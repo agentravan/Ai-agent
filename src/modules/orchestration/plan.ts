@@ -24,12 +24,16 @@ export const planSchema = z.object({
 export type PlanStep = z.infer<typeof planStepSchema>;
 export type Plan = z.infer<typeof planSchema>;
 
-export const PLAN_FORMAT_INSTRUCTIONS = `Respond with ONLY a JSON object, no prose, matching:
+export const PLAN_FORMAT_INSTRUCTIONS = `"summary" is your reply to the Founder: max 60 words, simple language, in the Founder's own language/style,
+saying what you set up and what happens next. No numbers you were not given.
+Plan 3-8 concrete steps. Start with ONE create_project for the initiative, then create_task steps that the AI employees can
+actually do now (research, plans, drafts, website demo content, pitch copy, checklists) — each assigned to the best-fit agent.
+Respond with ONLY a JSON object, no prose, matching:
 {"summary": string, "steps": [{"action": "create_project"|"create_task"|"create_opportunity"|"request_approval",
 "title": string, "description": string, "assignee": agent name or omit, "priority": "low"|"medium"|"high"|"critical",
 "risk": "low"|"medium"|"high"|"critical", "kra": one of the listed KRA names,
 "approval_action": "domain.verb" (only for request_approval, e.g. "finance.spend", "external.contact")}]}
-Use 1-10 steps. Every step must name the KRA it serves. Assign work to the manager of the relevant business unit.
+Every step must name the KRA it serves. Assign work to the manager of the relevant business unit.
 Mark anything involving money, legal exposure, external communication or irreversible change as risk "high" or use request_approval.`;
 
 /** Extracts and validates a plan from model output. Invalid output is retryable: the model may comply next attempt. */

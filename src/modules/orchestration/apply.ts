@@ -28,13 +28,13 @@ function resolveAssignee(step: PlanStep, agents: AgentWithPermissions[], fallbac
 }
 
 /** Performs a single executable step. Called only after policy (or a Founder approval) allows it. */
-export async function executeStep(ctx: AppContext, step: PlanStep, actor: AgentWithPermissions, assignee: { id: string; business_unit_id: string | null }, kraId: string | null): Promise<string> {
+export async function executeStep(ctx: AppContext, step: PlanStep, actor: AgentWithPermissions, assignee: { id: string; business_unit_id: string | null }, kraId: string | null, projectId: string | null = null): Promise<string> {
   const org = ctx.organisation.id;
   switch (step.action) {
     case "create_project":
       return must(await ctx.db.from("projects").insert({ organisation_id: org, name: step.title.slice(0, 120), description: step.description, owner_agent_id: assignee.id, business_unit_id: assignee.business_unit_id, kra_id: kraId }).select("id").single<{ id: string }>()).id;
     case "create_task":
-      return must(await ctx.db.from("tasks").insert({ organisation_id: org, title: step.title, description: step.description, priority: step.priority, assigned_agent_id: assignee.id, kra_id: kraId, created_by: ctx.userId }).select("id").single<{ id: string }>()).id;
+      return must(await ctx.db.from("tasks").insert({ organisation_id: org, title: step.title, description: step.description, priority: step.priority, assigned_agent_id: assignee.id, kra_id: kraId, project_id: projectId, created_by: ctx.userId }).select("id").single<{ id: string }>()).id;
     case "create_opportunity":
       return must(await ctx.db.from("opportunities").insert({ organisation_id: org, title: step.title, summary: step.description, proposed_by_agent_id: actor.id, created_by: ctx.userId }).select("id").single<{ id: string }>()).id;
     default:
@@ -46,6 +46,7 @@ export async function executeStep(ctx: AppContext, step: PlanStep, actor: AgentW
 export async function applyPlan(ctx: AppContext, plan: Plan, actor: AgentWithPermissions, pc: PlanContext, executionId: string): Promise<StepOutcome[]> {
   const perms = permissionsOf(actor);
   const outcomes: StepOutcome[] = [];
+  let projectId: string | null = null; // tasks join the project created earlier in the same plan
   for (const step of plan.steps) {
     const assignee = step.action === "create_task" || step.action === "create_project" ? resolveAssignee(step, pc.agents, actor) : actor;
     const kra = resolveKra(step, assignee, pc.kras);
@@ -53,7 +54,8 @@ export async function applyPlan(ctx: AppContext, plan: Plan, actor: AgentWithPer
     const kraNote = kra ? ` · KRA: ${kra.name}` : "";
     try {
       if (decision.kind === "execute") {
-        const ref = await executeStep(ctx, step, actor, assignee, kra?.id ?? null);
+        const ref = await executeStep(ctx, step, actor, assignee, kra?.id ?? null, step.action === "create_task" ? projectId : null);
+        if (step.action === "create_project") projectId = ref;
         let detail = `Assigned to ${assignee.name}${kraNote}`;
         if (decision.review === "manager") {
           // Mid-tier issue: resolved inside the team, visible to the manager — not sent to the Founder.

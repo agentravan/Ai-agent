@@ -5,6 +5,7 @@ import type { AppContext } from "@/modules/auth/session";
 import { cockpitFacts, loadCockpit } from "@/modules/cockpit/service";
 import { loadAgentByTier, runAgent } from "@/modules/orchestration/engine";
 import { runProspectingCycle } from "@/modules/sales/service";
+import { runReadyTasks } from "@/modules/tasks/service";
 
 export type Slot = "morning" | "evening";
 
@@ -18,9 +19,15 @@ export interface Report { subject: string; text: string; html: string }
  */
 export async function buildDailyReport(ctx: AppContext, slot: Slot, opts: { prospect?: boolean } = {}): Promise<Report> {
   const ai = !!activeProvider();
+  const startedAt = Date.now();
   let prospecting: string | null = null;
+  let autopilot: string[] = [];
   if (slot === "morning" && opts.prospect && ai) {
     prospecting = await runProspectingCycle(ctx).catch((e: Error) => `Prospecting failed: ${e.message}`);
+    // Overnight-style work: let the team clear ready tasks within the job's time budget.
+    // Serverless limit is 300 s: leave ~90 s for the report itself.
+    const budget = Math.max(0, 200_000 - (Date.now() - startedAt));
+    autopilot = (await runReadyTasks(ctx, budget).catch(() => [])).map((r) => `${r.ok ? "✓" : "✗"} ${r.message}`);
   }
   const c = await loadCockpit(ctx);
   const w = c.wall;
@@ -41,6 +48,7 @@ export async function buildDailyReport(ctx: AppContext, slot: Slot, opts: { pros
   const sections: [string, string[]][] = slot === "morning"
     ? [
         ["Yesterday's performance", [`${c.last24h.tasksDone} tasks completed, ${c.last24h.tasksCreated} created`, `${c.last24h.runsOk} agent runs succeeded, ${c.last24h.runsFailed} failed`, `${c.last24h.decisions} decisions taken`]],
+        ["Done by the team this morning", autopilot.length ? autopilot : ["No tasks were ready"]],
         ["Today's plan", c.desk.filter((d) => d.entry.current).map((d) => `${d.agent.name}: ${d.entry.current!.title}`).slice(0, 8)],
         ["Client lead status", [`${c.sales.leadsFound24h} new leads found`, `${c.sales.awaitingApproval} pitches await your approval`, `${c.sales.readyToSend} approved & ready to send`, `${c.sales.contacted} contacted · ${c.sales.positive} positive · ${c.sales.won} won`, ...(prospecting ? [`Auto-prospecting: ${prospecting}`] : [])]],
         ["Needs you", [`${c.approvals.length} approval(s) pending`, ...c.risks.slice(0, 5)]],

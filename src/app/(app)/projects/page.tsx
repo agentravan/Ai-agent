@@ -7,6 +7,8 @@ import { requireContext } from "@/modules/auth/session";
 import { listAgents } from "@/modules/orchestration/engine";
 import { createProjectAction, setProjectStatusAction } from "@/modules/projects/actions";
 import { createTaskAction, runTaskAction, updateTaskAction } from "@/modules/tasks/actions";
+import { nextReadyTask } from "@/modules/tasks/service";
+import { Autopilot } from "@/components/agents/autopilot";
 import { PRIORITIES, PROJECT_STATUSES, TASK_STATUSES, type BusinessUnit, type Kra, type Project, type Task } from "@/types/domain";
 
 export const metadata = { title: "Projects & Tasks" };
@@ -23,6 +25,8 @@ export default async function ProjectsPage({ searchParams }: { searchParams: Sea
     ctx.db.from("kras").select("id, name, description, business_unit_id").order("name").returns<Kra[]>(),
     ctx.db.from("business_units").select("id, name, description, department_id, manager_agent_id").order("name").returns<BusinessUnit[]>(),
   ]);
+  const next = await nextReadyTask(ctx);
+  const nextInfo = next ? { title: next.title, agent: agents.find((a) => a.id === next.assigned_agent_id)?.name ?? "Agent" } : null;
   const kraOptions = (kras ?? []).map((k) => ({ value: k.id, label: k.name }));
   const kraName = new Map((kras ?? []).map((k) => [k.id, k.name]));
   const unitName = new Map((units ?? []).map((u) => [u.id, u.name]));
@@ -69,6 +73,10 @@ export default async function ProjectsPage({ searchParams }: { searchParams: Sea
           </Card>
         )}
       </div>
+
+      <Card title="Team at work" description="Runs every ready task in order and shows live progress" className="mt-6">
+        <Autopilot next={nextInfo} aiAvailable={ai.available} />
+      </Card>
 
       <Card title="Tasks" className="mt-6">
         <Table head={["Task", "Project · KRA", "Priority", "Assignee & status", ""]}>

@@ -10,8 +10,16 @@ import type { AgentWithPermissions, Execution } from "@/types/domain";
 import { checkAgentCanRun, checkCostLimit, monthStartIso, STALE_EXECUTION_MS } from "./policy";
 
 const GOVERNANCE = `You are an AI employee inside AI Empire OS, working for a human founder.
-Rules: be factual and concise; never claim to have performed actions you cannot perform; you cannot spend money,
-sign agreements or contact external parties; anything risky must be proposed for founder approval.`;
+Company reality: the workforce is the AI employees listed in this system plus the Founder. Infrastructure budget is ₹0.
+Rules:
+- Do the work; don't write essays about doing it. Output the deliverable itself.
+- Write for a busy founder: simple words, short bullet points, no jargon, no tables unless asked.
+- Reply in the same language and style the Founder used (e.g. Hinglish if they wrote Hinglish).
+- Never invent numbers: no revenue projections, prices of competitors, statistics, salaries or hiring plans.
+  Only use figures the Founder gave or that appear in the provided data; otherwise say "data needed".
+- Never assume humans will be hired, paid tools bought or money spent.
+- You cannot spend money, sign agreements or contact external parties yourself; propose those for Founder approval.
+- Never claim an action happened unless the system did it.`;
 
 export interface RunOptions<T> {
   agent: AgentWithPermissions;
@@ -136,6 +144,13 @@ export async function recoverStaleExecutions(ctx: AppContext): Promise<void> {
     .update({ status: "failed", error: "Execution interrupted before completion (recovered after timeout)", finished_at: new Date().toISOString() })
     .eq("organisation_id", ctx.organisation.id)
     .in("status", ["queued", "running"])
+    .lt("updated_at", cutoff);
+  // Tasks whose run was cut off stay re-runnable instead of "in progress" forever.
+  await ctx.db
+    .from("tasks")
+    .update({ status: "failed", result: "Interrupted before completion — press Run or Start work to retry." })
+    .eq("organisation_id", ctx.organisation.id)
+    .eq("status", "in_progress")
     .lt("updated_at", cutoff);
 }
 
