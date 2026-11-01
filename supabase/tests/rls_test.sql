@@ -19,15 +19,15 @@ begin
   assert (select count(*) from public.agents) = 4, 'RLS: sees only own agents';
   assert (select count(*) from public.organisations) = 1, 'RLS: sees only own org';
 
-  insert into public.tasks (organisation_id, title) values (public.auth_org_id(), 'A') returning id into t1;
-  insert into public.tasks (organisation_id, title) values (public.auth_org_id(), 'B') returning id into t2;
-  insert into public.task_dependencies (organisation_id, task_id, depends_on_task_id) values (public.auth_org_id(), t2, t1);
+  insert into public.tasks (organisation_id, title) values (private.auth_org_id(), 'A') returning id into t1;
+  insert into public.tasks (organisation_id, title) values (private.auth_org_id(), 'B') returning id into t2;
+  insert into public.task_dependencies (organisation_id, task_id, depends_on_task_id) values (private.auth_org_id(), t2, t1);
   begin
-    insert into public.task_dependencies (organisation_id, task_id, depends_on_task_id) values (public.auth_org_id(), t1, t2);
+    insert into public.task_dependencies (organisation_id, task_id, depends_on_task_id) values (private.auth_org_id(), t1, t2);
     raise exception 'cycle not rejected';
   exception when check_violation then null; end;
 
-  insert into public.approvals (organisation_id, title, action_type) values (public.auth_org_id(), 'Spend', 'finance.spend') returning id into appr;
+  insert into public.approvals (organisation_id, title, action_type) values (private.auth_org_id(), 'Spend', 'finance.spend') returning id into appr;
   update public.approvals set status = 'approved', decided_by = auth.uid(), decided_at = now() where id = appr;
   begin
     update public.approvals set status = 'rejected' where id = appr;
@@ -53,7 +53,7 @@ select set_config('test.foreign_agent', id::text, false) from public.agents
 set role authenticated;
 do $$ begin
   begin
-    insert into public.tasks (organisation_id, title, assigned_agent_id) values (public.auth_org_id(), 'X', current_setting('test.foreign_agent')::uuid);
+    insert into public.tasks (organisation_id, title, assigned_agent_id) values (private.auth_org_id(), 'X', current_setting('test.foreign_agent')::uuid);
     raise exception 'cross-tenant reference allowed';
   exception when foreign_key_violation then null; end;
   begin
@@ -69,7 +69,7 @@ update public.profiles set role = 'viewer' where email = 'founder@a.test';
 set role authenticated;
 do $$ begin
   begin
-    insert into public.tasks (organisation_id, title) values (public.auth_org_id(), 'V');
+    insert into public.tasks (organisation_id, title) values (private.auth_org_id(), 'V');
     raise exception 'viewer write allowed';
   exception when insufficient_privilege then null; end;
 end $$;

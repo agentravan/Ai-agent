@@ -1,0 +1,47 @@
+import { z } from "zod";
+import { AiError } from "@/lib/ai/types";
+import { PRIORITIES } from "@/types/domain";
+
+export const PLAN_ACTIONS = ["create_project", "create_task", "create_opportunity", "request_approval"] as const;
+export type PlanAction = (typeof PLAN_ACTIONS)[number];
+
+export const planStepSchema = z.object({
+  action: z.enum(PLAN_ACTIONS),
+  title: z.string().trim().min(1).max(200),
+  description: z.string().trim().max(2000).optional().default(""),
+  assignee: z.string().trim().max(80).optional(),
+  priority: z.enum(PRIORITIES).catch("medium").default("medium"),
+  risk: z.enum(PRIORITIES).catch("high").default("low"),
+  approval_action: z.string().regex(/^[a-z_]+\.[a-z_]+$/).optional().catch(undefined),
+});
+
+export const planSchema = z.object({
+  summary: z.string().trim().min(1).max(2000),
+  steps: z.array(planStepSchema).min(1).max(10),
+});
+
+export type PlanStep = z.infer<typeof planStepSchema>;
+export type Plan = z.infer<typeof planSchema>;
+
+export const PLAN_FORMAT_INSTRUCTIONS = `Respond with ONLY a JSON object, no prose, matching:
+{"summary": string, "steps": [{"action": "create_project"|"create_task"|"create_opportunity"|"request_approval",
+"title": string, "description": string, "assignee": agent name or omit, "priority": "low"|"medium"|"high"|"critical",
+"risk": "low"|"medium"|"high"|"critical", "approval_action": "domain.verb" (only for request_approval, e.g. "finance.spend")}]}
+Use 1-10 steps. Mark anything involving money, legal exposure, external communication or irreversible change as risk "high" or use request_approval.`;
+
+/** Extracts and validates a plan from model output. Invalid output is retryable: the model may comply next attempt. */
+export function parsePlan(text: string): Plan {
+  const unfenced = text.replace(/```(?:json)?/gi, "");
+  const start = unfenced.indexOf("{");
+  const end = unfenced.lastIndexOf("}");
+  if (start < 0 || end <= start) throw new AiError("AI response contained no JSON plan", true);
+  let raw: unknown;
+  try {
+    raw = JSON.parse(unfenced.slice(start, end + 1));
+  } catch {
+    throw new AiError("AI response contained malformed JSON", true);
+  }
+  const parsed = planSchema.safeParse(raw);
+  if (!parsed.success) throw new AiError(`AI plan failed validation: ${parsed.error.issues[0]?.message ?? "invalid"}`, true);
+  return parsed.data;
+}
