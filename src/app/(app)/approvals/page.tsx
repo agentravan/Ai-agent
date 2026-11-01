@@ -5,7 +5,10 @@ import { formatDateTime } from "@/lib/utilities/format";
 import { decideApprovalAction, requestApprovalAction } from "@/modules/approvals/actions";
 import { requireContext } from "@/modules/auth/session";
 import { listAgents } from "@/modules/orchestration/engine";
-import type { Approval } from "@/types/domain";
+import { PRIORITIES, type Approval } from "@/types/domain";
+import { Select } from "@/components/ui";
+
+type StepPayload = { step?: { title?: string; description?: string; priority?: string; action?: string }; kra?: string | null; reason?: string };
 
 export const metadata = { title: "Approval Center" };
 
@@ -22,7 +25,7 @@ export default async function ApprovalsPage({ searchParams }: { searchParams: Se
 
   return (
     <>
-      <PageHeader title="Approval Center" subtitle="Nothing risky happens without you. Approved plan steps execute immediately; other approvals record your decision." />
+      <PageHeader title="Approval Matrix" subtitle="Only critical decisions, budget breaches and policy changes reach you. Approve, reject, or modify then approve. Approved plan steps execute immediately." />
       <Flash params={params} />
       <h2 className="mb-3 text-sm font-semibold text-slate-200">Pending ({pending?.length ?? 0})</h2>
       {!pending?.length ? <Empty>No pending requests.</Empty> : (
@@ -38,6 +41,24 @@ export default async function ApprovalsPage({ searchParams }: { searchParams: Se
                 <summary className="cursor-pointer text-xs text-gold">Action details</summary>
                 <pre className="mt-2 max-h-72 overflow-auto rounded-lg bg-ink/60 p-3 text-xs text-slate-300">{JSON.stringify(a.payload, null, 2)}</pre>
               </details>
+              {(() => {
+                const p = a.payload as StepPayload;
+                return (p.kra || p.reason) ? <p className="mt-1 text-xs text-muted">{p.kra && <>KRA: <span className="text-slate-300">{p.kra}</span> · </>}{p.reason}</p> : null;
+              })()}
+              {canGovern && (a.payload as StepPayload).step?.action && (a.payload as StepPayload).step?.action !== "request_approval" && (
+                <details className="mt-3 rounded-lg border border-line p-3">
+                  <summary className="cursor-pointer text-sm text-gold">Modify, then approve</summary>
+                  <form action={decideApprovalAction} className="mt-3 grid gap-3 md:grid-cols-3">
+                    <input type="hidden" name="id" value={a.id} />
+                    <input type="hidden" name="decision" value="modified" />
+                    <Field label="Title" className="md:col-span-2"><input name="title" maxLength={200} defaultValue={(a.payload as StepPayload).step?.title} className="input" /></Field>
+                    <Field label="Priority"><Select name="priority" options={PRIORITIES} defaultValue={(a.payload as StepPayload).step?.priority ?? "medium"} /></Field>
+                    <Field label="Description" className="md:col-span-3"><textarea name="description" rows={3} maxLength={2000} defaultValue={(a.payload as StepPayload).step?.description} className="input" /></Field>
+                    <Field label="Note" className="md:col-span-2"><input name="note" maxLength={2000} className="input" placeholder="Why you changed it (optional)" /></Field>
+                    <div className="flex items-end"><SubmitButton>Approve modified</SubmitButton></div>
+                  </form>
+                </details>
+              )}
               {canGovern && (
                 <form action={decideApprovalAction} className="mt-3 flex flex-col gap-2 sm:flex-row sm:items-center">
                   <input type="hidden" name="id" value={a.id} />

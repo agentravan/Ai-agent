@@ -7,20 +7,25 @@ import { requireContext } from "@/modules/auth/session";
 import { listAgents } from "@/modules/orchestration/engine";
 import { createProjectAction, setProjectStatusAction } from "@/modules/projects/actions";
 import { createTaskAction, runTaskAction, updateTaskAction } from "@/modules/tasks/actions";
-import { PRIORITIES, PROJECT_STATUSES, TASK_STATUSES, type Project, type Task } from "@/types/domain";
+import { PRIORITIES, PROJECT_STATUSES, TASK_STATUSES, type BusinessUnit, type Kra, type Project, type Task } from "@/types/domain";
 
 export const metadata = { title: "Projects & Tasks" };
 export const maxDuration = 300;
 
 export default async function ProjectsPage({ searchParams }: { searchParams: SearchParams }) {
   const ctx = await requireContext();
-  const [params, ai, agents, { data: projects }, { data: tasks }] = await Promise.all([
+  const [params, ai, agents, { data: projects }, { data: tasks }, { data: kras }, { data: units }] = await Promise.all([
     searchParams,
     aiStatus(),
     listAgents(ctx),
     ctx.db.from("projects").select("*").order("created_at", { ascending: false }).returns<Project[]>(),
     ctx.db.from("tasks").select("*").order("created_at", { ascending: false }).limit(100).returns<Task[]>(),
+    ctx.db.from("kras").select("id, name, description, business_unit_id").order("name").returns<Kra[]>(),
+    ctx.db.from("business_units").select("id, name, description, department_id, manager_agent_id").order("name").returns<BusinessUnit[]>(),
   ]);
+  const kraOptions = (kras ?? []).map((k) => ({ value: k.id, label: k.name }));
+  const kraName = new Map((kras ?? []).map((k) => [k.id, k.name]));
+  const unitName = new Map((units ?? []).map((u) => [u.id, u.name]));
   const canOperate = can(ctx.profile.role, "operate");
   const projectName = new Map((projects ?? []).map((p) => [p.id, p.name]));
   const agentOptions = agents.filter((a) => a.status === "active").map((a) => ({ value: a.id, label: a.name }));
@@ -31,10 +36,11 @@ export default async function ProjectsPage({ searchParams }: { searchParams: Sea
       <Flash params={params} />
       <div className="grid gap-6 xl:grid-cols-3">
         <Card title="Projects" className="xl:col-span-2">
-          <Table head={["Project", "Owner", "Status"]}>
+          <Table head={["Project", "Unit · KRA", "Owner", "Status"]}>
             {(projects ?? []).map((p) => (
               <tr key={p.id}>
                 <Td><div className="text-white">{p.name}</div><div className="text-xs text-muted">{truncate(p.description, 100)}</div></Td>
+                <Td className="text-xs"><div>{unitName.get(p.business_unit_id ?? "") ?? "—"}</div><div className="text-muted">{kraName.get(p.kra_id ?? "") ?? "No KRA"}</div></Td>
                 <Td>{agents.find((a) => a.id === p.owner_agent_id)?.name ?? "—"}</Td>
                 <Td>
                   {canOperate ? (
@@ -54,6 +60,8 @@ export default async function ProjectsPage({ searchParams }: { searchParams: Sea
             <form action={createProjectAction} className="space-y-3">
               <Field label="Name"><input name="name" required maxLength={120} className="input" /></Field>
               <Field label="Description"><textarea name="description" rows={3} maxLength={4000} className="input" /></Field>
+              <Field label="Business unit"><Select name="business_unit_id" options={(units ?? []).map((u) => ({ value: u.id, label: u.name }))} placeholder="Company-wide" /></Field>
+              <Field label="KRA (required)"><Select name="kra_id" required options={kraOptions} placeholder="Choose KRA" /></Field>
               <Field label="Owner agent"><Select name="owner_agent_id" options={agentOptions} placeholder="None" /></Field>
               <Field label="Due date"><input name="due_date" type="date" className="input" /></Field>
               <SubmitButton>Create project</SubmitButton>
@@ -63,14 +71,14 @@ export default async function ProjectsPage({ searchParams }: { searchParams: Sea
       </div>
 
       <Card title="Tasks" className="mt-6">
-        <Table head={["Task", "Project", "Priority", "Assignee & status", ""]}>
+        <Table head={["Task", "Project · KRA", "Priority", "Assignee & status", ""]}>
           {(tasks ?? []).map((t) => (
             <tr key={t.id}>
               <Td>
                 <div className="text-white">{t.title}</div>
                 {t.result && <details className="mt-1 text-xs text-muted"><summary className="cursor-pointer text-gold">Result</summary><div className="mt-1 max-h-64 overflow-y-auto whitespace-pre-wrap text-slate-300">{t.result}</div></details>}
               </Td>
-              <Td className="text-xs">{projectName.get(t.project_id ?? "") ?? "—"}</Td>
+              <Td className="text-xs"><div>{projectName.get(t.project_id ?? "") ?? "—"}</div><div className={t.kra_id ? "text-muted" : "text-amber-300"}>{kraName.get(t.kra_id ?? "") ?? "No KRA"}</div></Td>
               <Td><Badge>{t.priority}</Badge></Td>
               <Td>
                 {canOperate ? (
@@ -106,6 +114,7 @@ export default async function ProjectsPage({ searchParams }: { searchParams: Sea
             <Field label="Description" className="md:col-span-3"><textarea name="description" rows={2} maxLength={8000} className="input" /></Field>
             <Field label="Project"><Select name="project_id" options={(projects ?? []).map((p) => ({ value: p.id, label: p.name }))} placeholder="No project" /></Field>
             <Field label="Assignee"><Select name="assigned_agent_id" options={agentOptions} placeholder="Unassigned" /></Field>
+            <Field label="KRA (required)"><Select name="kra_id" required options={kraOptions} placeholder="Choose KRA" /></Field>
             <Field label="Depends on"><Select name="depends_on" options={(tasks ?? []).map((t) => ({ value: t.id, label: truncate(t.title, 60) }))} placeholder="No dependency" /></Field>
             <div className="md:col-span-3"><SubmitButton>Create task</SubmitButton></div>
           </form>

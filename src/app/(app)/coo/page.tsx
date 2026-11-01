@@ -8,7 +8,7 @@ import { requireContext } from "@/modules/auth/session";
 import { listAgents, recoverStaleExecutions } from "@/modules/orchestration/engine";
 import { monthStartIso } from "@/modules/orchestration/policy";
 import { createTaskAction } from "@/modules/tasks/actions";
-import { PRIORITIES, TASK_STATUSES, type Execution, type Project, type Task } from "@/types/domain";
+import { PRIORITIES, TASK_STATUSES, type Execution, type Kra, type Project, type Task } from "@/types/domain";
 
 export const metadata = { title: "COO Office" };
 export const maxDuration = 300;
@@ -16,13 +16,14 @@ export const maxDuration = 300;
 export default async function CooPage({ searchParams }: { searchParams: SearchParams }) {
   const ctx = await requireContext();
   await recoverStaleExecutions(ctx);
-  const [params, ai, agents, { data: tasks }, { data: projects }, { data: executions }] = await Promise.all([
+  const [params, ai, agents, { data: tasks }, { data: projects }, { data: executions }, { data: kras }] = await Promise.all([
     searchParams,
     aiStatus(),
     listAgents(ctx),
     ctx.db.from("tasks").select("id, status, assigned_agent_id, project_id").limit(5000).returns<Pick<Task, "id" | "status" | "assigned_agent_id" | "project_id">[]>(),
     ctx.db.from("projects").select("*").in("status", ["planned", "active", "on_hold"]).order("created_at", { ascending: false }).returns<Project[]>(),
     ctx.db.from("agent_executions").select("*").gte("created_at", monthStartIso()).order("created_at", { ascending: false }).limit(200).returns<Execution[]>(),
+    ctx.db.from("kras").select("id, name, description, business_unit_id").order("name").returns<Kra[]>(),
   ]);
   const coo = agents.find((a) => a.tier === "coo") ?? null;
   const byStatus = Object.fromEntries(TASK_STATUSES.map((s) => [s, (tasks ?? []).filter((t) => t.status === s).length]));
@@ -38,7 +39,7 @@ export default async function CooPage({ searchParams }: { searchParams: SearchPa
       </div>
 
       <ExecutiveConsole agent={coo} returnTo="/coo" aiAvailable={ai.available} canOperate={canOperate}
-        placeholder="e.g. What is blocking delivery this week, and who should pick up the unassigned tasks?" />
+        placeholder="e.g. What is blocking delivery this week, and who should pick up the unassigned tasks?" report="eod" />
 
       <div className="mt-6 grid gap-6 xl:grid-cols-3">
         {canOperate && (
@@ -48,6 +49,7 @@ export default async function CooPage({ searchParams }: { searchParams: SearchPa
               <Field label="Description"><textarea name="description" rows={3} maxLength={8000} className="input" /></Field>
               <Field label="Assign to"><Select name="assigned_agent_id" options={agentOptions} placeholder="Unassigned" /></Field>
               <Field label="Project"><Select name="project_id" options={(projects ?? []).map((p) => ({ value: p.id, label: p.name }))} placeholder="No project" /></Field>
+              <Field label="KRA (required)"><Select name="kra_id" required options={(kras ?? []).map((k) => ({ value: k.id, label: k.name }))} placeholder="Choose KRA" /></Field>
               <Field label="Priority"><Select name="priority" options={PRIORITIES} defaultValue="medium" /></Field>
               <SubmitButton>Create task</SubmitButton>
             </form>

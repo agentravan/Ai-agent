@@ -5,13 +5,15 @@ import { usePathname } from "next/navigation";
 import { cn } from "@/lib/utilities/format";
 
 export const NAV = [
-  { href: "/dashboard", label: "Dashboard" },
+  { href: "/dashboard", label: "CEO Cockpit" },
   { href: "/command", label: "Empire Command" },
   { href: "/ceo", label: "CEO Office" },
   { href: "/coo", label: "COO Office" },
   { href: "/workforce", label: "Agent Registry" },
   { href: "/projects", label: "Projects & Tasks" },
   { href: "/opportunities", label: "Opportunities" },
+  { href: "/finance", label: "Finance" },
+  { href: "/kpis", label: "KRAs & KPIs" },
   { href: "/approvals", label: "Approvals" },
   { href: "/audit", label: "Audit Log" },
   { href: "/settings", label: "Settings" },

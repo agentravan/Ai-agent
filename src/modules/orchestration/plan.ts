@@ -13,6 +13,7 @@ export const planStepSchema = z.object({
   priority: z.enum(PRIORITIES).catch("medium").default("medium"),
   risk: z.enum(PRIORITIES).catch("high").default("low"),
   approval_action: z.string().regex(/^[a-z_]+\.[a-z_]+$/).optional().catch(undefined),
+  kra: z.string().trim().max(120).optional().catch(undefined),
 });
 
 export const planSchema = z.object({
@@ -26,8 +27,10 @@ export type Plan = z.infer<typeof planSchema>;
 export const PLAN_FORMAT_INSTRUCTIONS = `Respond with ONLY a JSON object, no prose, matching:
 {"summary": string, "steps": [{"action": "create_project"|"create_task"|"create_opportunity"|"request_approval",
 "title": string, "description": string, "assignee": agent name or omit, "priority": "low"|"medium"|"high"|"critical",
-"risk": "low"|"medium"|"high"|"critical", "approval_action": "domain.verb" (only for request_approval, e.g. "finance.spend")}]}
-Use 1-10 steps. Mark anything involving money, legal exposure, external communication or irreversible change as risk "high" or use request_approval.`;
+"risk": "low"|"medium"|"high"|"critical", "kra": one of the listed KRA names,
+"approval_action": "domain.verb" (only for request_approval, e.g. "finance.spend", "external.contact")}]}
+Use 1-10 steps. Every step must name the KRA it serves. Assign work to the manager of the relevant business unit.
+Mark anything involving money, legal exposure, external communication or irreversible change as risk "high" or use request_approval.`;
 
 /** Extracts and validates a plan from model output. Invalid output is retryable: the model may comply next attempt. */
 export function parsePlan(text: string): Plan {

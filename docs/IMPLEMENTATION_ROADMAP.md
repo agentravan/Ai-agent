@@ -11,6 +11,13 @@
 - [ ] **Founder:** configure Supabase Auth URLs, create founder account, set `FOUNDER_EMAILS` (see DEPLOYMENT_GUIDE)
 - [ ] **Founder:** connect an AI provider (Ollama via tunnel, or a free OpenAI-compatible endpoint)
 
+## Milestone 1.1 — Virtual Executive Office (done)
+- [x] Divisions, business units, Tier-2 manager agents, KRA/KPI framework
+- [x] CEO Executive Cockpit (6 sections), Finance & Accounts, KRAs & KPIs pages
+- [x] Escalation ladder (team → manager review → Founder), Approve/Reject/Modify matrix
+- [x] AI morning briefing and end-of-day report grounded in live data
+- [ ] Buyontime order integration (needs its API or database access)
+
 ## Milestone 2 — Business operations
 - CRM UI (clients, pipeline) on the existing `clients` table
 - Finance UI: budgets, income/expense records, budget-vs-actual, agent spend roll-up

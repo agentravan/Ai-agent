@@ -19,6 +19,17 @@ export type ExecutionStatus = (typeof EXECUTION_STATUSES)[number];
 export type ApprovalStatus = (typeof APPROVAL_STATUSES)[number];
 export type OpportunityStatus = (typeof OPPORTUNITY_STATUSES)[number];
 
+/** Corporate hierarchy labels for agent tiers (Tier 4 is the human Founder). */
+export const TIER_LABEL: Record<AgentTier, string> = {
+  ceo: "C-Suite · Chief Executive",
+  coo: "C-Suite · Chief Operating",
+  executive: "Tier 3 · Senior VP / Division Head",
+  manager: "Tier 2 · Team Manager",
+  worker: "Tier 1 · Associate / Specialist",
+};
+export const KPI_PERIODS = ["daily", "weekly", "monthly", "quarterly"] as const;
+export type KpiPeriod = (typeof KPI_PERIODS)[number];
+
 export interface Profile {
   id: string;
   organisation_id: string;
@@ -40,6 +51,7 @@ export interface Agent {
   department_id: string | null;
   manager_id: string | null;
   status: AgentStatus;
+  business_unit_id: string | null;
   monthly_cost_limit_cents: number;
   created_at: string;
 }
@@ -54,6 +66,8 @@ export interface Project {
   description: string | null;
   status: ProjectStatus;
   owner_agent_id: string | null;
+  business_unit_id: string | null;
+  kra_id: string | null;
   due_date: string | null;
   created_at: string;
 }
@@ -67,6 +81,7 @@ export interface Task {
   status: TaskStatus;
   priority: Priority;
   assigned_agent_id: string | null;
+  kra_id: string | null;
   result: string | null;
   due_date: string | null;
   created_at: string;
@@ -128,3 +143,21 @@ export interface AuditLog {
   metadata: Record<string, unknown>;
   created_at: string;
 }
+
+export interface BusinessUnit { id: string; name: string; description: string | null; department_id: string | null; manager_agent_id: string | null }
+export interface Kra { id: string; name: string; description: string | null; business_unit_id: string | null }
+export interface Kpi { id: string; kra_id: string; name: string; unit: string; target: number; current_value: number; period: KpiPeriod; updated_at: string }
+export interface FinancialRecord {
+  id: string;
+  kind: "income" | "expense";
+  amount_cents: number;
+  currency: string;
+  occurred_on: string;
+  description: string | null;
+  business_unit_id: string | null;
+  budget_id: string | null;
+  client_id: string | null;
+  created_at: string;
+}
+export interface Budget { id: string; name: string; department_id: string | null; period_start: string; period_end: string; amount_cents: number; currency: string }
+export interface Client { id: string; name: string; status: "lead" | "active" | "churned"; business_unit_id: string | null }

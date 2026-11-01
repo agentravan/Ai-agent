@@ -45,3 +45,31 @@ Recovery: `recoverStaleExecutions` marks runs stuck in `queued` or `running` for
 
 ## Executive offices
 CEO and COO pages provide an identity card, founder ↔ executive messaging (persisted executions) and executive reports generated from live counts only. The report prompt forbids inventing figures.
+
+## Virtual Executive Office (Milestone 1.1)
+**Structure.** Divisions: Executive & Strategy, Operations, Growth, Finance & Accounts. Business units, each with an accountable Tier-2 manager agent:
+- Web Development & Tech → **Vega** (Web Development Lead)
+- HR Services & Consulting → **Hera** (HR Services Manager)
+- Buyontime E-Commerce → **Mercury** (E-Commerce Operations Manager)
+
+**Tiers.** Tier 1 Associate/Specialist (`worker`) → Tier 2 Team Manager (`manager`) → Tier 3 Senior VP / Division Head (`executive`, plus the CEO/COO C-suite) → Tier 4 Founder (human).
+
+**Escalation ladder** (`decideStep`):
+| Situation | Route |
+|---|---|
+| Low risk, permitted | Executes inside the team |
+| Medium risk, permitted | Executes. Logged as `escalation.manager_review` for the assignee's manager; the Founder is not notified |
+| High/critical risk, or `finance.*`, `budget.*`, `external.*`, `legal.*`, `policy.*` | Founder Approval Matrix (Approve / Reject / Modify) |
+| Missing permission or delegation right | Founder approval, or denied if the agent cannot request approval |
+
+**KRA/KPI.** Every task and project carries a KRA (required in forms). Plan steps resolve their KRA in this order: the named KRA, then the KRA of the assignee's unit, then "Strategic growth". KPI targets are set by the Founder and never by AI.
+
+**CEO Executive Cockpit** (`/dashboard`) has six live-data sections:
+1. Executive summary for the last 24h, plus an AI morning briefing
+2. Business units
+3. Financial headline
+4. Real-time virtual desk
+5. Strategic think-tank and risks
+6. Approval matrix
+
+Briefing, end-of-day and executive reports send the AI only a computed fact sheet (`cockpitFacts`), so figures cannot be invented. Buyontime order data shows "integration pending" until it is connected.

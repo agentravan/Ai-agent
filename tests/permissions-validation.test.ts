@@ -28,8 +28,10 @@ describe("form validation", () => {
     expect(() => parseForm(agentSchema, form([...base, ["permissions", "finance.spend"]]), ["permissions"])).toThrow(ValidationError);
   });
   it("maps empty optional ids to null and rejects bad uuids", () => {
-    const t = parseForm(taskSchema, form([["title", "X"], ["description", ""], ["project_id", ""], ["assigned_agent_id", ""], ["due_date", ""]]));
-    expect(t).toMatchObject({ project_id: null, assigned_agent_id: null, due_date: null, priority: "medium" });
+    const kra = "3f1c2a52-6b0e-4c55-9d43-2a7c1e0b9f10";
+    const t = parseForm(taskSchema, form([["title", "X"], ["description", ""], ["project_id", ""], ["assigned_agent_id", ""], ["due_date", ""], ["kra_id", kra]]));
+    expect(t).toMatchObject({ project_id: null, assigned_agent_id: null, due_date: null, priority: "medium", kra_id: kra });
+    expect(() => parseForm(taskSchema, form([["title", "X"], ["description", ""], ["kra_id", ""]]))).toThrow("Choose the KRA this work serves");
     expect(() => parseForm(taskSchema, form([["title", "X"], ["description", ""], ["project_id", "nope"]]))).toThrow(ValidationError);
   });
   it("requires a title", () => expect(() => parseForm(taskSchema, form([["title", "  "]]))).toThrow("Title is required"));

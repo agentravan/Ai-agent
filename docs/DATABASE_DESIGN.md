@@ -30,3 +30,8 @@ Migrations: `supabase/migrations/20261101000000_foundation.sql`, `20261101000100
 
 ## Testing
 `npm run test:db` spins up a throwaway Postgres, stubs `auth`, applies all migrations and asserts: bootstrap, isolation, cycle rejection, final approvals, no role self-escalation, audit immutability, cross-tenant FK rejection, viewer read-only and clean cascade.
+
+## Migration 20261101000200 — Virtual Executive Office
+- New tables: `kras` (governance write) and `kpis` (operational write; `target > 0`, `current_value >= 0`, period enum). Both have RLS, audit and `updated_at` triggers.
+- New tenant-safe FK columns: `business_units.manager_agent_id`, `agents.business_unit_id`, `projects.kra_id`, `tasks.kra_id`, `clients.business_unit_id`, `financial_records.business_unit_id`.
+- `private.seed_executive_office(org)` is idempotent. It runs for existing organisations and, through the `on_auth_user_created_seed` trigger, for every new founder.
