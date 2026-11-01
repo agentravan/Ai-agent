@@ -177,3 +177,70 @@ export async function checkRepliesAction() {
     }
   });
 }
+
+const waAssistSchema = z.object({
+  lead_id: z.preprocess((v) => (v === "" ? undefined : v), z.uuid().optional()),
+  phone: z.string().trim().max(40).optional(),
+  name: z.string().trim().max(200).optional(),
+  message: z.string().trim().min(1, "Paste the client's WhatsApp message").max(4000),
+});
+
+/**
+ * WhatsApp reply assistant (no Meta setup): the Founder pastes a client's WhatsApp message, Iris drafts the
+ * reply, the lead is updated (replied → call task on the desk; opt-out → never contacted again), and the
+ * Founder sends it with one tap from their own WhatsApp.
+ */
+export async function whatsappAssistAction(form: FormData) {
+  await runAction("/desk", "Reply ready — tap Send on WhatsApp", async () => {
+    const ctx = await requireContext("operate");
+    const input = parseForm(waAssistSchema, form);
+    const org = ctx.organisation.id;
+    const { isOptOut, whatsappNumber: waNum } = await import("./logic");
+    const { listAgents, runAgent } = await import("@/modules/orchestration/engine");
+
+    // 1. Find the lead (chosen, or by phone), or create one for a new enquiry.
+    let lead: Lead | null = null;
+    if (input.lead_id) lead = must(await ctx.db.from("leads").select("*").eq("id", input.lead_id).eq("organisation_id", org).single<Lead>());
+    const digits = waNum(input.phone ?? null, "India") ?? waNum(input.phone ?? null, null);
+    if (!lead && digits) {
+      const { data } = await ctx.db.from("leads").select("*").eq("organisation_id", org).not("phone", "is", null).limit(2000).returns<Lead[]>();
+      lead = (data ?? []).find((l) => waNum(l.phone, l.country) === digits || waNum(l.phone, "India") === digits) ?? null;
+    }
+    if (!lead) {
+      if (!digits) throw new UserFacingError("Choose a contact or enter their WhatsApp number with country code");
+      lead = must(await ctx.db.from("leads").insert({
+        organisation_id: org, name: input.name || `WhatsApp +${digits}`, phone: `+${digits}`, source: "manual", category: "other", score: 60,
+      }).select("*").single<Lead>());
+    }
+
+    // 2. Opt-outs are honoured immediately and permanently.
+    if (isOptOut(input.message)) {
+      await ctx.db.from("leads").update({ status: "lost", outcome_note: "Unsubscribed", pitch_whatsapp: null }).eq("id", lead.id).eq("organisation_id", org);
+      return `${lead.name} asked not to be contacted — marked and will never be messaged again`;
+    }
+
+    // 3. Iris drafts the reply.
+    const agents = await listAgents(ctx);
+    const iris = agents.find((a) => a.name === "Iris" && a.status === "active") ?? agents.find((a) => a.name === "Nova" && a.status === "active");
+    if (!iris) throw new UserFacingError("Iris (Sales Manager) is not active");
+    const { execution } = await runAgent(ctx, {
+      agent: iris, kind: "chat", maxTokens: 500,
+      input: `[WA] Write the next WhatsApp reply to this client for Teamwork HR Solutions. Reply in the client's language and tone, max 70 words, friendly and clear.
+Never invent prices, dates or promises: if they ask price or timing, say the Founder will confirm on a quick call and ask a good time to call.
+Goal: move them to a short call. No links unless they asked.
+Client: ${lead.name}${lead.category && lead.category !== "other" ? ` (${lead.category}${lead.city ? `, ${lead.city}` : ""})` : ""}
+Our earlier message: ${lead.pitch_whatsapp ?? lead.pitch_email ?? "none"}
+Their message: ${input.message}
+Output ONLY the reply text.`,
+    });
+    if (execution.status === "failed" || !execution.output) throw new UserFacingError(`Iris could not draft a reply: ${execution.error}`);
+    const reply = execution.output.trim().replace(/^["']|["']$/g, "").slice(0, 1000);
+
+    // 4. Record the conversation; moving to "replied" puts a call task with their number on the desk.
+    const note = `WhatsApp: ${input.message}`.slice(0, 1000);
+    const toReplied = ["new", "qualified", "pitch_ready", "approved", "contacted"].includes(lead.status);
+    await ctx.db.from("leads").update({ pitch_whatsapp: reply, outcome_note: note, ...(toReplied ? { status: "replied" } : {}) }).eq("id", lead.id).eq("organisation_id", org);
+    await logEvent(ctx, { action: "sales.whatsapp_reply_drafted", entity: "leads", entityId: lead.id, actorType: "agent", metadata: { agent_id: iris.id } });
+    return `Iris wrote a reply for ${lead.name} — it is at the top of “People to call”. Tap WhatsApp to send.`;
+  });
+}

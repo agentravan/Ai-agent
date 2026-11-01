@@ -9,13 +9,14 @@ import { growthStage, MILESTONES, upgradeUnlocked } from "@/modules/cockpit/metr
 import { addFounderTaskAction, setFounderTaskStatusAction, updateGoalsAction } from "@/modules/desk/actions";
 import { companySnapshot } from "@/modules/orchestration/engine";
 import { whatsappLink } from "@/modules/sales/logic";
+import { whatsappAssistAction } from "@/modules/sales/actions";
 import { FOUNDER_TASK_TYPES, PRIORITIES, type Task } from "@/types/domain";
 
 export const metadata = { title: "My Desk" };
 
 const TYPE_ICON: Record<string, LucideIcon> = { call: Phone, meeting: CalendarClock, order: ShoppingCart, physical: Wrench, other: Circle };
 const RANK = { critical: 0, high: 1, medium: 2, low: 3 } as const;
-type Contact = { id: string; name: string; category: string; city: string | null; country: string | null; phone: string | null; email: string | null; status: string; outcome_note: string | null; ai_reason: string | null; updated_at: string };
+type Contact = { id: string; name: string; category: string; city: string | null; country: string | null; phone: string | null; email: string | null; status: string; outcome_note: string | null; ai_reason: string | null; pitch_whatsapp: string | null; updated_at: string };
 type DeskTask = Task & { leads: { name: string; phone: string | null; email: string | null; country: string | null } | null; updated_at: string };
 
 export default async function DeskPage({ searchParams }: { searchParams: SearchParams }) {
@@ -33,11 +34,14 @@ export default async function DeskPage({ searchParams }: { searchParams: SearchP
       ctx.db.from("projects").select("id", { count: "exact", head: true }).eq("organisation_id", org).eq("status", "active"),
     ]),
     // People who need a human: replied or won (call/meet), and approved leads reachable only by phone.
-    ctx.db.from("leads").select("id, name, category, city, country, phone, email, status, outcome_note, ai_reason, updated_at").eq("organisation_id", org)
+    ctx.db.from("leads").select("id, name, category, city, country, phone, email, status, outcome_note, ai_reason, pitch_whatsapp, updated_at").eq("organisation_id", org)
       .or("status.in.(replied,won),and(status.eq.approved,email.is.null,phone.not.is.null)").order("updated_at", { ascending: false }).limit(30)
       .returns<Contact[]>(),
   ]);
   const people = contacts ?? [];
+  const { data: waRows } = await ctx.db.from("leads").select("id, name, phone").eq("organisation_id", org).not("phone", "is", null)
+    .in("status", ["approved", "contacted", "replied", "won", "pitch_ready"]).order("updated_at", { ascending: false }).limit(60).returns<{ id: string; name: string; phone: string | null }[]>();
+  const waContacts = waRows ?? [];
   const [income, clients, leads, aiDone, activeProjects] = counts;
   const revenue = (income.data ?? []).reduce((s, r) => s + Number(r.amount_cents), 0);
   const stage = growthStage(company.netProfitCents, company.northStarCents);
@@ -97,21 +101,32 @@ export default async function DeskPage({ searchParams }: { searchParams: SearchP
         <Stat label="Tasks done by AI team" value={aiDone.count ?? 0} />
       </div>
 
+      <Card title="WhatsApp reply assistant" description="A client messaged you on WhatsApp? Paste it here — Iris writes the reply, updates the lead and puts a call on your desk. Then tap Send on WhatsApp." className="mb-6">
+        <form action={whatsappAssistAction} className="grid gap-3 md:grid-cols-6">
+          <Field label="Who" className="md:col-span-2"><Select name="lead_id" options={waContacts.map((c) => ({ value: c.id, label: `${c.name}${c.phone ? ` · ${c.phone}` : ""}` }))} placeholder="New contact (enter number →)" /></Field>
+          <Field label="Their WhatsApp number" className="md:col-span-2" hint="only for a new contact, with country code"><input name="phone" maxLength={40} className="input" placeholder="+91 98xxx xxxxx" /></Field>
+          <Field label="Name" className="md:col-span-2" hint="optional"><input name="name" maxLength={200} className="input" /></Field>
+          <Field label="Their message" className="md:col-span-6"><textarea name="message" required rows={3} maxLength={4000} className="input" placeholder="Paste exactly what they wrote on WhatsApp" /></Field>
+          <div className="md:col-span-6"><SubmitButton pendingText="Iris is writing (30–60 sec)…">Ask Iris for a reply</SubmitButton></div>
+        </form>
+      </Card>
+
       <Card title={`People to call (${people.length})`} description="Clients who replied or were won, and approved leads reachable only by phone. Tap the number to call." className="mb-6">
         {people.length ? (
           <ul className="divide-y divide-line">
             {people.map((c) => {
-              const wa = whatsappLink(c.phone, c.country, `Hi ${c.name}, this is Teamwork HR Solutions — thanks for your time.`);
+              const wa = whatsappLink(c.phone, c.country, c.pitch_whatsapp ?? `Hi ${c.name}, this is Teamwork HR Solutions — thanks for your time.`);
               return (
                 <li key={c.id} className="flex flex-col gap-2 py-3 sm:flex-row sm:items-center sm:justify-between">
                   <div className="min-w-0">
                     <div className="flex flex-wrap items-center gap-2"><span className="font-medium text-zinc-100">{c.name}</span><Badge>{c.status}</Badge><span className="text-xs text-zinc-500">{[c.category, c.city].filter(Boolean).join(" · ")}</span></div>
                     {c.outcome_note && <p className="mt-0.5 line-clamp-2 text-xs text-zinc-400">{c.outcome_note}</p>}
                     {!c.outcome_note && c.ai_reason && <p className="mt-0.5 line-clamp-2 text-xs text-zinc-500">Why: {c.ai_reason}</p>}
+                    {c.pitch_whatsapp && c.status !== "approved" && <p className="mt-1.5 rounded-md border border-emerald-500/20 bg-emerald-500/[0.05] px-2 py-1.5 text-xs text-emerald-100"><span className="text-emerald-400">Iris&apos;s reply ready:</span> {c.pitch_whatsapp}</p>}
                   </div>
                   <div className="flex shrink-0 flex-wrap items-center gap-2 text-sm">
                     {c.phone ? <a href={`tel:${c.phone}`} className="btn-gold"><Phone className="h-4 w-4" />{c.phone}</a> : <span className="text-xs text-zinc-500">No phone listed</span>}
-                    {wa && <a href={wa} target="_blank" rel="noreferrer" className="btn-ghost"><MessageCircle className="h-4 w-4" />WhatsApp</a>}
+                    {wa && <a href={wa} target="_blank" rel="noreferrer" className="btn-ghost"><MessageCircle className="h-4 w-4" />{c.pitch_whatsapp ? "Send on WhatsApp" : "WhatsApp"}</a>}
                     {c.email && <a href={`mailto:${c.email}`} className="btn-ghost">{c.email}</a>}
                   </div>
                 </li>
