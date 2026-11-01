@@ -17,7 +17,7 @@ export default async function SettingsPage() {
 
   return (
     <>
-      <PageHeader title="Settings" subtitle="Organisation, access control and integration status. Secrets are configured as environment variables, never in the browser." />
+      <PageHeader eyebrow="System" title="Settings" subtitle="Organisation, access control and integration status. Secrets are configured as environment variables, never in the browser." />
       <div className="grid gap-6 xl:grid-cols-2">
         <Card title="Organisation">
           <dl className="grid grid-cols-3 gap-2 text-sm">
@@ -46,7 +46,7 @@ export default async function SettingsPage() {
         </Card>
         <Card title="Departments">
           <ul className="divide-y divide-line text-sm">
-            {(departments ?? []).map((d) => <li key={d.id} className="py-2"><div className="text-white">{d.name}</div><div className="text-xs text-muted">{d.description}</div></li>)}
+            {(departments ?? []).map((d) => <li key={d.id} className="py-2"><div className="text-zinc-50">{d.name}</div><div className="text-xs text-muted">{d.description}</div></li>)}
           </ul>
         </Card>
       </div>

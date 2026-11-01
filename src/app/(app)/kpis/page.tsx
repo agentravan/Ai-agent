@@ -23,7 +23,7 @@ export default async function KpisPage({ searchParams }: { searchParams: SearchP
 
   return (
     <>
-      <PageHeader title="KRAs & KPIs" subtitle="Every task and project is tied to a Key Result Area. Set measurable KPI targets per KRA — targets are your decision, never invented by AI." />
+      <PageHeader eyebrow="Governance" title="KRAs & KPIs" subtitle="Every task and project is tied to a Key Result Area. Set measurable KPI targets per KRA — targets are your decision, never invented by AI." />
       <Flash params={params} />
       <div className="space-y-6">
         {groups.map((g) => {
@@ -36,9 +36,9 @@ export default async function KpisPage({ searchParams }: { searchParams: SearchP
                   const kk = (kpis ?? []).filter((x) => x.kra_id === k.id);
                   const t = (taskKras ?? []).filter((x) => x.kra_id === k.id);
                   return (
-                    <div key={k.id} className="rounded-lg border border-line bg-ink/40 p-3">
+                    <div key={k.id} className="rounded-lg border border-line bg-panel-2/40 p-3">
                       <div className="flex items-baseline justify-between gap-2">
-                        <h3 className="font-medium text-white">{k.name}</h3>
+                        <h3 className="font-medium text-zinc-50">{k.name}</h3>
                         <span className="text-xs text-muted">{t.filter((x) => x.status === "done").length}/{t.length} tasks done</span>
                       </div>
                       {k.description && <p className="text-xs text-muted">{k.description}</p>}

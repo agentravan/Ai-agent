@@ -14,10 +14,10 @@ export function ExecutiveConsole({ agent, returnTo, aiAvailable, canOperate, pla
   return (
     <div className="grid gap-6 xl:grid-cols-3">
       <Card title="Identity">
-        <div className="text-lg font-semibold text-white">{agent.name}</div>
+        <div className="text-lg font-semibold text-zinc-50">{agent.name}</div>
         <div className="text-sm text-muted">{agent.designation}</div>
         <div className="mt-2 flex flex-wrap gap-1.5"><Badge tone="gold">{TIER_LABEL[agent.tier]}</Badge><Badge>{agent.status}</Badge></div>
-        <p className="mt-3 text-sm whitespace-pre-wrap text-slate-300">{agent.instructions || "No role instructions configured."}</p>
+        <p className="mt-3 text-sm whitespace-pre-wrap text-zinc-300">{agent.instructions || "No role instructions configured."}</p>
         <div className="mt-3 flex flex-wrap gap-1.5">{agent.agent_permissions.map((p) => <Badge key={p.permission} tone="neutral">{p.permission}</Badge>)}</div>
       </Card>
       <Card title="Founder communication" className="xl:col-span-2">

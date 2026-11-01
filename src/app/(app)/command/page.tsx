@@ -30,7 +30,7 @@ export default async function CommandPage({ searchParams }: { searchParams: Sear
 
   return (
     <>
-      <PageHeader title="Empire Command" subtitle="Give an instruction in plain language. The AI CEO drafts a structured plan; you review it; governance decides what runs and what needs approval." />
+      <PageHeader eyebrow="Overview" title="Empire Command" subtitle="Give an instruction in plain language. The AI CEO drafts a structured plan; you review it; governance decides what runs and what needs approval." />
       <Flash params={params} />
       <div className="grid gap-6 xl:grid-cols-3">
         <Card title="New command" className="xl:col-span-2">
@@ -46,7 +46,7 @@ export default async function CommandPage({ searchParams }: { searchParams: Sear
         <Card title="AI provider"><AiStatusPanel status={ai} /></Card>
       </div>
 
-      <h2 className="mt-8 mb-3 text-sm font-semibold text-slate-200">Execution tracking</h2>
+      <h2 className="mt-8 mb-3 text-sm font-semibold text-zinc-200">Execution tracking</h2>
       {!commands?.length ? <Empty>No commands issued yet.</Empty> : (
         <div className="space-y-4">
           {commands.map((c) => {
@@ -60,16 +60,16 @@ export default async function CommandPage({ searchParams }: { searchParams: Sear
                   <span>{names.get(c.agent_id ?? "") ?? "CEO"} · attempt {c.attempts}/{c.max_attempts} · {c.provider ?? "—"}</span>
                   <span className="ml-auto">{formatDateTime(c.created_at)}</span>
                 </div>
-                <p className="mt-2 text-sm text-slate-200">{c.input.split("\n")[0]?.replace("Founder command: ", "")}</p>
+                <p className="mt-2 text-sm text-zinc-200">{c.input.split("\n")[0]?.replace("Founder command: ", "")}</p>
                 {c.error && <p className="mt-2 text-sm text-rose-300">{c.error}</p>}
                 {plan.success && (
                   <div className="mt-3 border-t border-line pt-3">
-                    <p className="text-sm text-slate-300">{plan.data.summary}</p>
+                    <p className="text-sm text-zinc-300">{plan.data.summary}</p>
                     <ol className="mt-3 space-y-2">
                       {plan.data.steps.map((s, i) => {
                         const o = stored.outcomes?.[i];
                         return (
-                          <li key={i} className="flex flex-col gap-1 rounded-lg bg-ink/40 p-2.5 text-sm sm:flex-row sm:items-center sm:justify-between">
+                          <li key={i} className="flex flex-col gap-1 rounded-lg bg-panel-2/40 p-2.5 text-sm sm:flex-row sm:items-center sm:justify-between">
                             <span><span className="text-muted">{i + 1}.</span> {s.title} <span className="text-xs text-muted">({s.action.replace("_", " ")}{s.assignee ? ` → ${s.assignee}` : ""})</span></span>
                             <span className="flex flex-wrap gap-1.5"><Badge>{s.risk}</Badge>{o && <Badge>{o.outcome}</Badge>}</span>
                           </li>

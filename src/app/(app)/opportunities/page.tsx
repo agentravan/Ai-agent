@@ -20,13 +20,13 @@ export default async function OpportunitiesPage({ searchParams }: { searchParams
   const names = new Map(agents.map((a) => [a.id, a.name]));
   return (
     <>
-      <PageHeader title="Opportunities" subtitle="Business opportunities proposed by your AI executives or by you." />
+      <PageHeader eyebrow="Operations" title="Opportunities" subtitle="Business opportunities proposed by your AI executives or by you." />
       <Flash params={params} />
       <Card>
         <Table head={["Opportunity", "Est. value", "Proposed by", "Created", "Status"]}>
           {(data ?? []).map((o) => (
             <tr key={o.id}>
-              <Td><div className="text-white">{o.title}</div><div className="text-xs text-muted">{truncate(o.summary, 140)}</div></Td>
+              <Td><div className="text-zinc-50">{o.title}</div><div className="text-xs text-muted">{truncate(o.summary, 140)}</div></Td>
               <Td>{formatInr(o.estimated_value_cents)}</Td>
               <Td>{names.get(o.proposed_by_agent_id ?? "") ?? "Founder"}</Td>
               <Td className="text-xs text-muted">{formatDateTime(o.created_at)}</Td>

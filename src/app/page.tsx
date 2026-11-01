@@ -1,42 +1,50 @@
 import Link from "next/link";
 import { redirect } from "next/navigation";
+import { ArrowRight, BadgeCheck, Bot, ScrollText, Wallet } from "lucide-react";
 import { Logo } from "@/components/navigation/logo";
 import { resolveContext } from "@/modules/auth/session";
 
 const PILLARS = [
-  ["AI CEO & COO", "Executive agents with defined role instructions plan strategy and run operations."],
-  ["Governed autonomy", "Every agent action passes permission, cost and approval checks before it executes."],
-  ["Full audit trail", "Database-enforced, append-only history of every user and agent action."],
-  ["₹0 infrastructure", "Runs on free tiers: Vercel, Supabase and local Ollama inference."],
+  { icon: Bot, title: "AI executive team", text: "A CEO, COO and unit managers with defined roles plan, delegate and execute work." },
+  { icon: BadgeCheck, title: "Governed autonomy", text: "Permission, cost and approval checks on every action. Critical decisions wait for you." },
+  { icon: ScrollText, title: "Complete audit trail", text: "Database-enforced, append-only history of every human and agent action." },
+  { icon: Wallet, title: "Zero infrastructure cost", text: "Runs entirely on free tiers — Vercel, Supabase and open models." },
 ];
 
 export default async function Home() {
   if ((await resolveContext()).state === "ready") redirect("/dashboard");
   return (
-    <main className="mx-auto flex min-h-dvh max-w-5xl flex-col px-4 py-8 sm:px-6">
-      <header className="flex items-center justify-between">
+    <main className="relative mx-auto flex min-h-dvh max-w-6xl flex-col px-5 sm:px-8">
+      <header className="flex h-20 items-center justify-between">
         <Logo />
-        <Link href="/login" className="btn-primary">Founder login</Link>
+        <Link href="/login" className="btn-ghost">Sign in</Link>
       </header>
       <section className="flex flex-1 flex-col justify-center py-16">
-        <p className="text-sm font-medium tracking-widest text-gold uppercase">Autonomous business operating system</p>
-        <h1 className="mt-3 max-w-3xl text-4xl font-semibold tracking-tight text-white sm:text-5xl">
-          Run your company with an AI executive team — under your command.
-        </h1>
-        <p className="mt-4 max-w-2xl text-muted">
-          AI Empire OS gives a founder an AI CEO, COO and workforce that plan, delegate and execute work,
-          while every risky action waits for your approval.
+        <p className="inline-flex w-fit items-center gap-2 rounded-full border border-line bg-panel/70 px-3 py-1 text-xs text-zinc-400">
+          <span className="h-1.5 w-1.5 rounded-full bg-gold" /> Private founder workspace
         </p>
-        <div className="mt-10 grid gap-3 sm:grid-cols-2">
-          {PILLARS.map(([t, d]) => (
-            <div key={t} className="rounded-xl border border-line bg-panel p-4">
-              <h2 className="font-medium text-white">{t}</h2>
-              <p className="mt-1 text-sm text-muted">{d}</p>
+        <h1 className="mt-6 max-w-3xl text-4xl leading-[1.1] font-semibold tracking-tight text-zinc-50 sm:text-6xl">
+          Run your company with an AI executive office.
+        </h1>
+        <p className="mt-5 max-w-2xl text-base text-zinc-400 sm:text-lg">
+          AI Empire OS gives you a CEO, COO and division managers that plan, delegate and report — while every critical decision stays with you.
+        </p>
+        <div className="mt-8 flex gap-3">
+          <Link href="/login" className="btn-gold h-10 px-5">Open cockpit <ArrowRight className="h-4 w-4" /></Link>
+        </div>
+        <div className="mt-16 grid gap-px overflow-hidden rounded-xl border border-line bg-line sm:grid-cols-2 lg:grid-cols-4">
+          {PILLARS.map(({ icon: Icon, title, text }) => (
+            <div key={title} className="bg-panel p-5">
+              <Icon className="h-5 w-5 text-gold" aria-hidden />
+              <h2 className="mt-4 text-sm font-semibold text-zinc-100">{title}</h2>
+              <p className="mt-1.5 text-sm text-zinc-500">{text}</p>
             </div>
           ))}
         </div>
       </section>
-      <footer className="text-xs text-muted">Founder: Harshit Bhardwaj · AI Empire OS</footer>
+      <footer className="flex h-16 items-center justify-between border-t border-line text-xs text-zinc-500">
+        <span>© AI Empire OS</span><span>Founder: Harshit Bhardwaj</span>
+      </footer>
     </main>
   );
 }

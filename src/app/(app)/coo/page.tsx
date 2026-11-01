@@ -32,7 +32,7 @@ export default async function CooPage({ searchParams }: { searchParams: SearchPa
 
   return (
     <>
-      <PageHeader title="AI COO Office" subtitle="Operational overview, task assignment, project tracking and workforce monitoring." />
+      <PageHeader eyebrow="Executive Office" title="AI COO Office" subtitle="Operational overview, task assignment, project tracking and workforce monitoring." />
       <Flash params={params} />
       <div className="mb-6 grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
         {TASK_STATUSES.map((s) => <Stat key={s} label={s.replace("_", " ")} value={byStatus[s] ?? 0} />)}
@@ -63,7 +63,7 @@ export default async function CooPage({ searchParams }: { searchParams: SearchPa
               const pct = pt.length ? Math.round((done / pt.length) * 100) : 0;
               return (
                 <tr key={p.id}>
-                  <Td className="text-white">{p.name}</Td>
+                  <Td className="text-zinc-50">{p.name}</Td>
                   <Td><Badge>{p.status}</Badge></Td>
                   <Td>
                     <div className="flex items-center gap-2"><div className="h-1.5 w-28 rounded-full bg-line"><div className="h-1.5 rounded-full bg-gold" style={{ width: `${pct}%` }} /></div><span className="text-xs text-muted">{done}/{pt.length}</span></div>
@@ -81,7 +81,7 @@ export default async function CooPage({ searchParams }: { searchParams: SearchPa
             const runs = (executions ?? []).filter((e) => e.agent_id === a.id);
             return (
               <tr key={a.id}>
-                <Td><span className="text-white">{a.name}</span> <span className="text-xs text-muted">{a.designation}</span></Td>
+                <Td><span className="text-zinc-50">{a.name}</span> <span className="text-xs text-muted">{a.designation}</span></Td>
                 <Td><Badge>{a.status}</Badge></Td>
                 <Td>{(tasks ?? []).filter((t) => t.assigned_agent_id === a.id && ["todo", "in_progress", "blocked"].includes(t.status)).length}</Td>
                 <Td>{runs.length}</Td>
@@ -93,7 +93,7 @@ export default async function CooPage({ searchParams }: { searchParams: SearchPa
         </Table>
       </Card>
 
-      <h2 className="mt-8 mb-3 text-sm font-semibold text-slate-200">Recent executions</h2>
+      <h2 className="mt-8 mb-3 text-sm font-semibold text-zinc-200">Recent executions</h2>
       <ExecutionList executions={(executions ?? []).slice(0, 10)} agentNames={new Map(agents.map((a) => [a.id, a.name]))} empty="No agent executions this month." />
     </>
   );

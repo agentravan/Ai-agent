@@ -25,25 +25,25 @@ export default async function ApprovalsPage({ searchParams }: { searchParams: Se
 
   return (
     <>
-      <PageHeader title="Approval Matrix" subtitle="Only critical decisions, budget breaches and policy changes reach you. Approve, reject, or modify then approve. Approved plan steps execute immediately." />
+      <PageHeader eyebrow="Governance" title="Approval Matrix" subtitle="Only critical decisions, budget breaches and policy changes reach you. Approve, reject, or modify then approve. Approved plan steps execute immediately." />
       <Flash params={params} />
-      <h2 className="mb-3 text-sm font-semibold text-slate-200">Pending ({pending?.length ?? 0})</h2>
+      <h2 className="mb-3 text-sm font-semibold text-zinc-200">Pending ({pending?.length ?? 0})</h2>
       {!pending?.length ? <Empty>No pending requests.</Empty> : (
         <div className="space-y-4">
           {pending.map((a) => (
             <Card key={a.id}>
               <div className="flex flex-wrap items-center gap-2">
-                <span className="font-medium text-white">{a.title}</span>
+                <span className="font-medium text-zinc-50">{a.title}</span>
                 <Badge>{a.risk}</Badge><Badge tone="neutral">{a.action_type}</Badge>
                 <span className="ml-auto text-xs text-muted">{names.get(a.requested_by_agent_id ?? "") ?? "Founder team"} · {formatDateTime(a.created_at)}</span>
               </div>
               <details className="mt-2 text-sm">
                 <summary className="cursor-pointer text-xs text-gold">Action details</summary>
-                <pre className="mt-2 max-h-72 overflow-auto rounded-lg bg-ink/60 p-3 text-xs text-slate-300">{JSON.stringify(a.payload, null, 2)}</pre>
+                <pre className="mt-2 max-h-72 overflow-auto rounded-lg bg-panel-2/60 p-3 text-xs text-zinc-300">{JSON.stringify(a.payload, null, 2)}</pre>
               </details>
               {(() => {
                 const p = a.payload as StepPayload;
-                return (p.kra || p.reason) ? <p className="mt-1 text-xs text-muted">{p.kra && <>KRA: <span className="text-slate-300">{p.kra}</span> · </>}{p.reason}</p> : null;
+                return (p.kra || p.reason) ? <p className="mt-1 text-xs text-muted">{p.kra && <>KRA: <span className="text-zinc-300">{p.kra}</span> · </>}{p.reason}</p> : null;
               })()}
               {canGovern && (a.payload as StepPayload).step?.action && (a.payload as StepPayload).step?.action !== "request_approval" && (
                 <details className="mt-3 rounded-lg border border-line p-3">
@@ -78,7 +78,7 @@ export default async function ApprovalsPage({ searchParams }: { searchParams: Se
         <Table head={["Request", "Type", "Decision", "Note", "Decided"]}>
           {(history ?? []).map((a) => (
             <tr key={a.id}>
-              <Td className="text-white">{a.title}</Td>
+              <Td className="text-zinc-50">{a.title}</Td>
               <Td className="text-xs">{a.action_type}</Td>
               <Td><Badge>{a.status}</Badge></Td>
               <Td className="text-xs text-muted">{a.decision_note ?? "—"}</Td>

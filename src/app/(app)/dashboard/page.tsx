@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { BadgeCheck, CheckCircle2, Cpu, TrendingDown, TrendingUp, Wallet } from "lucide-react";
 import type { ReactNode } from "react";
 import { AiStatusPanel } from "@/components/dashboard/ai-status";
 import { Badge, Card, Empty, Flash, PageHeader, Stat, type SearchParams } from "@/components/ui";
@@ -24,7 +25,10 @@ function Progress({ pct }: { pct: number }) {
 }
 
 const Section = ({ n, title, children, action, className }: { n: number; title: string; children: ReactNode; action?: ReactNode; className?: string }) => (
-  <Card title={<span><span className="mr-2 text-gold">{n}.</span>{title}</span>} action={action} className={className}>{children}</Card>
+  <Card title={<span className="flex items-center gap-2.5"><span className="num grid h-5 w-5 place-items-center rounded bg-gold/10 text-[11px] font-semibold text-gold">{n}</span>{title}</span>} action={action} className={className}>{children}</Card>
+);
+const ViewLink = ({ href, children }: { href: string; children: ReactNode }) => (
+  <Link href={href} className="text-xs font-medium text-zinc-400 transition hover:text-zinc-100">{children} →</Link>
 );
 
 export default async function CockpitPage({ searchParams }: { searchParams: SearchParams }) {
@@ -39,8 +43,9 @@ export default async function CockpitPage({ searchParams }: { searchParams: Sear
   return (
     <>
       <PageHeader
-        title="AI Empire — Founder Dashboard"
-        subtitle={`CEO Executive Cockpit · ${ctx.organisation.name} · ${formatDateTime(new Date().toISOString())}`}
+        eyebrow="CEO Executive Cockpit"
+        title="Founder Dashboard"
+        subtitle={`${ctx.organisation.name} · ${formatDateTime(new Date().toISOString())}`}
         action={<div className="max-w-xs"><AiStatusPanel status={ai} /></div>}
       />
       <Flash params={params} />
@@ -57,14 +62,14 @@ export default async function CockpitPage({ searchParams }: { searchParams: Sear
             </form>
           )}>
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
-            <Stat label="Tasks completed" value={d.tasksDone} hint={`${d.tasksCreated} created`} />
-            <Stat label="Agent runs" value={d.runsOk} hint={`${d.runsFailed} failed`} />
-            <Stat label="Awaiting you" value={c.approvals.length} hint={`${d.decisions} decided in 24h`} />
+            <Stat icon={CheckCircle2} label="Tasks completed" value={d.tasksDone} hint={`${d.tasksCreated} created`} />
+            <Stat icon={Cpu} label="Agent runs" value={d.runsOk} hint={`${d.runsFailed} failed`} />
+            <Stat icon={BadgeCheck} label="Awaiting you" value={c.approvals.length} hint={`${d.decisions} decided in 24h`} />
           </div>
           {c.latestBriefing?.output ? (
-            <details className="mt-4 rounded-lg border border-line bg-ink/40 p-3" open>
+            <details className="mt-4 rounded-lg border border-line bg-panel-2/40 p-4" open>
               <summary className="cursor-pointer text-xs text-muted">Latest AI briefing by {ceo?.name ?? "CEO"} · {formatDateTime(c.latestBriefing.created_at)}</summary>
-              <div className="mt-2 max-h-96 overflow-y-auto text-sm whitespace-pre-wrap text-slate-200">{c.latestBriefing.output}</div>
+              <div className="mt-2 max-h-96 overflow-y-auto text-sm whitespace-pre-wrap text-zinc-200">{c.latestBriefing.output}</div>
             </details>
           ) : (
             <p className="mt-4 text-xs text-muted">{ai.available ? "No briefing yet — generate one to get an AI narrative grounded in these numbers." : "AI briefing unavailable until an AI provider is connected. All figures above are live."}</p>
@@ -72,14 +77,17 @@ export default async function CockpitPage({ searchParams }: { searchParams: Sear
         </Section>
 
         {/* 3. Financial headline */}
-        <Section n={3} title="Financial headline & budget" action={<Link href="/finance" className="text-xs text-gold">Finance</Link>}>
-          <dl className="grid grid-cols-2 gap-x-3 gap-y-2 text-sm">
+        <Section n={3} title="Financial headline & budget" action={<ViewLink href="/finance">Finance</ViewLink>}>
+          <div className="mb-4 flex items-center justify-between rounded-lg bg-panel-2/60 p-3">
+            <div><div className="text-xs text-muted">Net profit · 30 days</div><div className={`num mt-0.5 text-2xl font-semibold ${f.net30Cents < 0 ? "text-rose-300" : "text-zinc-50"}`}>{formatInr(f.net30Cents)}</div></div>
+            {f.net30Cents < 0 ? <TrendingDown className="h-5 w-5 text-rose-400" /> : f.net30Cents > 0 ? <TrendingUp className="h-5 w-5 text-emerald-400" /> : <Wallet className="h-5 w-5 text-zinc-500" />}
+          </div>
+          <dl className="num grid grid-cols-2 gap-x-3 gap-y-2.5 text-sm">
             <dt className="text-muted">Total inbound</dt><dd className="text-right text-emerald-300">{formatInr(f.inboundCents)}</dd>
             <dt className="text-muted">Total outbound</dt><dd className="text-right text-amber-300">{formatInr(f.outboundCents)}</dd>
             <dt className="text-muted">Budget pool</dt><dd className="text-right">{formatInr(f.budgetPoolCents)}</dd>
             <dt className="text-muted">Budget remaining</dt><dd className="text-right">{formatInr(f.budgetRemainingCents)}</dd>
             <dt className="text-muted">Burn (30 days)</dt><dd className="text-right">{formatInr(f.burn30Cents)}</dd>
-            <dt className="text-muted">Net profit (30 days)</dt><dd className={`text-right font-semibold ${f.net30Cents < 0 ? "text-rose-300" : "text-white"}`}>{formatInr(f.net30Cents)}</dd>
           </dl>
           {f.inboundCents === 0 && f.outboundCents === 0 && <p className="mt-3 text-xs text-muted">No transactions recorded yet.</p>}
         </Section>
@@ -91,9 +99,9 @@ export default async function CockpitPage({ searchParams }: { searchParams: Sear
               const isHr = u.unit.name.startsWith("HR");
               const isEcom = u.unit.name.includes("Buyontime");
               return (
-                <div key={u.unit.id} className="rounded-lg border border-line bg-ink/40 p-3 text-sm">
+                <div key={u.unit.id} className="rounded-lg border border-line bg-panel-2/40 p-4 text-sm">
                   <div className="flex items-start justify-between gap-2">
-                    <h3 className="font-medium text-white">{u.unit.name}</h3>
+                    <h3 className="font-medium text-zinc-50">{u.unit.name}</h3>
                     <Badge tone={u.blockedTasks ? "warn" : "good"}>{u.blockedTasks ? `${u.blockedTasks} blocked` : "on track"}</Badge>
                   </div>
                   <p className="text-xs text-muted">Manager: {u.manager ? `${u.manager.name} · ${u.manager.designation}` : "unassigned"}</p>
@@ -108,7 +116,7 @@ export default async function CockpitPage({ searchParams }: { searchParams: Sear
                   </dl>
                   <div className="mt-2 border-t border-line pt-2">
                     {u.kpis.length ? u.kpis.slice(0, 3).map((k) => <div key={k.name} className="flex items-center justify-between gap-2 text-xs"><span className="truncate">{k.name}</span><Progress pct={k.pct} /></div>)
-                      : <p className="text-xs text-muted">{isHr ? "Compliance status: no KPI set" : "No KPIs set"} · <Link href="/kpis" className="text-gold">set targets</Link></p>}
+                      : <p className="text-xs text-muted">{isHr ? "Compliance status: no KPI set" : "No KPIs set"} · <Link href="/kpis" className="text-zinc-300 underline decoration-zinc-600 underline-offset-2 hover:text-white">set targets</Link></p>}
                   </div>
                 </div>
               );
@@ -117,14 +125,14 @@ export default async function CockpitPage({ searchParams }: { searchParams: Sear
         </Section>
 
         {/* 4. Virtual desk */}
-        <Section n={4} title="Real-time office · who is doing what" className="xl:col-span-2" action={<Link href="/coo" className="text-xs text-gold">COO Office</Link>}>
+        <Section n={4} title="Real-time office · who is doing what" className="xl:col-span-2" action={<ViewLink href="/coo">COO Office</ViewLink>}>
           <ul className="divide-y divide-line">
             {c.desk.map(({ agent, entry, pendingFinanceApprovals }) => (
               <li key={agent.id} className="flex flex-col gap-1 py-2.5 sm:flex-row sm:items-center sm:justify-between">
                 <div className="min-w-0">
-                  <div className="text-sm"><span className="text-white">{agent.name}</span> <span className="text-muted">· {agent.designation}</span></div>
+                  <div className="text-sm"><span className="text-zinc-50">{agent.name}</span> <span className="text-muted">· {agent.designation}</span></div>
                   <div className="truncate text-xs text-muted">
-                    {entry.current ? <>Working on: <span className="text-slate-300">{truncate(entry.current.title, 70)}</span> ({entry.current.status.replace("_", " ")})</> : "Idle — no open tasks"}
+                    {entry.current ? <>Working on: <span className="text-zinc-300">{truncate(entry.current.title, 70)}</span> ({entry.current.status.replace("_", " ")})</> : "Idle — no open tasks"}
                     {pendingFinanceApprovals !== undefined && ` · ${pendingFinanceApprovals} finance approval(s) pending`}
                   </div>
                 </div>
@@ -135,7 +143,7 @@ export default async function CockpitPage({ searchParams }: { searchParams: Sear
         </Section>
 
         {/* 5. Think tank */}
-        <Section n={5} title="Strategic think-tank" action={<Link href="/opportunities" className="text-xs text-gold">All ideas</Link>}>
+        <Section n={5} title="Strategic think-tank" action={<ViewLink href="/opportunities">All ideas</ViewLink>}>
           <h3 className="text-xs tracking-wide text-muted uppercase">Growth ideas under evaluation</h3>
           {c.thinkTank.length ? (
             <ul className="mt-1 space-y-1 text-sm">{c.thinkTank.map((o) => <li key={o.id} className="flex justify-between gap-2"><span className="truncate">{o.title}</span><Badge>{o.status}</Badge></li>)}</ul>
@@ -145,13 +153,13 @@ export default async function CockpitPage({ searchParams }: { searchParams: Sear
         </Section>
 
         {/* 6. Approval matrix */}
-        <Section n={6} title="Approval matrix · pending Founder sign-off" className="xl:col-span-3" action={<Link href="/approvals" className="text-xs text-gold">Full matrix & Modify</Link>}>
+        <Section n={6} title="Approval matrix · pending Founder sign-off" className="xl:col-span-3" action={<ViewLink href="/approvals">Full matrix & Modify</ViewLink>}>
           {c.approvals.length ? (
             <ul className="divide-y divide-line">
               {c.approvals.map((a) => (
                 <li key={a.id} className="flex flex-col gap-2 py-2.5 md:flex-row md:items-center md:justify-between">
                   <div className="min-w-0 text-sm">
-                    <span className="text-white">{a.title}</span>
+                    <span className="text-zinc-50">{a.title}</span>
                     <span className="ml-2 inline-flex gap-1.5 align-middle"><Badge>{a.risk}</Badge><Badge tone="neutral">{a.action_type}</Badge></span>
                   </div>
                   {canGovern && (

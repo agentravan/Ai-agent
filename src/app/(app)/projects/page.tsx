@@ -32,14 +32,14 @@ export default async function ProjectsPage({ searchParams }: { searchParams: Sea
 
   return (
     <>
-      <PageHeader title="Projects & Tasks" subtitle="Track delivery. Run a task to delegate it to its assigned AI agent (dependencies must be done first)." />
+      <PageHeader eyebrow="Operations" title="Projects & Tasks" subtitle="Track delivery. Run a task to delegate it to its assigned AI agent (dependencies must be done first)." />
       <Flash params={params} />
       <div className="grid gap-6 xl:grid-cols-3">
         <Card title="Projects" className="xl:col-span-2">
           <Table head={["Project", "Unit · KRA", "Owner", "Status"]}>
             {(projects ?? []).map((p) => (
               <tr key={p.id}>
-                <Td><div className="text-white">{p.name}</div><div className="text-xs text-muted">{truncate(p.description, 100)}</div></Td>
+                <Td><div className="text-zinc-50">{p.name}</div><div className="text-xs text-muted">{truncate(p.description, 100)}</div></Td>
                 <Td className="text-xs"><div>{unitName.get(p.business_unit_id ?? "") ?? "—"}</div><div className="text-muted">{kraName.get(p.kra_id ?? "") ?? "No KRA"}</div></Td>
                 <Td>{agents.find((a) => a.id === p.owner_agent_id)?.name ?? "—"}</Td>
                 <Td>
@@ -75,8 +75,8 @@ export default async function ProjectsPage({ searchParams }: { searchParams: Sea
           {(tasks ?? []).map((t) => (
             <tr key={t.id}>
               <Td>
-                <div className="text-white">{t.title}</div>
-                {t.result && <details className="mt-1 text-xs text-muted"><summary className="cursor-pointer text-gold">Result</summary><div className="mt-1 max-h-64 overflow-y-auto whitespace-pre-wrap text-slate-300">{t.result}</div></details>}
+                <div className="text-zinc-50">{t.title}</div>
+                {t.result && <details className="mt-1 text-xs text-muted"><summary className="cursor-pointer font-medium text-zinc-300 hover:text-white">Result</summary><div className="mt-1 max-h-64 overflow-y-auto whitespace-pre-wrap text-zinc-300">{t.result}</div></details>}
               </Td>
               <Td className="text-xs"><div>{projectName.get(t.project_id ?? "") ?? "—"}</div><div className={t.kra_id ? "text-muted" : "text-amber-300"}>{kraName.get(t.kra_id ?? "") ?? "No KRA"}</div></Td>
               <Td><Badge>{t.priority}</Badge></Td>

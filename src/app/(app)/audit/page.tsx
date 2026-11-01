@@ -26,7 +26,7 @@ export default async function AuditPage({ searchParams }: { searchParams: Search
 
   return (
     <>
-      <PageHeader title="Audit Log" subtitle="Append-only record. Row changes are captured by database triggers and cannot be edited or deleted." />
+      <PageHeader eyebrow="Governance" title="Audit Log" subtitle="Append-only record. Row changes are captured by database triggers and cannot be edited or deleted." />
       <div className="mb-4 flex flex-wrap gap-2">
         {FILTERS.map((f) => (
           <Link key={f.label} href={`/audit${f.q ? `?${f.q}` : ""}`} className={cn("rounded-full border px-3 py-1 text-xs", current === f.q ? "border-gold text-gold" : "border-line text-muted hover:text-white")}>{f.label}</Link>
@@ -41,8 +41,8 @@ export default async function AuditPage({ searchParams }: { searchParams: Search
               <Td>{humanize(l.action)}</Td>
               <Td className="text-xs">{l.entity}</Td>
               <Td>
-                <details className="text-xs"><summary className="cursor-pointer text-gold">View</summary>
-                  <pre className="mt-1 max-h-60 max-w-md overflow-auto rounded bg-ink/60 p-2 text-slate-300">{JSON.stringify(l.metadata, null, 2)}</pre>
+                <details className="text-xs"><summary className="cursor-pointer font-medium text-zinc-300 hover:text-white">View</summary>
+                  <pre className="mt-1 max-h-60 max-w-md overflow-auto rounded bg-panel-2/60 p-2 text-zinc-300">{JSON.stringify(l.metadata, null, 2)}</pre>
                 </details>
               </Td>
             </tr>

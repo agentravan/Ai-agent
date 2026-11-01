@@ -28,7 +28,7 @@ export default async function FinancePage({ searchParams }: { searchParams: Sear
 
   return (
     <>
-      <PageHeader title="Finance & Accounts" subtitle="Inbound client payments, outbound expenses, budgets and cash flow. Every entry is audited; nothing moves money automatically." />
+      <PageHeader eyebrow="Governance" title="Finance & Accounts" subtitle="Inbound client payments, outbound expenses, budgets and cash flow. Every entry is audited; nothing moves money automatically." />
       <Flash params={params} />
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
         <Stat label="Total inbound" value={formatInr(f.inboundCents)} hint={`30 days: ${formatInr(f.inbound30Cents)}`} />
@@ -71,7 +71,7 @@ export default async function FinancePage({ searchParams }: { searchParams: Sear
               const status = s > Number(b.amount_cents) ? "Over budget" : b.period_end < today ? "Closed" : b.period_start > today ? "Upcoming" : "Active";
               return (
                 <tr key={b.id}>
-                  <Td className="text-white">{b.name}</Td>
+                  <Td className="text-zinc-50">{b.name}</Td>
                   <Td className="text-xs text-muted">{b.period_start} → {b.period_end}</Td>
                   <Td>{formatInr(b.amount_cents)}</Td>
                   <Td>{formatInr(s)}</Td>

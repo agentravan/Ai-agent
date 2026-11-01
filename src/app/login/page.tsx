@@ -23,13 +23,13 @@ export default async function LoginPage({ searchParams }: { searchParams: Search
 
   return (
     <main className="flex min-h-dvh items-center justify-center px-4 py-10">
-      <div className="w-full max-w-sm">
+      <div className="w-full max-w-[380px]">
         <div className="mb-8 flex justify-center"><Logo /></div>
-        <div className="rounded-2xl border border-line bg-panel p-6">
-          <h1 className="text-lg font-semibold text-white">Founder access</h1>
-          <p className="mt-1 mb-5 text-sm text-muted">Sign in to command your empire.</p>
+        <div className="rounded-xl border border-line bg-panel/80 p-6 shadow-2xl shadow-black/40 sm:p-7">
+          <h1 className="text-xl font-semibold text-zinc-50">Welcome back</h1>
+          <p className="mt-1 mb-6 text-sm text-muted">Sign in to your executive cockpit.</p>
           <Flash params={params} />
-          {notice && <p className="mb-5 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-200">{notice}</p>}
+          {notice && <p className="mb-5 rounded-lg border border-amber-500/30 bg-amber-500/[0.06] px-3 py-2 text-sm text-amber-200">{notice}</p>}
           {s.state === "unconfigured" ? null : s.state === "forbidden" || s.state === "unprovisioned" ? (
             <form action={signOutAction}><SubmitButton variant="ghost">Sign out</SubmitButton></form>
           ) : (
@@ -38,12 +38,13 @@ export default async function LoginPage({ searchParams }: { searchParams: Search
               <Field label="Email"><input className="input" type="email" name="email" autoComplete="email" required /></Field>
               <Field label="Password"><input className="input" type="password" name="password" autoComplete="current-password" minLength={8} required /></Field>
               <div className="flex flex-col gap-2 pt-1">
-                <button formAction={signInAction} className="btn-primary">Sign in</button>
-                <button formAction={signUpAction} className="btn-ghost">Create founder account</button>
+                <button formAction={signInAction} className="btn-primary h-10">Sign in</button>
+                <button formAction={signUpAction} className="btn h-10 text-zinc-400 hover:text-zinc-100">Create founder account</button>
               </div>
             </form>
           )}
         </div>
+        <p className="mt-6 text-center text-xs text-zinc-600">Private workspace · Protected by row-level security</p>
       </div>
     </main>
   );

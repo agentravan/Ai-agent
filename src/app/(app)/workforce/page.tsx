@@ -26,13 +26,13 @@ export default async function WorkforcePage({ searchParams }: { searchParams: Se
 
   return (
     <>
-      <PageHeader title="Agent Registry" subtitle="Your AI workforce: designations, instructions, departments, reporting lines, permissions and status." />
+      <PageHeader eyebrow="Operations" title="Agent Registry" subtitle="Your AI workforce: designations, instructions, departments, reporting lines, permissions and status." />
       <Flash params={params} />
       <Card>
         <Table head={["Agent", "Tier", "Division · Unit", "Reports to", "Permissions", "Status", ""]}>
           {agents.map((a) => (
             <tr key={a.id}>
-              <Td><div className="text-white">{a.name}</div><div className="text-xs text-muted">{a.designation}</div></Td>
+              <Td><div className="text-zinc-50">{a.name}</div><div className="text-xs text-muted">{a.designation}</div></Td>
               <Td><Badge tone={a.tier === "ceo" || a.tier === "coo" ? "gold" : a.tier === "executive" ? "info" : "neutral"}>{TIER_LABEL[a.tier]}</Badge></Td>
               <Td className="text-xs"><div>{depts.get(a.department_id ?? "") ?? "—"}</div><div className="text-muted">{unitName.get(a.business_unit_id ?? "") ?? ""}</div></Td>
               <Td>{names.get(a.manager_id ?? "") ?? "Founder"}</Td>
@@ -56,7 +56,7 @@ export default async function WorkforcePage({ searchParams }: { searchParams: Se
       </Card>
 
       {canGovern && (
-        <Card title={editing ? `Edit ${editing.name}` : "Hire a new AI employee"} className="mt-6" action={editing && <Link href="/workforce" className="text-xs text-gold">New agent instead</Link>}>
+        <Card title={editing ? `Edit ${editing.name}` : "Hire a new AI employee"} className="mt-6" action={editing && <Link href="/workforce" className="text-xs font-medium text-zinc-400 hover:text-zinc-100">New agent instead</Link>}>
           <form id="editor" key={editing?.id ?? "new"} action={saveAgentAction} className="grid gap-4 md:grid-cols-2">
             {editing && <input type="hidden" name="id" value={editing.id} />}
             <Field label="Name"><input name="name" required maxLength={80} defaultValue={editing?.name} className="input" /></Field>
@@ -75,7 +75,7 @@ export default async function WorkforcePage({ searchParams }: { searchParams: Se
                 {AGENT_PERMISSION_KEYS.map((p) => (
                   <label key={p} className="flex items-start gap-2 rounded-lg border border-line p-2.5 text-sm">
                     <input type="checkbox" name="permissions" value={p} defaultChecked={granted.has(p)} className="mt-0.5 accent-[#e8b64c]" />
-                    <span><span className="text-white">{p}</span><span className="block text-xs text-muted">{AGENT_PERMISSIONS[p]}</span></span>
+                    <span><span className="text-zinc-50">{p}</span><span className="block text-xs text-muted">{AGENT_PERMISSIONS[p]}</span></span>
                   </label>
                 ))}
               </div>

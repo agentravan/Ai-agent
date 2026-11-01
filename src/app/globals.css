@@ -1,31 +1,46 @@
 @import "tailwindcss";
 
+/* AI Empire OS design tokens — neutral zinc surfaces, champagne-gold accent used sparingly. */
 @theme {
-  --color-ink: #0b1020;
-  --color-panel: #121831;
-  --color-panel-2: #18203f;
-  --color-line: #263056;
-  --color-muted: #8e98c0;
-  --color-gold: #e8b64c;
-  --color-gold-strong: #f5c862;
-  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --color-ink: #09090b;
+  --color-panel: #111113;
+  --color-panel-2: #18181b;
+  --color-line: #232327;
+  --color-line-strong: #2e2e33;
+  --color-muted: #8b8b94;
+  --color-gold: #d4af6a;
+  --color-gold-strong: #e6c88e;
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, monospace;
 }
 
 @layer base {
   html { color-scheme: dark; }
-  body { @apply bg-ink text-slate-100 antialiased; }
-  ::selection { @apply bg-gold/30; }
+  body {
+    @apply bg-ink text-zinc-200 antialiased;
+    font-feature-settings: "cv11", "ss01";
+    background-image: radial-gradient(1200px 600px at 80% -10%, rgb(212 175 106 / 0.05), transparent 60%);
+    background-attachment: fixed;
+  }
+  ::selection { @apply bg-gold/25 text-white; }
+  h1, h2, h3 { @apply tracking-tight text-zinc-50; }
+  *:focus-visible { @apply outline-2 outline-offset-2 outline-gold/60; }
+  table { font-variant-numeric: tabular-nums; }
 }
 
+@utility num { font-variant-numeric: tabular-nums; }
+
 @utility input {
-  @apply w-full rounded-lg border border-line bg-ink/60 px-3 py-2 text-sm text-slate-100 placeholder:text-muted/70
-    focus:border-gold focus:ring-1 focus:ring-gold focus:outline-none disabled:opacity-50;
+  @apply w-full rounded-md border border-line bg-panel-2/60 px-3 py-2 text-sm text-zinc-100 shadow-[inset_0_1px_0_0_rgb(255_255_255/0.02)]
+    transition placeholder:text-zinc-500 hover:border-line-strong
+    focus:border-zinc-500 focus:ring-2 focus:ring-zinc-500/20 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50;
 }
 @utility btn {
-  @apply inline-flex items-center justify-center gap-2 rounded-lg px-3.5 py-2 text-sm font-medium transition
+  @apply inline-flex h-9 items-center justify-center gap-2 rounded-md px-3.5 text-sm font-medium whitespace-nowrap transition
     disabled:cursor-not-allowed disabled:opacity-50;
 }
-@utility btn-primary { @apply btn bg-gold text-ink hover:bg-gold-strong; }
-@utility btn-ghost { @apply btn border border-line text-slate-200 hover:bg-panel-2; }
-@utility btn-danger { @apply btn border border-rose-500/40 text-rose-300 hover:bg-rose-500/10; }
-@utility label { @apply mb-1 block text-xs font-medium tracking-wide text-muted uppercase; }
+@utility btn-primary { @apply btn bg-zinc-50 text-zinc-950 shadow-sm hover:bg-white; }
+@utility btn-gold { @apply btn bg-gold text-zinc-950 shadow-sm hover:bg-gold-strong; }
+@utility btn-ghost { @apply btn border border-line bg-panel-2/40 text-zinc-200 hover:border-line-strong hover:bg-panel-2; }
+@utility btn-danger { @apply btn border border-rose-500/25 bg-rose-500/5 text-rose-300 hover:bg-rose-500/10; }
+@utility label { @apply mb-1.5 block text-xs font-medium text-zinc-400; }

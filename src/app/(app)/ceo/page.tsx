@@ -29,7 +29,7 @@ export default async function CeoPage({ searchParams }: { searchParams: SearchPa
 
   return (
     <>
-      <PageHeader title="AI CEO Office" subtitle="Strategy workspace, opportunity proposals, executive reports and founder communication." />
+      <PageHeader eyebrow="Executive Office" title="AI CEO Office" subtitle="Strategy workspace, opportunity proposals, executive reports and founder communication." />
       <Flash params={params} />
       <ExecutiveConsole agent={ceo} returnTo="/ceo" aiAvailable={ai.available} canOperate={canOperate}
         placeholder="Strategy workspace: e.g. Which three revenue streams should we prioritise this quarter with zero budget?" />
@@ -40,7 +40,7 @@ export default async function CeoPage({ searchParams }: { searchParams: SearchPa
             <ul className="divide-y divide-line">
               {opportunities.map((o) => (
                 <li key={o.id} className="py-2.5 text-sm">
-                  <div className="flex items-center justify-between gap-3"><span className="text-white">{o.title}</span><Badge>{o.status}</Badge></div>
+                  <div className="flex items-center justify-between gap-3"><span className="text-zinc-50">{o.title}</span><Badge>{o.status}</Badge></div>
                   <p className="mt-0.5 text-xs text-muted">{truncate(o.summary, 160)} {o.estimated_value_cents != null && `· est. ${formatInr(o.estimated_value_cents)}`}</p>
                 </li>
               ))}
@@ -60,7 +60,7 @@ export default async function CeoPage({ searchParams }: { searchParams: SearchPa
         )}
       </div>
 
-      <h2 className="mt-8 mb-3 text-sm font-semibold text-slate-200">Executive reports & communication</h2>
+      <h2 className="mt-8 mb-3 text-sm font-semibold text-zinc-200">Executive reports & communication</h2>
       <ExecutionList executions={reports ?? []} agentNames={new Map(agents.map((a) => [a.id, a.name]))} empty="No executive communication yet." />
     </>
   );
