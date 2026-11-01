@@ -18,7 +18,7 @@ export const metadata = { title: "Sales Engine" };
 export const maxDuration = 300;
 
 const CATEGORY_OPTIONS = Object.entries(LEAD_CATEGORIES).map(([value, c]) => ({ value, label: c.label }));
-const OFFER_OPTIONS = [{ value: "website", label: "Website (Web Dev)" }, { value: "hr_services", label: "HR services" }, { value: "ecommerce", label: "E-commerce store" }];
+const OFFER_OPTIONS = [{ value: "website", label: "Website + social media" }, { value: "hr_services", label: "HR services (ask what they need)" }, { value: "ecommerce", label: "E-commerce store" }];
 
 function Pitch({ lead }: { lead: Lead }) {
   return (

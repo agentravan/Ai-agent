@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
-  BadgeCheck, Bot, Briefcase, Building2, Crown, Gauge, Megaphone, Lightbulb, type LucideIcon, ScrollText, Settings, Target, Terminal, Wallet, Workflow,
+  BadgeCheck, Bot, Briefcase, Building2, ClipboardCheck, Crown, Gauge, Megaphone, Lightbulb, type LucideIcon, ScrollText, Settings, Target, Terminal, Wallet, Workflow,
 } from "lucide-react";
 import { cn } from "@/lib/utilities/format";
 
@@ -11,6 +11,7 @@ type Item = { href: string; label: string; icon: LucideIcon };
 
 export const NAV_GROUPS: { label: string; items: Item[] }[] = [
   { label: "Overview", items: [
+    { href: "/desk", label: "My Desk", icon: ClipboardCheck },
     { href: "/dashboard", label: "CEO Cockpit", icon: Gauge },
     { href: "/office", label: "Virtual Office", icon: Building2 },
     { href: "/command", label: "Empire Command", icon: Terminal },

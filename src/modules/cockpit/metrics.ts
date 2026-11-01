@@ -103,3 +103,39 @@ export function invoiceSummary(invoices: InvoiceLite[], now = new Date()) {
     invoicedTodayCents: sum(invoices.filter((i) => i.status !== "void" && i.issued_on === today)),
   };
 }
+
+/** Growth ladder to the North Star (amounts in paise). Stage is judged on net profit earned so far. */
+export const MILESTONES: { label: string; cents: number }[] = [
+  { label: "₹80,000 — system upgrade unlocked", cents: 8_000_000 },
+  { label: "₹1 lakh", cents: 10_000_000 },
+  { label: "₹10 lakh", cents: 100_000_000 },
+  { label: "₹1 crore", cents: 1_000_000_000 },
+  { label: "₹10 crore", cents: 10_000_000_000 },
+  { label: "₹100 crore", cents: 100_000_000_000 },
+  { label: "₹1,000 crore", cents: 1_000_000_000_000 },
+  { label: "₹10,000 crore", cents: 10_000_000_000_000 },
+  { label: "₹1,00,000 crore — North Star", cents: 100_000_000_000_000 },
+];
+
+export interface GrowthStage {
+  reached: number;          // index of the last milestone reached, -1 if none
+  next: { label: string; cents: number } | null;
+  pctToNext: number;        // progress from the previous milestone (or 0) to the next one
+  pctOfNorthStar: number;   // linear % of the North Star (very small for a long time — shown with decimals)
+}
+
+export function growthStage(netProfitCents: number, northStarCents = MILESTONES.at(-1)!.cents): GrowthStage {
+  const ladder = MILESTONES.filter((m) => m.cents <= northStarCents);
+  const value = Math.max(0, netProfitCents);
+  let reached = -1;
+  ladder.forEach((m, i) => { if (value >= m.cents) reached = i; });
+  const next = ladder[reached + 1] ?? null;
+  const from = reached >= 0 ? ladder[reached]!.cents : 0;
+  const pctToNext = next ? Math.min(100, Math.floor(((value - from) / (next.cents - from)) * 1000) / 10) : 100;
+  return { reached, next, pctToNext, pctOfNorthStar: Math.min(100, (value / northStarCents) * 100) };
+}
+
+/** Paid upgrades / funding requests are allowed only after the profit gate is crossed. */
+export function upgradeUnlocked(netProfitCents: number, gateCents: number): boolean {
+  return netProfitCents >= gateCents;
+}

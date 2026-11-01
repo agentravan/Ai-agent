@@ -79,3 +79,24 @@ describe("finance & KPI validation", () => {
     expect(() => parseForm(kpiSchema, form({ kra_id: "3f1c2a52-6b0e-4c55-9d43-2a7c1e0b9f10", name: "Clients", unit: "", target: "0" }))).toThrow(/Target/);
   });
 });
+
+import { growthStage, upgradeUnlocked } from "@/modules/cockpit/metrics";
+
+describe("growth ladder to ₹1,00,000 crore", () => {
+  it("starts before the first milestone", () => {
+    expect(growthStage(0)).toMatchObject({ reached: -1, next: { cents: 8_000_000 }, pctToNext: 0 });
+  });
+  it("shows progress toward the ₹80k gate", () => expect(growthStage(4_000_000).pctToNext).toBe(50));
+  it("moves to the next rung after a milestone", () => {
+    const s = growthStage(8_000_000);
+    expect(s.reached).toBe(0);
+    expect(s.next?.label).toBe("₹1 lakh");
+    expect(s.pctToNext).toBe(0);
+  });
+  it("treats losses as zero progress", () => expect(growthStage(-500_000).reached).toBe(-1));
+  it("completes at the North Star", () => expect(growthStage(100_000_000_000_000)).toMatchObject({ next: null, pctToNext: 100, pctOfNorthStar: 100 }));
+  it("unlocks paid upgrades only at the profit gate", () => {
+    expect(upgradeUnlocked(7_999_999, 8_000_000)).toBe(false);
+    expect(upgradeUnlocked(8_000_000, 8_000_000)).toBe(true);
+  });
+});

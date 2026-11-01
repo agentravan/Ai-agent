@@ -17,9 +17,16 @@ export interface Lead {
 }
 
 const OFFER_TEXT = {
-  website: "a professional website (design, build, hosting setup, Google Maps & booking integration)",
-  hr_services: "HR services (recruitment, compliance, payroll)",
+  website: "a professional website plus social media handling (free demo site first; then build, hosting, Google Maps/booking and managed Instagram/Facebook)",
+  hr_services: "HR services by Teamwork HR Solutions: core HR, HR operations, HRMS setup, recruitment and payroll",
   ecommerce: "an online store / e-commerce setup",
+} as const;
+
+/** How to pitch each offer — discovery first, never pushy. */
+const PITCH_STYLE = {
+  website: "Offer a FREE demo website built for them before they pay anything; mention we can also run their social media. Ask one easy question (e.g. do you get bookings from Google?).",
+  hr_services: "Do NOT hard-sell. Ask whether they currently need HR help and which kind (hiring staff, payroll, HR compliance/policies, HR software, day-to-day HR operations). Offer a free 15-minute HR check-up call.",
+  ecommerce: "Offer to set up a simple online store; ask what they sell most.",
 } as const;
 
 async function salesUnitId(ctx: AppContext): Promise<string | null> {
@@ -88,6 +95,7 @@ export async function qualifyLeads(ctx: AppContext, limit = 8): Promise<{ review
     json: true,
     maxTokens: 4000,
     input: `Qualify these leads for outreach. Pitch only businesses that are a genuine fit and reachable; skip the rest with a reason.
+Pitch style per offer — website: ${PITCH_STYLE.website} | hr_services: ${PITCH_STYLE.hr_services} | ecommerce: ${PITCH_STYLE.ecommerce}
 What we have learned from past outreach: ${learning.summary}
 Leads:
 ${facts}

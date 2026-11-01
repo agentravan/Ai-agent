@@ -61,6 +61,13 @@ begin
   update public.leads set status = 'approved' where id = t1;
   update public.leads set status = 'contacted' where id = t1;
   update public.leads set status = 'replied' where id = t1;
+  assert (select count(*) from public.tasks where lead_id = t1 and owner = 'founder' and task_type = 'call') = 1, 'reply creates founder call task';
+  begin
+    insert into public.tasks (organisation_id, title, owner, assigned_agent_id)
+    values (private.auth_org_id(), 'bad', 'founder', (select id from public.agents limit 1));
+    raise exception 'founder task with agent allowed';
+  exception when check_violation then null; end;
+  assert (select north_star_target_cents from public.organisations) = 100000000000000, 'north star default';
 end $$;
 
 -- Cross-tenant write must fail even with a known foreign id.

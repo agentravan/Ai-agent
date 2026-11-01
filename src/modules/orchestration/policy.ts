@@ -7,6 +7,7 @@ import type { PlanAction, PlanStep } from "./plan";
 export const STEP_PERMISSION: Record<PlanAction, AgentPermission> = {
   create_project: "projects.create",
   create_task: "tasks.create",
+  create_founder_task: "tasks.create",
   create_opportunity: "opportunities.create",
   request_approval: "approvals.request",
 };

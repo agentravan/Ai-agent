@@ -30,6 +30,9 @@ export async function buildDailyReport(ctx: AppContext, slot: Slot, opts: { pros
     autopilot = (await runReadyTasks(ctx, budget).catch(() => [])).map((r) => `${r.ok ? "✓" : "✗"} ${r.message}`);
   }
   const c = await loadCockpit(ctx);
+  const { data: desk } = await ctx.db.from("tasks").select("title, task_type, due_date, priority").eq("organisation_id", ctx.organisation.id).eq("owner", "founder").in("status", ["todo", "in_progress", "blocked"]).order("created_at").limit(15)
+    .returns<{ title: string; task_type: string; due_date: string | null; priority: string }[]>();
+  const deskLines = (desk ?? []).map((t) => `[${t.task_type}] ${t.title}${t.due_date ? ` (due ${t.due_date})` : ""}${t.priority === "high" || t.priority === "critical" ? " — urgent" : ""}`);
   const w = c.wall;
   const date = new Intl.DateTimeFormat("en-IN", { dateStyle: "full", timeZone: "Asia/Kolkata" }).format(new Date());
 
@@ -51,6 +54,7 @@ export async function buildDailyReport(ctx: AppContext, slot: Slot, opts: { pros
         ["Done by the team this morning", autopilot.length ? autopilot : ["No tasks were ready"]],
         ["Today's plan", c.desk.filter((d) => d.entry.current).map((d) => `${d.agent.name}: ${d.entry.current!.title}`).slice(0, 8)],
         ["Client lead status", [`${c.sales.leadsFound24h} new leads found`, `${c.sales.awaitingApproval} pitches await your approval`, `${c.sales.readyToSend} approved & ready to send`, `${c.sales.contacted} contacted · ${c.sales.positive} positive · ${c.sales.won} won`, ...(prospecting ? [`Auto-prospecting: ${prospecting}`] : [])]],
+        ["On your desk today", deskLines.length ? deskLines : ["Nothing — the team has it covered"]],
         ["Needs you", [`${c.approvals.length} approval(s) pending`, ...c.risks.slice(0, 5)]],
         ["System health", [`AI: ${ai ? "configured" : "not configured"}`, "Database: OK"]],
       ]
@@ -58,7 +62,8 @@ export async function buildDailyReport(ctx: AppContext, slot: Slot, opts: { pros
         ["Today's money", [`Invoiced today: ${formatInr(w.revenueTodayCents)}`, `Payments received today: ${formatInr(w.receivedTodayCents)}`, `Outstanding dues: ${formatInr(w.outstandingCents)} (${w.outstandingCount} invoices, overdue ${formatInr(w.overdueCents)})`]],
         ["Projects", [`${w.activeProjects} active · ${w.pipelineProjects} in pipeline`, `${c.last24h.tasksDone} tasks completed today`]],
         ["Clients & sales", [`${w.newClients30} new clients (30d) · ${w.retainedClients} retained`, `${c.sales.contacted} contacted · ${c.sales.positive} positive · ${c.sales.won} won`]],
-        ["Buyontime", ["New users today: integration pending"]],
+        ["Buyontime", ["Orders & new users: integration pending"]],
+        ["Still on your desk", deskLines.length ? deskLines : ["All clear"]],
         ["C-suite recommendations", recommendations ? recommendations.split("\n").filter((l) => l.trim()) : [ai ? "Not available this run" : "AI not configured"]],
         ["Needs you", [`${c.approvals.length} approval(s) pending`, ...c.risks.slice(0, 5)]],
       ];

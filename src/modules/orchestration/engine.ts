@@ -8,6 +8,28 @@ import { logEvent } from "@/modules/audit/service";
 import type { AppContext } from "@/modules/auth/session";
 import type { AgentWithPermissions, Execution } from "@/types/domain";
 import { checkAgentCanRun, checkCostLimit, monthStartIso, STALE_EXECUTION_MS } from "./policy";
+import { growthStage, upgradeUnlocked } from "@/modules/cockpit/metrics";
+import { formatInr } from "@/lib/utilities/format";
+
+export interface CompanySnapshot { netProfitCents: number; northStarCents: number; gateCents: number }
+
+/** Where the company stands against its North Star (used by every agent and by the funding gate). */
+export async function companySnapshot(ctx: AppContext): Promise<CompanySnapshot> {
+  const [{ data: org }, { data: money }] = await Promise.all([
+    ctx.db.from("organisations").select("north_star_target_cents, upgrade_profit_gate_cents").eq("id", ctx.organisation.id).maybeSingle<{ north_star_target_cents: number; upgrade_profit_gate_cents: number }>(),
+    ctx.db.from("financial_records").select("kind, amount_cents").eq("organisation_id", ctx.organisation.id).limit(20000).returns<{ kind: string; amount_cents: number }[]>(),
+  ]);
+  const net = (money ?? []).reduce((s, r) => s + (r.kind === "income" ? 1 : -1) * Number(r.amount_cents), 0);
+  return { netProfitCents: net, northStarCents: Number(org?.north_star_target_cents ?? 100_000_000_000_000), gateCents: Number(org?.upgrade_profit_gate_cents ?? 8_000_000) };
+}
+
+function goalBriefing(c: CompanySnapshot): string {
+  const g = growthStage(c.netProfitCents, c.northStarCents);
+  const unlocked = upgradeUnlocked(c.netProfitCents, c.gateCents);
+  return `Company North Star: ${formatInr(c.northStarCents)} (₹1,00,000 crore). Net profit so far: ${formatInr(c.netProfitCents)}.
+Next milestone: ${g.next ? `${g.next.label} (${g.pctToNext}% of the way)` : "North Star reached"}. Every plan must move us to the next milestone fastest, using the AI workforce.
+Spending rule: ${unlocked ? `the ${formatInr(c.gateCents)} profit gate is crossed — the CFO may propose funding for system upgrades via Founder approval, with expected return.` : `no paid upgrades, tools or spending until net profit reaches ${formatInr(c.gateCents)}; grow with free methods only.`}`;
+}
 
 const GOVERNANCE = `You are an AI employee inside AI Empire OS, working for a human founder.
 Company reality: the workforce is the AI employees listed in this system plus the Founder. Infrastructure budget is ₹0.
@@ -95,7 +117,8 @@ export async function runAgent<T = string>(ctx: AppContext, opts: RunOptions<T>)
       .single<Execution>(),
   );
 
-  const system = `${GOVERNANCE}\nYour identity: ${agent.name}, ${agent.designation} (${agent.tier}).\n${agent.instructions}${await memoryContext(ctx, agent.id)}`;
+  const [memory, company] = await Promise.all([memoryContext(ctx, agent.id), companySnapshot(ctx)]);
+  const system = `${GOVERNANCE}\n${goalBriefing(company)}\nYour identity: ${agent.name}, ${agent.designation} (${agent.tier}).\n${agent.instructions}${memory}`;
   const update = (patch: Record<string, unknown>) =>
     ctx.db.from("agent_executions").update(patch).eq("id", execution.id).eq("organisation_id", ctx.organisation.id).select("*").single<Execution>();
 

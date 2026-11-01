@@ -15,12 +15,17 @@ export interface StepOutcome {
   ref?: string;
 }
 
-const EXECUTABLE = new Set<PlanStep["action"]>(["create_project", "create_task", "create_opportunity"]);
+const EXECUTABLE = new Set<PlanStep["action"]>(["create_project", "create_task", "create_founder_task", "create_opportunity"]);
 
 export interface PlanContext {
   agents: AgentWithPermissions[];
   kras: Kra[];
+  /** Spending gate: funding / budget requests are refused until net profit reaches the gate. */
+  netProfitCents?: number;
+  upgradeGateCents?: number;
 }
+
+const isFundingRequest = (s: PlanStep) => !!s.approval_action && /^(budget|finance)\./.test(s.approval_action);
 
 function resolveAssignee(step: PlanStep, agents: AgentWithPermissions[], fallback: AgentWithPermissions) {
   const name = step.assignee?.toLowerCase();
@@ -35,6 +40,8 @@ export async function executeStep(ctx: AppContext, step: PlanStep, actor: AgentW
       return must(await ctx.db.from("projects").insert({ organisation_id: org, name: step.title.slice(0, 120), description: step.description, owner_agent_id: assignee.id, business_unit_id: assignee.business_unit_id, kra_id: kraId }).select("id").single<{ id: string }>()).id;
     case "create_task":
       return must(await ctx.db.from("tasks").insert({ organisation_id: org, title: step.title, description: step.description, priority: step.priority, assigned_agent_id: assignee.id, kra_id: kraId, project_id: projectId, created_by: ctx.userId }).select("id").single<{ id: string }>()).id;
+    case "create_founder_task":
+      return must(await ctx.db.from("tasks").insert({ organisation_id: org, title: step.title, description: step.description, priority: step.priority, owner: "founder", task_type: step.task_type ?? "other", assigned_agent_id: null, kra_id: kraId, project_id: projectId, created_by: ctx.userId }).select("id").single<{ id: string }>()).id;
     case "create_opportunity":
       return must(await ctx.db.from("opportunities").insert({ organisation_id: org, title: step.title, summary: step.description, proposed_by_agent_id: actor.id, created_by: ctx.userId }).select("id").single<{ id: string }>()).id;
     default:
@@ -50,11 +57,14 @@ export async function applyPlan(ctx: AppContext, plan: Plan, actor: AgentWithPer
   for (const step of plan.steps) {
     const assignee = step.action === "create_task" || step.action === "create_project" ? resolveAssignee(step, pc.agents, actor) : actor;
     const kra = resolveKra(step, assignee, pc.kras);
-    const decision = decideStep(step, perms, assignee.id !== actor.id);
+    const gateClosed = isFundingRequest(step) && pc.upgradeGateCents !== undefined && (pc.netProfitCents ?? 0) < pc.upgradeGateCents;
+    const decision = gateClosed
+      ? { kind: "deny" as const, reason: "Funding gate: no paid upgrades or spending until net profit reaches the ₹80,000 gate" }
+      : decideStep(step, perms, assignee.id !== actor.id);
     const kraNote = kra ? ` · KRA: ${kra.name}` : "";
     try {
       if (decision.kind === "execute") {
-        const ref = await executeStep(ctx, step, actor, assignee, kra?.id ?? null, step.action === "create_task" ? projectId : null);
+        const ref = await executeStep(ctx, step, actor, assignee, kra?.id ?? null, step.action === "create_task" || step.action === "create_founder_task" ? projectId : null);
         if (step.action === "create_project") projectId = ref;
         let detail = `Assigned to ${assignee.name}${kraNote}`;
         if (decision.review === "manager") {

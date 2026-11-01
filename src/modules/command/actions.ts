@@ -6,7 +6,7 @@ import { requireContext } from "@/modules/auth/session";
 import { logEvent } from "@/modules/audit/service";
 import { applyPlan, type StepOutcome } from "@/modules/orchestration/apply";
 import type { AppContext } from "@/modules/auth/session";
-import { listAgents, loadAgentByTier, runAgent } from "@/modules/orchestration/engine";
+import { companySnapshot, listAgents, loadAgentByTier, runAgent } from "@/modules/orchestration/engine";
 import { parsePlan, PLAN_FORMAT_INSTRUCTIONS, planSchema } from "@/modules/orchestration/plan";
 import type { Execution, Kra } from "@/types/domain";
 
@@ -23,10 +23,10 @@ async function applyOnce(ctx: AppContext, exec: Execution): Promise<StepOutcome[
     .update({ plan: { ...plan.data, applied_at: new Date().toISOString(), applied_by: ctx.userId } })
     .eq("id", exec.id).eq("organisation_id", ctx.organisation.id).is("plan->>applied_at", null).select("id");
   if (!claimed.data?.length) return null;
-  const [ceo, agents, kras] = await Promise.all([loadAgentByTier(ctx, "ceo"), listAgents(ctx), listKras(ctx)]);
+  const [ceo, agents, kras, company] = await Promise.all([loadAgentByTier(ctx, "ceo"), listAgents(ctx), listKras(ctx), companySnapshot(ctx)]);
   const actor = agents.find((a) => a.id === exec.agent_id) ?? ceo;
   if (!actor) throw new UserFacingError("Planning agent no longer exists");
-  const outcomes = await applyPlan(ctx, plan.data, actor, { agents, kras }, exec.id);
+  const outcomes = await applyPlan(ctx, plan.data, actor, { agents, kras, netProfitCents: company.netProfitCents, upgradeGateCents: company.gateCents }, exec.id);
   await ctx.db.from("agent_executions").update({ plan: { ...plan.data, applied_at: new Date().toISOString(), applied_by: ctx.userId, outcomes } }).eq("id", exec.id).eq("organisation_id", ctx.organisation.id);
   await logEvent(ctx, { action: "command.plan_executed", entity: "agent_executions", entityId: exec.id, metadata: { outcomes } });
   return outcomes;

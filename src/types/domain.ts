@@ -38,7 +38,8 @@ export interface Profile {
   role: AppRole;
 }
 
-export interface Organisation { id: string; name: string; created_at: string }
+export interface Organisation { id: string; name: string; created_at: string; north_star_target_cents?: number; upgrade_profit_gate_cents?: number }
+export const FOUNDER_TASK_TYPES = ["call", "meeting", "order", "physical", "other"] as const;
 export interface Department { id: string; name: string; description: string | null }
 
 export interface Agent {
@@ -82,6 +83,9 @@ export interface Task {
   priority: Priority;
   assigned_agent_id: string | null;
   kra_id: string | null;
+  owner?: "agent" | "founder";
+  task_type?: "work" | "call" | "meeting" | "order" | "physical" | "other";
+  lead_id?: string | null;
   result: string | null;
   due_date: string | null;
   created_at: string;
