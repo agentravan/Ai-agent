@@ -5,6 +5,7 @@ import { Badge, PageHeader } from "@/components/ui";
 import { formatInr, truncate } from "@/lib/utilities/format";
 import { requireContext } from "@/modules/auth/session";
 import { loadCockpit, type UnitOverview } from "@/modules/cockpit/service";
+import { storeSummary } from "@/modules/buyontime/service";
 import type { DeskEntry } from "@/modules/cockpit/metrics";
 import type { AgentWithPermissions } from "@/types/domain";
 
@@ -63,7 +64,7 @@ const Row = ({ k, v, tone }: { k: string; v: ReactNode; tone?: string }) => (
 
 export default async function OfficePage() {
   const ctx = await requireContext();
-  const c = await loadCockpit(ctx);
+  const [c, { data: store }] = await Promise.all([loadCockpit(ctx), storeSummary(24)]);
   const deskOf = (id?: string) => c.desk.find((d) => d.agent.id === id)?.entry;
   const agent = (pred: (a: AgentWithPermissions) => boolean) => c.agents.find(pred) ?? null;
   const unit = (prefix: string): UnitOverview | undefined => c.units.find((u) => u.unit.name.startsWith(prefix));
@@ -88,7 +89,9 @@ export default async function OfficePage() {
         <div className="grid grid-cols-2 gap-x-6 gap-y-6 md:grid-cols-4">
           <WallMetric label="Active projects" value={w.activeProjects} sub={`${w.pipelineProjects} upcoming / pipeline`} />
           <WallMetric label="Client acquisition" value={`${w.newClients30} new`} sub={`${w.retainedClients} retained clients`} />
-          <WallMetric label="Buyontime today" value={<span className="text-base text-amber-300">Not connected</span>} sub="New / repeat customers & voucher conversion appear once integrated" />
+          {store
+            ? <WallMetric label="Buyontime (24h)" value={`${store.newCustomers} new`} sub={`${store.repeatCustomers} repeat customers · vouchers ${store.voucherConversionPct}% · ${store.orders} orders`} />
+            : <WallMetric label="Buyontime" value={<span className="text-base text-amber-300">Not connected</span>} sub="Publish the Buyontime update to connect" />}
           <WallMetric label="Daily tally" value={formatInr(w.receivedTodayCents)} sub={<>Received today · invoiced {formatInr(w.revenueTodayCents)} · <span className={w.overdueCents ? "text-rose-300" : ""}>dues {formatInr(w.outstandingCents)}</span></>} />
         </div>
       </section>
@@ -136,11 +139,21 @@ export default async function OfficePage() {
           <Row k="Compliance KPIs" v={hr?.kpis.length ? `${Math.round(hr.kpis.reduce((s, k) => s + k.pct, 0) / hr.kpis.length)}% avg` : "not set"} />
           <Row k="Revenue (30d)" v={formatInr(hr?.revenue30Cents ?? 0)} />
         </Cabin>
-        <Cabin code="Cabin C" title="Buyontime E-Commerce Ops" icon={ShoppingBag} manager={ecom?.manager ?? null} entry={deskOf(ecom?.manager?.id)}>
-          <Row k="Open ops tasks" v={ecom?.openTasks ?? 0} />
-          <Row k="Revenue (30d, recorded)" v={formatInr(ecom?.revenue30Cents ?? 0)} />
-          <Row k="Margin health" v={ecom?.marginPct == null ? "no data" : `${ecom.marginPct}%`} />
-          <Row k="Orders / subscribers" v="integration pending" tone="text-amber-300" />
+        <Cabin code="Cabin C" title="Buyontime E-Commerce Ops" icon={ShoppingBag} manager={ecom?.manager ?? null} entry={deskOf(ecom?.manager?.id)} href="/buyontime">
+          {store ? (
+            <>
+              <Row k="Orders (24h)" v={`${store.orders} · ${formatInr(store.revenuePaise)}`} />
+              <Row k="Est. profit (24h)" v={formatInr(store.estimatedProfitPaise)} tone={store.estimatedProfitPaise < 0 ? "text-rose-300" : undefined} />
+              <Row k="New / repeat customers" v={`${store.newCustomers} / ${store.repeatCustomers}`} />
+              <Row k="Voucher conversion" v={`${store.voucherConversionPct}%`} />
+              <Row k="To place on Meesho" v={store.toFulfil.length} tone={store.toFulfil.length ? "text-amber-300" : undefined} />
+            </>
+          ) : (
+            <>
+              <Row k="Open ops tasks" v={ecom?.openTasks ?? 0} />
+              <Row k="Store link" v="not connected" tone="text-amber-300" />
+            </>
+          )}
         </Cabin>
         <Cabin code="Cabin D" title="Sales & Social Media Engine" icon={Megaphone} manager={sales?.manager ?? null} entry={deskOf(sales?.manager?.id)} href="/sales">
           <Row k="Leads found (24h)" v={c.sales.leadsFound24h} />

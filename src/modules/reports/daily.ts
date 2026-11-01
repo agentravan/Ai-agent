@@ -6,6 +6,13 @@ import { cockpitFacts, loadCockpit } from "@/modules/cockpit/service";
 import { loadAgentByTier, runAgent } from "@/modules/orchestration/engine";
 import { runProspectingCycle } from "@/modules/sales/service";
 import { runReadyTasks } from "@/modules/tasks/service";
+import { storeSummary, syncOrderTasks } from "@/modules/buyontime/service";
+
+/** Hours since midnight India time (for "today" in the evening wrap-up). */
+const hoursSinceIstMidnight = () => {
+  const ist = new Date(Date.now() + 5.5 * 3_600_000);
+  return Math.max(1, ist.getUTCHours() + ist.getUTCMinutes() / 60);
+};
 
 export type Slot = "morning" | "evening";
 
@@ -29,6 +36,8 @@ export async function buildDailyReport(ctx: AppContext, slot: Slot, opts: { pros
     const budget = Math.max(0, 200_000 - (Date.now() - startedAt));
     autopilot = (await runReadyTasks(ctx, budget).catch(() => [])).map((r) => `${r.ok ? "✓" : "✗"} ${r.message}`);
   }
+  const store = (await storeSummary(slot === "morning" ? 24 : hoursSinceIstMidnight())).data;
+  if (store) await syncOrderTasks(ctx, store).catch(() => undefined);
   const c = await loadCockpit(ctx);
   const { data: desk } = await ctx.db.from("tasks").select("title, task_type, due_date, priority").eq("organisation_id", ctx.organisation.id).eq("owner", "founder").in("status", ["todo", "in_progress", "blocked"]).order("created_at").limit(15)
     .returns<{ title: string; task_type: string; due_date: string | null; priority: string }[]>();
@@ -42,7 +51,7 @@ export async function buildDailyReport(ctx: AppContext, slot: Slot, opts: { pros
     if (ceo?.status === "active") {
       const { execution } = await runAgent(ctx, {
         agent: ceo, kind: "chat", maxTokens: 900,
-        input: `[EOD] Give the Founder 3-5 strategic recommendations for tomorrow, each one line and tied to a KRA. Use ONLY these facts; never invent numbers.\n\nFACTS:\n${cockpitFacts(ctx, c)}`,
+        input: `[EOD] Give the Founder 3-5 strategic recommendations for tomorrow, each one line and tied to a KRA. Use ONLY these facts; never invent numbers.\n\nFACTS:\n${cockpitFacts(ctx, c, store)}`,
       }).catch(() => ({ execution: null }));
       recommendations = execution?.status === "succeeded" ? execution.output : null;
     }
@@ -53,6 +62,12 @@ export async function buildDailyReport(ctx: AppContext, slot: Slot, opts: { pros
         ["Yesterday's performance", [`${c.last24h.tasksDone} tasks completed, ${c.last24h.tasksCreated} created`, `${c.last24h.runsOk} agent runs succeeded, ${c.last24h.runsFailed} failed`, `${c.last24h.decisions} decisions taken`]],
         ["Done by the team this morning", autopilot.length ? autopilot : ["No tasks were ready"]],
         ["Today's plan", c.desk.filter((d) => d.entry.current).map((d) => `${d.agent.name}: ${d.entry.current!.title}`).slice(0, 8)],
+        ["Buyontime (last 24h)", store
+          ? [`Orders: ${store.orders} (${store.onlineOrders} online, ${store.codOrders} COD)${store.cancelled ? `, ${store.cancelled} cancelled` : ""}`,
+             `Revenue: ${formatInr(store.revenuePaise)} · estimated profit ${formatInr(store.estimatedProfitPaise)}`,
+             `Customers: ${store.newCustomers} new, ${store.repeatCustomers} repeat · voucher conversion ${store.voucherConversionPct}%`,
+             `To place on Meesho: ${store.toFulfil.length}${store.toFulfil.length ? ` (${store.toFulfil.slice(0, 5).map((o) => "#" + o.orderNumber).join(", ")})` : ""}`]
+          : ["Not connected yet"]],
         ["Client lead status", [`${c.sales.leadsFound24h} new leads found`, `${c.sales.awaitingApproval} pitches await your approval`, `${c.sales.readyToSend} approved & ready to send`, `${c.sales.contacted} contacted · ${c.sales.positive} positive · ${c.sales.won} won`, ...(prospecting ? [`Auto-prospecting: ${prospecting}`] : [])]],
         ["On your desk today", deskLines.length ? deskLines : ["Nothing — the team has it covered"]],
         ["Needs you", [`${c.approvals.length} approval(s) pending`, ...c.risks.slice(0, 5)]],
@@ -62,7 +77,12 @@ export async function buildDailyReport(ctx: AppContext, slot: Slot, opts: { pros
         ["Today's money", [`Invoiced today: ${formatInr(w.revenueTodayCents)}`, `Payments received today: ${formatInr(w.receivedTodayCents)}`, `Outstanding dues: ${formatInr(w.outstandingCents)} (${w.outstandingCount} invoices, overdue ${formatInr(w.overdueCents)})`]],
         ["Projects", [`${w.activeProjects} active · ${w.pipelineProjects} in pipeline`, `${c.last24h.tasksDone} tasks completed today`]],
         ["Clients & sales", [`${w.newClients30} new clients (30d) · ${w.retainedClients} retained`, `${c.sales.contacted} contacted · ${c.sales.positive} positive · ${c.sales.won} won`]],
-        ["Buyontime", ["Orders & new users: integration pending"]],
+        ["Buyontime today", store
+          ? [`Orders: ${store.orders} (${store.onlineOrders} online, ${store.codOrders} COD)${store.cancelled ? `, ${store.cancelled} cancelled` : ""}`,
+             `Revenue: ${formatInr(store.revenuePaise)} · estimated profit ${formatInr(store.estimatedProfitPaise)}`,
+             `Customers: ${store.newCustomers} new, ${store.repeatCustomers} repeat · voucher conversion ${store.voucherConversionPct}%`,
+             `To place on Meesho: ${store.toFulfil.length}${store.toFulfil.length ? ` (${store.toFulfil.slice(0, 5).map((o) => "#" + o.orderNumber).join(", ")})` : ""}`]
+          : ["Not connected yet"]],
         ["Still on your desk", deskLines.length ? deskLines : ["All clear"]],
         ["C-suite recommendations", recommendations ? recommendations.split("\n").filter((l) => l.trim()) : [ai ? "Not available this run" : "AI not configured"]],
         ["Needs you", [`${c.approvals.length} approval(s) pending`, ...c.risks.slice(0, 5)]],

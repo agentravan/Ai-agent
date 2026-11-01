@@ -1,6 +1,7 @@
 import "server-only";
 import { formatInr } from "@/lib/utilities/format";
 import type { AppContext } from "@/modules/auth/session";
+import type { BuyontimeSummary } from "@/lib/integrations/buyontime";
 import { listAgents } from "@/modules/orchestration/engine";
 import type { AgentWithPermissions, Approval, AuditLog, Budget, BusinessUnit, Client, Execution, FinancialRecord, Kpi, Kra, Opportunity, Project, Task } from "@/types/domain";
 import { deskEntry, financeSummary, invoiceSummary, kpiProgress, marginPct, withinHours, type DeskEntry, type FinanceSummary, type InvoiceLite } from "./metrics";
@@ -151,7 +152,7 @@ export async function loadCockpit(ctx: AppContext): Promise<Cockpit> {
 }
 
 /** Plain-text fact sheet fed to the AI so reports are grounded in data and never invented. */
-export function cockpitFacts(ctx: AppContext, c: Cockpit): string {
+export function cockpitFacts(ctx: AppContext, c: Cockpit, store?: BuyontimeSummary | null): string {
   const f = c.finance;
   const lines = [
     `Organisation: ${ctx.organisation.name}. Report time: ${new Date().toISOString()}.`,
@@ -159,7 +160,7 @@ export function cockpitFacts(ctx: AppContext, c: Cockpit): string {
     `Finance (all time): inbound ${formatInr(f.inboundCents)}, outbound ${formatInr(f.outboundCents)}, net ${formatInr(f.netCents)}. Last 30 days: inbound ${formatInr(f.inbound30Cents)}, burn ${formatInr(f.burn30Cents)}, net ${formatInr(f.net30Cents)}. Active budget pool ${formatInr(f.budgetPoolCents)}, remaining ${formatInr(f.budgetRemainingCents)}.`,
     ...c.units.map((u) => `Unit ${u.unit.name} (manager ${u.manager?.name ?? "none"}): ${u.activeProjects} active projects, ${u.openTasks} open tasks, ${u.blockedTasks} blocked, ${u.activeClients} active clients, 30-day revenue ${formatInr(u.revenue30Cents)}, margin ${u.marginPct == null ? "n/a" : `${u.marginPct}%`}, KPIs: ${u.kpis.map((k) => `${k.name} ${k.pct}%`).join(", ") || "none set"}.`),
     ...c.desk.map((d) => `Desk ${d.agent.name} (${d.agent.designation}): focus "${d.entry.current?.title ?? "idle"}", ${d.entry.open} open, ${d.entry.done} done, progress ${d.entry.progressPct}%.`),
-    `Main wall: ${c.wall.activeProjects} active projects, ${c.wall.pipelineProjects} in pipeline; clients: ${c.wall.newClients30} new (30d), ${c.wall.retainedClients} retained; today: invoiced ${formatInr(c.wall.revenueTodayCents)}, received ${formatInr(c.wall.receivedTodayCents)}; outstanding dues ${formatInr(c.wall.outstandingCents)} (${c.wall.outstandingCount} invoices, overdue ${formatInr(c.wall.overdueCents)}). Buyontime metrics: not connected.`,
+    `Main wall: ${c.wall.activeProjects} active projects, ${c.wall.pipelineProjects} in pipeline; clients: ${c.wall.newClients30} new (30d), ${c.wall.retainedClients} retained; today: invoiced ${formatInr(c.wall.revenueTodayCents)}, received ${formatInr(c.wall.receivedTodayCents)}; outstanding dues ${formatInr(c.wall.outstandingCents)} (${c.wall.outstandingCount} invoices, overdue ${formatInr(c.wall.overdueCents)}). ${store ? `Buyontime (24h): ${store.orders} orders, revenue ${formatInr(store.revenuePaise)}, est. profit ${formatInr(store.estimatedProfitPaise)}, ${store.newCustomers} new customers, ${store.repeatCustomers} repeat, voucher conversion ${store.voucherConversionPct}%, ${store.toFulfil.length} orders waiting to be placed on Meesho.` : "Buyontime: not connected."}`,
     `Sales engine: ${c.sales.leadsFound24h} leads found in 24h, ${c.sales.newLeads} awaiting AI review, ${c.sales.awaitingApproval} pitches awaiting founder approval, ${c.sales.readyToSend} approved & ready to send, ${c.sales.contacted} contacted, ${c.sales.positive} positive replies, ${c.sales.won} won.`,
     `Pending founder approvals: ${c.approvals.length}${c.approvals.length ? ` (${c.approvals.map((a) => `${a.title} [${a.risk}]`).join("; ")})` : ""}.`,
     `Opportunities under evaluation: ${c.thinkTank.map((o) => o.title).join("; ") || "none"}.`,

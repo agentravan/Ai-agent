@@ -37,6 +37,9 @@ const schema = z.object({
   // Scheduled jobs (Vercel Cron). Server-only secrets; never exposed to the browser.
   CRON_SECRET: optional,
   SUPABASE_SERVICE_ROLE_KEY: optional,
+  // Buyontime store link (read-only summary + draft products), shared secret with EMPIRE_API_TOKEN there.
+  BUYONTIME_URL: z.url().optional().catch(undefined),
+  BUYONTIME_API_TOKEN: optional,
   // Lead discovery (OpenStreetMap — free public data).
   OVERPASS_URL: z.url().default("https://overpass-api.de/api/interpreter"),
   NOMINATIM_URL: z.url().default("https://nominatim.openstreetmap.org"),

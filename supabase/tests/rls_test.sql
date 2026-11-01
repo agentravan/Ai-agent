@@ -68,6 +68,11 @@ begin
     raise exception 'founder task with agent allowed';
   exception when check_violation then null; end;
   assert (select north_star_target_cents from public.organisations) = 100000000000000, 'north star default';
+  insert into public.tasks (organisation_id, title, owner, external_ref) values (private.auth_org_id(), 'Place order BOT1', 'founder', 'buyontime:BOT1');
+  begin
+    insert into public.tasks (organisation_id, title, owner, external_ref) values (private.auth_org_id(), 'dup', 'founder', 'buyontime:BOT1');
+    raise exception 'duplicate external task allowed';
+  exception when unique_violation then null; end;
 end $$;
 
 -- Cross-tenant write must fail even with a known foreign id.

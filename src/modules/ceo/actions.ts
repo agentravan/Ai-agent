@@ -53,7 +53,9 @@ export async function executiveReportAction(form: FormData) {
     const ctx = await requireContext("operate");
     const { agent_id } = parseForm(reportSchema, form);
     const agent = await loadAgent(ctx, agent_id);
-    const facts = cockpitFacts(ctx, await loadCockpit(ctx));
+    const { storeSummary } = await import("@/modules/buyontime/service");
+    const [cockpit, store] = await Promise.all([loadCockpit(ctx), storeSummary(24)]);
+    const facts = cockpitFacts(ctx, cockpit, store.data);
     const { execution } = await runAgent(ctx, { agent, kind: "chat", maxTokens: 1800, input: `${REPORTS[report].tag} ${REPORTS[report].prompt}\n\nFACTS:\n${facts}` });
     if (execution.status === "failed") throw new UserFacingError(`Report failed: ${execution.error}`);
   });
