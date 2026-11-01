@@ -1,0 +1,39 @@
+# AI Empire OS
+
+Autonomous multi-agent business operating system. Founder: **Harshit Bhardwaj**. Infrastructure budget: **₹0**.
+
+An AI CEO, COO and executive workforce plan, delegate and execute work. Every agent action passes permission, cost and approval governance, and everything is recorded in an append-only audit log.
+
+## Features (Milestone 1)
+- **Founder authentication:** Supabase Auth, secure cookie sessions, protected routes, role-based permissions (founder/admin/member/viewer).
+- **Founder dashboard:** organisation overview, active projects, agent registry, pending approvals, latest activity, live AI connectivity.
+- **AI CEO office:** identity, strategy workspace, opportunity proposals, data-grounded executive reports, founder communication.
+- **AI COO office:** task status overview, task assignment, project progress, workforce monitoring (runs, failures, spend).
+- **Agent registry:** hire agents with designation, tier, instructions, department, reporting manager, permissions and cost limit; activate or suspend.
+- **Empire Command:** natural language → schema-validated plan → per-step execute, approval or deny, with execution tracking.
+- **Approval center:** pending requests with action details, approve/reject (exactly once), history.
+- **Audit system:** database-trigger audit of all business tables plus semantic agent/user events, with filters.
+- **AI providers:** Ollama (free, default), any OpenAI-compatible endpoint, Claude (optional). If none is configured, AI features are clearly marked unavailable.
+
+## Stack
+Next.js 16 (App Router) · TypeScript strict · Tailwind CSS 4 · Supabase (Postgres + Auth + RLS) · Zod 4 · Vitest · Vercel.
+
+## Quick start
+```bash
+npm ci
+cp .env.example .env.local   # NEXT_PUBLIC_SUPABASE_URL + NEXT_PUBLIC_SUPABASE_ANON_KEY (+ optional AI vars)
+npm run dev
+```
+Apply `supabase/migrations/*.sql` to your Supabase project first. Full steps: [docs/DEPLOYMENT_GUIDE.md](docs/DEPLOYMENT_GUIDE.md).
+
+## Scripts
+| Command | Purpose |
+|---|---|
+| `npm run dev` / `build` / `start` | Next.js |
+| `npm run typecheck` | `tsc --noEmit` (strict) |
+| `npm test` | Unit tests (governance policy, plan parsing, retries, permissions, validation, providers) |
+| `npm run test:db` | Applies migrations to a throwaway local Postgres and runs the RLS/integrity suite |
+| `npm run check` | typecheck + tests + build |
+
+## Documentation
+[Repository audit](docs/REPOSITORY_AUDIT.md) · [Architecture](docs/ARCHITECTURE.md) · [Database](docs/DATABASE_DESIGN.md) · [Security](docs/SECURITY_MODEL.md) · [AI agents](docs/AI_AGENT_DESIGN.md) · [Deployment](docs/DEPLOYMENT_GUIDE.md) · [Roadmap](docs/IMPLEMENTATION_ROADMAP.md)
