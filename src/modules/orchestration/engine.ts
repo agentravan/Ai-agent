@@ -1,7 +1,7 @@
 import "server-only";
-import { activeProvider, estimateCostCents } from "@/lib/ai/registry";
+import { estimateCostCents, providerChain } from "@/lib/ai/registry";
 import { withRetry } from "@/lib/ai/retry";
-import { AiUnavailableError } from "@/lib/ai/types";
+import { AiUnavailableError, type AiProvider, type GenerateResult } from "@/lib/ai/types";
 import { env } from "@/lib/env";
 import { UserFacingError, must } from "@/lib/utilities/action";
 import { logEvent } from "@/modules/audit/service";
@@ -90,7 +90,10 @@ export async function runAgent<T = string>(ctx: AppContext, opts: RunOptions<T>)
   const runCheck = checkAgentCanRun(agent, perms);
   if (!runCheck.ok) throw new UserFacingError(`${agent.name}: ${runCheck.reason}`);
 
-  const provider = activeProvider();
+  // Main provider first, then configured backups (AI_FALLBACK). Backups get one attempt each so a
+  // failover still fits the serverless time limit.
+  const chain = providerChain();
+  const provider = chain[0];
   if (!provider) throw new AiUnavailableError();
 
   const providerIsFree = env.AI_COST_INPUT_CENTS_PER_MTOK === 0 && env.AI_COST_OUTPUT_CENTS_PER_MTOK === 0;
@@ -123,24 +126,43 @@ export async function runAgent<T = string>(ctx: AppContext, opts: RunOptions<T>)
     ctx.db.from("agent_executions").update(patch).eq("id", execution.id).eq("organisation_id", ctx.organisation.id).select("*").single<Execution>();
 
   try {
-    const { value, attempts } = await withRetry(
-      async () => {
-        const out = await provider.generate({
-          system,
-          prompt: opts.input,
-          json: opts.json,
-          maxTokens: opts.maxTokens ?? 1500,
-          signal: AbortSignal.timeout(env.AI_TIMEOUT_MS),
-        });
-        const parsed = opts.parse ? opts.parse(out.text) : (out.text as unknown as T);
-        return { out, parsed };
-      },
-      { attempts: env.AI_MAX_ATTEMPTS, onAttempt: async (attempts) => void (await update({ attempts })) },
-    );
+    let totalAttempts = 0;
+    let lastError: unknown;
+    let done: { value: { out: GenerateResult; parsed: T }; used: AiProvider } | null = null;
+    for (const p of chain) {
+      if (p !== provider) {
+        console.warn("[ai] provider failed, failing over", { from: provider.id, to: p.id });
+        await update({ provider: p.id, model: p.model });
+      }
+      try {
+        const { value } = await withRetry(
+          async () => {
+            const out = await p.generate({
+              system,
+              prompt: opts.input,
+              json: opts.json,
+              maxTokens: opts.maxTokens ?? 1500,
+              signal: AbortSignal.timeout(env.AI_TIMEOUT_MS),
+            });
+            const parsed = opts.parse ? opts.parse(out.text) : (out.text as unknown as T);
+            return { out, parsed };
+          },
+          { attempts: p === provider ? env.AI_MAX_ATTEMPTS : 1, onAttempt: async () => void (await update({ attempts: ++totalAttempts })) },
+        );
+        done = { value, used: p };
+        break;
+      } catch (err) {
+        lastError = err;
+      }
+    }
+    if (!done) throw lastError;
+    const { value, used } = done;
     const final = must(
       await update({
         status: "succeeded",
-        attempts,
+        attempts: totalAttempts,
+        provider: used.id,
+        model: used.model,
         output: value.out.text,
         plan: opts.parse ? value.parsed : null,
         input_tokens: value.out.inputTokens,
@@ -149,7 +171,7 @@ export async function runAgent<T = string>(ctx: AppContext, opts: RunOptions<T>)
         finished_at: new Date().toISOString(),
       }),
     );
-    await logEvent(ctx, { action: "agent.execution_succeeded", entity: "agent_executions", entityId: final.id, actorType: "agent", metadata: { agent_id: agent.id, kind: opts.kind } });
+    await logEvent(ctx, { action: "agent.execution_succeeded", entity: "agent_executions", entityId: final.id, actorType: "agent", metadata: { agent_id: agent.id, kind: opts.kind, provider: used.id, ...(used !== provider ? { failed_over_from: provider.id } : {}) } });
     return { execution: final, result: value.parsed };
   } catch (err) {
     const message = (err as Error).message?.slice(0, 2000) || "Unknown error";

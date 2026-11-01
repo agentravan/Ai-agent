@@ -21,6 +21,18 @@ export function activeProvider(e: Env = defaultEnv): AiProvider | null {
   return list[0] ?? null;
 }
 
+/**
+ * Providers to try in order when running an agent: the active one first, then the other configured
+ * providers allowed by AI_FALLBACK. Anthropic (paid) is only a fallback when AI_FALLBACK="all".
+ */
+export function providerChain(e: Env = defaultEnv): AiProvider[] {
+  const primary = activeProvider(e);
+  if (!primary) return [];
+  if (e.AI_FALLBACK === "off") return [primary];
+  const backups = configuredProviders(e).filter((p) => p.id !== primary.id && (e.AI_FALLBACK === "all" || p.id !== "anthropic"));
+  return [primary, ...backups];
+}
+
 export interface AiStatus {
   available: boolean;
   provider: ProviderId | null;

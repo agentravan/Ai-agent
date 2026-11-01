@@ -22,6 +22,20 @@
 3. Vercel → Project → Settings → Environment Variables: add `FOUNDER_EMAILS=<your email>` (Preview and Production), then redeploy. You can also disable sign-ups under Supabase → Auth → Providers → Email.
 4. AI (optional, free): run `ollama pull llama3.2`, expose it with a tunnel, then set `OLLAMA_BASE_URL` and `OLLAMA_MODEL` in Vercel. Alternatively set the `OPENAI_COMPATIBLE_*` variables for a free hosted endpoint. Claude (`ANTHROPIC_API_KEY`) is optional and paid. Give agents a monthly cost limit before using it.
 
+## Autopilot (self-running, self-healing)
+Every 30 minutes `/api/cron/autopilot` runs one cycle per organisation:
+1. Recovers runs stuck in "running" (killed serverless calls).
+2. Puts failed tasks back in the queue: at most 3 automatic retries, waiting 30 min → 1 h → 2 h. After that the task stays failed and the Founder is told.
+3. Agents work ready tasks within the time budget (each task at most once per cycle). Risky steps still go to the Approval Center.
+4. If the main AI provider fails, the run fails over to the next configured provider (`AI_FALLBACK`, default `free` = never paid Anthropic).
+5. Emails the Founder (at most once per 12 h) only when something needs a human: tasks out of retries, every task in a cycle failing, or work waiting with no AI configured.
+
+Setup:
+- Vercel: `CRON_SECRET` and `SUPABASE_SERVICE_ROLE_KEY` (already needed for reports). Mailbox variables are only needed for alert emails.
+- GitHub → Settings → Secrets and variables → Actions: secret `CRON_SECRET` (same value as Vercel), optional variable `APP_URL`.
+- `.github/workflows/autopilot.yml` must be on the repository's **default branch**: GitHub only runs scheduled workflows from there. Without it, the daily Vercel cron (14:00 IST) still runs one cycle.
+- Run it by hand: Actions → Autopilot → Run workflow.
+
 ## Local development
 ```bash
 cp .env.example .env.local      # fill Supabase URL + publishable key

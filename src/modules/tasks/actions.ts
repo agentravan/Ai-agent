@@ -52,6 +52,11 @@ export async function autopilotStepAction(projectId: string | null): Promise<Aut
     if (!task) return { done: true, next: null };
     const result = await runTask(ctx, task).catch((err: Error) => ({ taskId: task.id, title: task.title, agent: "?", ok: false, message: err.message }));
     const upcoming = await nextReadyTask(ctx, scope);
+    // A task that failed before running is back in "todo"; stop instead of looping on it in the live view.
+    if (!result.ok && upcoming?.id === task.id) {
+      revalidatePath("/projects");
+      return { done: true, result, next: null };
+    }
     const agentName = upcoming?.assigned_agent_id ? (await ctx.db.from("agents").select("name").eq("id", upcoming.assigned_agent_id).maybeSingle<{ name: string }>()).data?.name ?? "agent" : "";
     revalidatePath("/projects");
     revalidatePath("/ceo");

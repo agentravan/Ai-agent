@@ -21,6 +21,9 @@ const schema = z.object({
   AI_COST_OUTPUT_CENTS_PER_MTOK: z.coerce.number().min(0).catch(0),
   AI_TIMEOUT_MS: intIn(1_000, 280_000, 60_000),
   AI_MAX_ATTEMPTS: intIn(1, 5, 3),
+  // When the main AI provider fails: "free" tries other configured non-Anthropic providers (default, keeps ₹0),
+  // "all" may also fall back to Anthropic (paid), "off" never falls back.
+  AI_FALLBACK: z.enum(["free", "all", "off"]).catch("free"),
   // Your own mailbox (e.g. Gmail with an App Password). The AI employee sends and reads mail as you.
   SMTP_HOST: z.string().trim().default("smtp.gmail.com"),
   SMTP_PORT: z.coerce.number().int().min(1).max(65535).catch(465),
