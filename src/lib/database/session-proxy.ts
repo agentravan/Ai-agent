@@ -2,7 +2,8 @@ import { createServerClient } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
 import { supabaseConfig } from "@/lib/env";
 
-export const PUBLIC_PATHS = ["/", "/login", "/auth", "/api/health"];
+// /api/cron authenticates with CRON_SECRET inside the route (no user session).
+export const PUBLIC_PATHS = ["/", "/login", "/auth", "/api/health", "/api/cron"];
 
 export function isPublicPath(pathname: string): boolean {
   return PUBLIC_PATHS.some((p) => pathname === p || (p !== "/" && pathname.startsWith(`${p}/`)));

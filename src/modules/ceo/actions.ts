@@ -58,3 +58,21 @@ export async function executiveReportAction(form: FormData) {
     if (execution.status === "failed") throw new UserFacingError(`Report failed: ${execution.error}`);
   });
 }
+
+/** Sends today's briefing/wrap-up to the Founder now (uses the signed-in session, no service key needed). */
+export async function emailReportNowAction(form: FormData) {
+  const { buildDailyReport } = await import("@/modules/reports/daily");
+  const { emailConfigured, sendEmail } = await import("@/lib/integrations/email");
+  const slot = z.enum(["morning", "evening"]).catch("morning").parse(form.get("slot"));
+  await runAction("/dashboard", "Report emailed", async () => {
+    const ctx = await requireContext("operate");
+    if (!emailConfigured()) throw new UserFacingError("Email is not set up yet (RESEND_API_KEY). Ask Claude to connect it.");
+    const report = await buildDailyReport(ctx, slot);
+    try {
+      await sendEmail({ to: ctx.email, subject: report.subject, text: report.text, html: report.html });
+    } catch (err) {
+      throw new UserFacingError((err as Error).message);
+    }
+    return `${slot === "morning" ? "Morning briefing" : "Evening wrap-up"} sent to ${ctx.email}`;
+  });
+}

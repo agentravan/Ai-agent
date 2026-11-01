@@ -97,6 +97,18 @@ export const budgetSchema = z
   .refine((b) => b.period_end >= b.period_start, "End date must be on or after the start date")
   .transform(({ amount_inr, ...b }) => ({ ...b, amount_cents: toCents(amount_inr) }));
 
+export const invoiceSchema = z
+  .object({
+    number: required("Invoice number", 40),
+    client_name: required("Client name", 200),
+    amount_inr: rupees("Amount"),
+    issued_on: z.iso.date("Choose the issue date"),
+    due_on: z.iso.date("Choose the due date"),
+    business_unit_id: optionalUuid,
+  })
+  .refine((i) => i.due_on >= i.issued_on, "Due date must be on or after the issue date")
+  .transform(({ amount_inr, ...i }) => ({ ...i, amount_cents: toCents(amount_inr), status: "sent" as const }));
+
 export const kraSchema = z.object({ name: required("KRA name", 120), description: text(2000), business_unit_id: optionalUuid });
 
 export const kpiSchema = z.object({

@@ -21,6 +21,16 @@ const schema = z.object({
   AI_COST_OUTPUT_CENTS_PER_MTOK: z.coerce.number().min(0).catch(0),
   AI_TIMEOUT_MS: intIn(1_000, 280_000, 60_000),
   AI_MAX_ATTEMPTS: intIn(1, 5, 3),
+  // Email (Resend free tier). Without these, email buttons fall back to opening your mail app.
+  RESEND_API_KEY: optional,
+  EMAIL_FROM: z.string().trim().default("AI Empire OS <onboarding@resend.dev>"),
+  REPORT_EMAIL: z.email().optional().catch(undefined),
+  // Scheduled jobs (Vercel Cron). Server-only secrets; never exposed to the browser.
+  CRON_SECRET: optional,
+  SUPABASE_SERVICE_ROLE_KEY: optional,
+  // Lead discovery (OpenStreetMap — free public data).
+  OVERPASS_URL: z.url().default("https://overpass-api.de/api/interpreter"),
+  NOMINATIM_URL: z.url().default("https://nominatim.openstreetmap.org"),
 });
 
 export type Env = z.infer<typeof schema>;

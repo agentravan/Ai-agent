@@ -9,7 +9,8 @@ import { can } from "@/lib/permissions";
 import { formatDateTime, formatInr, truncate } from "@/lib/utilities/format";
 import { decideApprovalAction } from "@/modules/approvals/actions";
 import { requireContext } from "@/modules/auth/session";
-import { executiveReportAction } from "@/modules/ceo/actions";
+import { emailReportNowAction, executiveReportAction } from "@/modules/ceo/actions";
+import { emailConfigured } from "@/lib/integrations/email";
 import { loadCockpit } from "@/modules/cockpit/service";
 
 export const metadata = { title: "CEO Executive Cockpit" };
@@ -73,6 +74,17 @@ export default async function CockpitPage({ searchParams }: { searchParams: Sear
             </details>
           ) : (
             <p className="mt-4 text-xs text-muted">{ai.available ? "No briefing yet — generate one to get an AI narrative grounded in these numbers." : "AI briefing unavailable until an AI provider is connected. All figures above are live."}</p>
+          )}
+          {canOperate && (
+            <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-line pt-4">
+              <span className="mr-auto text-xs text-muted">{emailConfigured() ? "Daily emails: 09:00 briefing · 19:00 wrap-up (IST)" : "Email reports: pending setup (Resend key)"}</span>
+              {emailConfigured() && (["morning", "evening"] as const).map((slot) => (
+                <form key={slot} action={emailReportNowAction}>
+                  <input type="hidden" name="slot" value={slot} />
+                  <SubmitButton variant="ghost" pendingText="Sending…">{slot === "morning" ? "Email briefing now" : "Email wrap-up now"}</SubmitButton>
+                </form>
+              ))}
+            </div>
           )}
         </Section>
 

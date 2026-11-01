@@ -3,21 +3,26 @@ import { SubmitButton } from "@/components/ui/submit-button";
 import { can } from "@/lib/permissions";
 import { formatInr, truncate } from "@/lib/utilities/format";
 import { requireContext } from "@/modules/auth/session";
-import { financeSummary } from "@/modules/cockpit/metrics";
-import { createBudgetAction, recordTransactionAction } from "@/modules/finance/actions";
+import { financeSummary, invoiceSummary, type InvoiceLite } from "@/modules/cockpit/metrics";
+import { createBudgetAction, createInvoiceAction, markInvoicePaidAction, recordTransactionAction } from "@/modules/finance/actions";
 import type { Budget, BusinessUnit, Department, FinancialRecord } from "@/types/domain";
 
 export const metadata = { title: "Finance & Accounts" };
 
+type Invoice = InvoiceLite & { id: string; number: string; client_name: string; business_unit_id: string | null };
+
 export default async function FinancePage({ searchParams }: { searchParams: SearchParams }) {
   const ctx = await requireContext();
-  const [params, { data: records }, { data: budgets }, { data: units }, { data: departments }] = await Promise.all([
+  const [params, { data: records }, { data: budgets }, { data: units }, { data: departments }, { data: invoices }] = await Promise.all([
     searchParams,
     ctx.db.from("financial_records").select("*").order("occurred_on", { ascending: false }).limit(10000).returns<FinancialRecord[]>(),
     ctx.db.from("budgets").select("*").order("period_start", { ascending: false }).returns<Budget[]>(),
     ctx.db.from("business_units").select("id, name, description, department_id, manager_agent_id").order("name").returns<BusinessUnit[]>(),
     ctx.db.from("departments").select("id, name, description").order("name").returns<Department[]>(),
+    ctx.db.from("invoices").select("id, number, client_name, amount_cents, status, issued_on, due_on, paid_on, business_unit_id").order("due_on").returns<Invoice[]>(),
   ]);
+  const I = invoices ?? [];
+  const dues = invoiceSummary(I);
   const R = records ?? [];
   const B = budgets ?? [];
   const f = financeSummary(R, B);
@@ -28,7 +33,7 @@ export default async function FinancePage({ searchParams }: { searchParams: Sear
 
   return (
     <>
-      <PageHeader eyebrow="Governance" title="Finance & Accounts" subtitle="Inbound client payments, outbound expenses, budgets and cash flow. Every entry is audited; nothing moves money automatically." />
+      <PageHeader eyebrow="CFO Desk · Governance" title="Finance & Accounts" subtitle="Inbound client payments, outbound expenses, budgets and cash flow. Every entry is audited; nothing moves money automatically." />
       <Flash params={params} />
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
         <Stat label="Total inbound" value={formatInr(f.inboundCents)} hint={`30 days: ${formatInr(f.inbound30Cents)}`} />
@@ -36,6 +41,33 @@ export default async function FinancePage({ searchParams }: { searchParams: Sear
         <Stat label="Net profit" value={formatInr(f.netCents)} hint={`30 days: ${formatInr(f.net30Cents)}`} />
         <Stat label="Budget pool (active)" value={formatInr(f.budgetPoolCents)} hint={`Remaining: ${formatInr(f.budgetRemainingCents)}`} />
       </div>
+
+      <Card title="Invoices & outstanding dues" description={`${dues.outstandingCount} unpaid · ${formatInr(dues.outstandingCents)} outstanding · ${dues.overdueCount} overdue (${formatInr(dues.overdueCents)})`} className="mt-6">
+        {I.filter((i) => i.status === "sent").length ? (
+          <Table head={["Invoice", "Client", "Amount", "Due", ""]}>
+            {I.filter((i) => i.status === "sent").map((i) => (
+              <tr key={i.id}>
+                <Td className="text-zinc-50">{i.number}</Td>
+                <Td>{i.client_name}<div className="text-xs text-muted">{unitName.get(i.business_unit_id ?? "") ?? ""}</div></Td>
+                <Td className="num">{formatInr(i.amount_cents)}</Td>
+                <Td>{i.due_on < today ? <Badge tone="bad">{`overdue ${i.due_on}`}</Badge> : <span className="text-xs text-muted">{i.due_on}</span>}</Td>
+                <Td>{canGovern && <form action={markInvoicePaidAction}><input type="hidden" name="id" value={i.id} /><SubmitButton variant="ghost" pendingText="Recording…">Mark paid</SubmitButton></form>}</Td>
+              </tr>
+            ))}
+          </Table>
+        ) : <Empty>No outstanding invoices.</Empty>}
+        {canGovern && (
+          <form action={createInvoiceAction} className="mt-5 grid gap-3 border-t border-line pt-4 sm:grid-cols-6">
+            <Field label="Invoice no."><input name="number" required maxLength={40} className="input" placeholder="INV-001" /></Field>
+            <Field label="Client" className="sm:col-span-2"><input name="client_name" required maxLength={200} className="input" /></Field>
+            <Field label="Amount (₹)"><input name="amount_inr" type="number" min="1" step="0.01" required className="input" /></Field>
+            <Field label="Issued"><input name="issued_on" type="date" required defaultValue={today} className="input" /></Field>
+            <Field label="Due"><input name="due_on" type="date" required className="input" /></Field>
+            <Field label="Business unit" className="sm:col-span-2"><Select name="business_unit_id" options={(units ?? []).map((u) => ({ value: u.id, label: u.name }))} placeholder="Company-wide" /></Field>
+            <div className="flex items-end sm:col-span-4"><SubmitButton>Record invoice</SubmitButton></div>
+          </form>
+        )}
+      </Card>
 
       {canGovern && (
         <div className="mt-6 grid gap-6 xl:grid-cols-2">

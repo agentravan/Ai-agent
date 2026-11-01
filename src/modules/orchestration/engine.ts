@@ -31,6 +31,7 @@ async function monthlySpendCents(ctx: AppContext, agentId: string): Promise<numb
     .from("agent_executions")
     .select("cost_cents")
     .eq("agent_id", agentId)
+    .eq("organisation_id", ctx.organisation.id)
     .gte("created_at", monthStartIso())
     .returns<{ cost_cents: number | string }[]>();
   return (data ?? []).reduce((sum, r) => sum + Number(r.cost_cents), 0);
@@ -41,6 +42,7 @@ async function memoryContext(ctx: AppContext, agentId: string): Promise<string> 
     .from("agent_memories")
     .select("kind, content")
     .eq("agent_id", agentId)
+    .eq("organisation_id", ctx.organisation.id)
     .order("importance", { ascending: false })
     .order("created_at", { ascending: false })
     .limit(5)
@@ -87,7 +89,7 @@ export async function runAgent<T = string>(ctx: AppContext, opts: RunOptions<T>)
 
   const system = `${GOVERNANCE}\nYour identity: ${agent.name}, ${agent.designation} (${agent.tier}).\n${agent.instructions}${await memoryContext(ctx, agent.id)}`;
   const update = (patch: Record<string, unknown>) =>
-    ctx.db.from("agent_executions").update(patch).eq("id", execution.id).select("*").single<Execution>();
+    ctx.db.from("agent_executions").update(patch).eq("id", execution.id).eq("organisation_id", ctx.organisation.id).select("*").single<Execution>();
 
   try {
     const { value, attempts } = await withRetry(
@@ -132,6 +134,7 @@ export async function recoverStaleExecutions(ctx: AppContext): Promise<void> {
   await ctx.db
     .from("agent_executions")
     .update({ status: "failed", error: "Execution interrupted before completion (recovered after timeout)", finished_at: new Date().toISOString() })
+    .eq("organisation_id", ctx.organisation.id)
     .in("status", ["queued", "running"])
     .lt("updated_at", cutoff);
 }
@@ -139,15 +142,15 @@ export async function recoverStaleExecutions(ctx: AppContext): Promise<void> {
 const AGENT_COLUMNS = "*, agent_permissions(permission)";
 
 export async function loadAgent(ctx: AppContext, id: string): Promise<AgentWithPermissions> {
-  return must(await ctx.db.from("agents").select(AGENT_COLUMNS).eq("id", id).single<AgentWithPermissions>());
+  return must(await ctx.db.from("agents").select(AGENT_COLUMNS).eq("id", id).eq("organisation_id", ctx.organisation.id).single<AgentWithPermissions>());
 }
 
 export async function loadAgentByTier(ctx: AppContext, tier: "ceo" | "coo"): Promise<AgentWithPermissions | null> {
-  const { data } = await ctx.db.from("agents").select(AGENT_COLUMNS).eq("tier", tier).maybeSingle<AgentWithPermissions>();
+  const { data } = await ctx.db.from("agents").select(AGENT_COLUMNS).eq("organisation_id", ctx.organisation.id).eq("tier", tier).maybeSingle<AgentWithPermissions>();
   return data;
 }
 
 export async function listAgents(ctx: AppContext): Promise<AgentWithPermissions[]> {
-  const { data } = await ctx.db.from("agents").select(AGENT_COLUMNS).order("tier").order("name").returns<AgentWithPermissions[]>();
+  const { data } = await ctx.db.from("agents").select(AGENT_COLUMNS).eq("organisation_id", ctx.organisation.id).order("tier").order("name").returns<AgentWithPermissions[]>();
   return data ?? [];
 }

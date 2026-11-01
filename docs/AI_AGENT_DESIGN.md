@@ -73,3 +73,16 @@ CEO and COO pages provide an identity card, founder ↔ executive messaging (per
 6. Approval matrix
 
 Briefing, end-of-day and executive reports send the AI only a computed fact sheet (`cockpitFacts`), so figures cannot be invented. Buyontime order data shows "integration pending" until it is connected.
+
+## Sales & Outreach Engine (Cabin D)
+1. **Targets:** you add a business type, city and offer (for example, salons in Dallas, website offer). Active targets are hunted daily.
+2. **Discovery:** OpenStreetMap supplies real businesses with their public contact tags. Nominatim finds the city and Overpass lists the businesses (free, ODbL, ≤1 request per second, results capped). Leads are de-duplicated by OSM id. For website offers, businesses that already have a website are dropped. Each lead gets a transparent fit score (`scoreLead`).
+3. **Qualification (Iris):** reviews up to 8 new leads per run. She decides pitch or skip with a reason, and drafts an email (with opt-out) and a WhatsApp message. Her prompt includes **what past outcomes taught** (`learnFromOutcomes`). Output is schema-validated, and invalid output is retried.
+4. **Founder approval:** required before any contact. A database trigger blocks `approved` unless a founder or admin session approves, and blocks `contacted` unless the lead was approved first. "Approve all" makes this one tap.
+5. **Sending:** WhatsApp opens `wa.me` with the approved text, so you press send yourself; this respects WhatsApp's rules. Email goes through Resend when configured, otherwise through your mail app.
+6. **Learning:** recording replied, won or lost updates conversion stats per category, city and website status. Won leads become active clients in the delivering unit.
+
+Not automated, by design: cold auto-messaging on WhatsApp, Instagram or LinkedIn. It breaks those platforms' terms and gets accounts banned. Social posting needs approved Meta and LinkedIn developer apps.
+
+## Daily email reports
+Vercel Cron calls `/api/cron/morning` at 03:30 UTC (09:00 IST) and `/api/cron/evening` at 13:30 UTC (19:00 IST). Both are authenticated with `CRON_SECRET`. The morning run executes one prospecting cycle, then emails the briefing. The evening run emails the wrap-up with CEO recommendations, which use facts only. Jobs use the service-role client with explicit organisation filters on every query. Required settings: `SUPABASE_SERVICE_ROLE_KEY`, `CRON_SECRET`, `RESEND_API_KEY`, and optionally `REPORT_EMAIL`.

@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
-  BadgeCheck, Bot, Briefcase, Crown, Gauge, Lightbulb, type LucideIcon, ScrollText, Settings, Target, Terminal, Wallet, Workflow,
+  BadgeCheck, Bot, Briefcase, Building2, Crown, Gauge, Megaphone, Lightbulb, type LucideIcon, ScrollText, Settings, Target, Terminal, Wallet, Workflow,
 } from "lucide-react";
 import { cn } from "@/lib/utilities/format";
 
@@ -12,6 +12,7 @@ type Item = { href: string; label: string; icon: LucideIcon };
 export const NAV_GROUPS: { label: string; items: Item[] }[] = [
   { label: "Overview", items: [
     { href: "/dashboard", label: "CEO Cockpit", icon: Gauge },
+    { href: "/office", label: "Virtual Office", icon: Building2 },
     { href: "/command", label: "Empire Command", icon: Terminal },
   ] },
   { label: "Executive Office", items: [
@@ -19,6 +20,7 @@ export const NAV_GROUPS: { label: string; items: Item[] }[] = [
     { href: "/coo", label: "COO Office", icon: Workflow },
   ] },
   { label: "Operations", items: [
+    { href: "/sales", label: "Sales Engine", icon: Megaphone },
     { href: "/projects", label: "Projects & Tasks", icon: Briefcase },
     { href: "/workforce", label: "Agent Registry", icon: Bot },
     { href: "/opportunities", label: "Opportunities", icon: Lightbulb },

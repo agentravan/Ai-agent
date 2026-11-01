@@ -6,12 +6,13 @@ insert into auth.users (id, email) values
 
 do $$ begin
   assert (select count(*) from public.organisations) = 2, 'one org per founder';
-  assert (select count(*) from public.agents) = 14, 'seven starter agents each (4 executives + 3 managers)';
-  assert (select count(*) from public.business_units) = 6, 'three business units each';
-  assert (select count(*) from public.kras) = 16, 'eight KRAs each';
+  assert (select count(*) from public.agents) = 16, 'eight starter agents each (4 executives + 4 managers)';
+  assert (select count(*) from public.business_units) = 8, 'four business units each';
+  assert (select count(*) from public.kras) = 20, 'ten KRAs each';
   assert (select count(*) from public.business_units where manager_agent_id is null) = 0, 'every unit has a manager';
   perform private.seed_executive_office(id) from public.organisations;
-  assert (select count(*) from public.agents) = 14, 'seed is idempotent';
+  perform private.seed_sales_engine(id) from public.organisations;
+  assert (select count(*) from public.agents) = 16, 'seed is idempotent';
   assert (select count(*) from public.profiles where role = 'founder') = 2, 'founder role';
 end $$;
 
@@ -21,8 +22,8 @@ select set_config('request.jwt.claim.sub', '11111111-1111-1111-1111-111111111111
 do $$
 declare other_agent uuid; t1 uuid; t2 uuid; appr uuid;
 begin
-  assert (select count(*) from public.agents) = 7, 'RLS: sees only own agents';
-  assert (select count(*) from public.kras) = 8, 'RLS: sees only own KRAs';
+  assert (select count(*) from public.agents) = 8, 'RLS: sees only own agents';
+  assert (select count(*) from public.kras) = 10, 'RLS: sees only own KRAs';
   assert (select count(*) from public.organisations) = 1, 'RLS: sees only own org';
 
   insert into public.tasks (organisation_id, title) values (private.auth_org_id(), 'A') returning id into t1;
@@ -50,6 +51,16 @@ begin
     raise exception 'audit delete allowed';
   exception when insufficient_privilege then null; end;
   assert (select count(*) from public.audit_logs where entity = 'tasks') >= 2, 'task changes audited';
+
+  -- Outreach must be approved before contact.
+  insert into public.leads (organisation_id, name) values (private.auth_org_id(), 'Salon X') returning id into t1;
+  begin
+    update public.leads set status = 'contacted' where id = t1;
+    raise exception 'contact without approval allowed';
+  exception when check_violation then null; end;
+  update public.leads set status = 'approved' where id = t1;
+  update public.leads set status = 'contacted' where id = t1;
+  update public.leads set status = 'replied' where id = t1;
 end $$;
 
 -- Cross-tenant write must fail even with a known foreign id.
@@ -77,6 +88,18 @@ do $$ begin
   begin
     insert into public.tasks (organisation_id, title) values (private.auth_org_id(), 'V');
     raise exception 'viewer write allowed';
+  exception when insufficient_privilege then null; end;
+end $$;
+
+-- Members can draft leads but cannot approve outreach.
+reset role;
+update public.profiles set role = 'member' where email = 'founder@a.test';
+set role authenticated;
+do $$ declare l uuid; begin
+  insert into public.leads (organisation_id, name, status) values (private.auth_org_id(), 'Salon Y', 'pitch_ready') returning id into l;
+  begin
+    update public.leads set status = 'approved' where id = l;
+    raise exception 'member approved outreach';
   exception when insufficient_privilege then null; end;
 end $$;
 

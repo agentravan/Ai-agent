@@ -86,3 +86,20 @@ export function deskEntry(tasks: Pick<Task, "id" | "title" | "status" | "priorit
 }
 
 export const withinHours = (iso: string, hours: number, now = new Date()) => now.getTime() - new Date(iso).getTime() <= hours * 3_600_000;
+
+export interface InvoiceLite { amount_cents: number; status: "draft" | "sent" | "paid" | "void"; due_on: string; paid_on: string | null; issued_on: string }
+
+/** CFO desk: outstanding dues = sent & unpaid; overdue = past due date. */
+export function invoiceSummary(invoices: InvoiceLite[], now = new Date()) {
+  const today = now.toISOString().slice(0, 10);
+  const open = invoices.filter((i) => i.status === "sent");
+  const sum = (xs: InvoiceLite[]) => xs.reduce((s, i) => s + Number(i.amount_cents), 0);
+  return {
+    outstandingCents: sum(open),
+    outstandingCount: open.length,
+    overdueCents: sum(open.filter((i) => i.due_on < today)),
+    overdueCount: open.filter((i) => i.due_on < today).length,
+    receivedTodayCents: sum(invoices.filter((i) => i.status === "paid" && i.paid_on === today)),
+    invoicedTodayCents: sum(invoices.filter((i) => i.status !== "void" && i.issued_on === today)),
+  };
+}

@@ -34,6 +34,8 @@ export const AGENT_PERMISSIONS = {
   "opportunities.create": "Propose business opportunities",
   "approvals.request": "Raise approval requests to the founder",
   "reports.create": "Produce executive reports",
+  "leads.qualify": "Score and qualify sales leads",
+  "outreach.draft": "Draft outreach pitches (sending always needs Founder approval)",
 } as const;
 
 export type AgentPermission = keyof typeof AGENT_PERMISSIONS;
