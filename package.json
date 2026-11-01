@@ -4,7 +4,7 @@
   "private": true,
   "description": "AI Empire OS — autonomous multi-agent business operating system",
   "engines": {
-    "node": ">=20.9"
+    "node": "22.x"
   },
   "scripts": {
     "dev": "next dev",
