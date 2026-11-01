@@ -66,7 +66,7 @@ export async function emailReportNowAction(form: FormData) {
   const slot = z.enum(["morning", "evening"]).catch("morning").parse(form.get("slot"));
   await runAction("/dashboard", "Report emailed", async () => {
     const ctx = await requireContext("operate");
-    if (!emailConfigured()) throw new UserFacingError("Email is not set up yet (RESEND_API_KEY). Ask Claude to connect it.");
+    if (!emailConfigured()) throw new UserFacingError("Your mailbox is not connected yet. Ask Claude to connect it.");
     const report = await buildDailyReport(ctx, slot);
     try {
       await sendEmail({ to: ctx.email, subject: report.subject, text: report.text, html: report.html });

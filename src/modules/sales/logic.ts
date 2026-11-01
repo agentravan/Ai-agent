@@ -123,3 +123,25 @@ export function parseDecisions(text: string, maxRef: number): QualificationDecis
   const seen = new Set<number>();
   return parsed.data.decisions.filter((d) => d.ref <= maxRef && !seen.has(d.ref) && seen.add(d.ref) && (!d.pitch || (d.email_body || d.whatsapp)));
 }
+
+/** A reply asking to stop contact. Opt-outs are honoured permanently. */
+export function isOptOut(text: string): boolean {
+  return /\b(unsubscribe|stop|remove me|not interested|do not contact|don't contact)\b/i.test(text);
+}
+
+/** Remaining outreach emails allowed today (protects the Founder's mailbox reputation). */
+export function remainingToday(sentToday: number, dailyLimit: number): number {
+  return Math.max(0, dailyLimit - sentToday);
+}
+
+/** Keeps only the new text of a reply: drops quoted history, signatures separators and our own footer. */
+export function stripQuoted(body: string): string {
+  const out: string[] = [];
+  for (const line of body.replace(/\r/g, "").split("\n")) {
+    const t = line.trim();
+    if (/^>/.test(t)) break;
+    if (/^On .{4,200}wrote:?$/i.test(t) || /^-{2,}\s*Original Message/i.test(t) || /^From: .+/i.test(t) || /^—$/.test(t) || /^Sent from my /i.test(t)) break;
+    out.push(line);
+  }
+  return out.join("\n").trim();
+}

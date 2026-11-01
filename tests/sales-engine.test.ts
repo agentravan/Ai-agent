@@ -99,3 +99,26 @@ describe("CFO invoice summary", () => {
     expect(s).toEqual({ outstandingCents: 8700, outstandingCount: 3, overdueCents: 3000, overdueCount: 1, receivedTodayCents: 2000, invoicedTodayCents: 700 });
   });
 });
+
+import { isOptOut, remainingToday, stripQuoted } from "@/modules/sales/logic";
+
+describe("inbox reply analysis", () => {
+  const ourPitch = `Hi Glow Salon, we build websites...\n—\nAI Empire · 1 Main St\nNot interested? Reply "unsubscribe" and we won't contact you again.`;
+  it("does not treat a quoted pitch footer as an opt-out", () => {
+    const reply = `Sounds great, call me tomorrow.\n\nOn Mon, Nov 2, 2026 at 10:00 AM AI Empire <me@gmail.com> wrote:\n> ${ourPitch.replace(/\n/g, "\n> ")}`;
+    expect(stripQuoted(reply)).toBe("Sounds great, call me tomorrow.");
+    expect(isOptOut(stripQuoted(reply))).toBe(false);
+  });
+  it("detects genuine opt-outs", () => {
+    for (const t of ["unsubscribe", "Please STOP emailing", "remove me from your list", "Not interested, thanks"]) expect(isOptOut(t)).toBe(true);
+    expect(isOptOut("Yes interested, what is the price?")).toBe(false);
+  });
+  it("cuts mobile signatures and forwarded headers", () => {
+    expect(stripQuoted("Ok!\nSent from my iPhone\n> old")).toBe("Ok!");
+    expect(stripQuoted("Thanks\n-----Original Message-----\nFrom: x")).toBe("Thanks");
+  });
+  it("enforces the daily sending limit", () => {
+    expect(remainingToday(5, 20)).toBe(15);
+    expect(remainingToday(25, 20)).toBe(0);
+  });
+});

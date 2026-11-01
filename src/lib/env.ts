@@ -21,9 +21,18 @@ const schema = z.object({
   AI_COST_OUTPUT_CENTS_PER_MTOK: z.coerce.number().min(0).catch(0),
   AI_TIMEOUT_MS: intIn(1_000, 280_000, 60_000),
   AI_MAX_ATTEMPTS: intIn(1, 5, 3),
-  // Email (Resend free tier). Without these, email buttons fall back to opening your mail app.
-  RESEND_API_KEY: optional,
-  EMAIL_FROM: z.string().trim().default("AI Empire OS <onboarding@resend.dev>"),
+  // Your own mailbox (e.g. Gmail with an App Password). The AI employee sends and reads mail as you.
+  SMTP_HOST: z.string().trim().default("smtp.gmail.com"),
+  SMTP_PORT: z.coerce.number().int().min(1).max(65535).catch(465),
+  IMAP_HOST: z.string().trim().default("imap.gmail.com"),
+  IMAP_PORT: z.coerce.number().int().min(1).max(65535).catch(993),
+  MAIL_USER: z.email().optional().catch(undefined),
+  MAIL_PASSWORD: optional,
+  MAIL_FROM_NAME: z.string().trim().max(80).default("AI Empire"),
+  // Required by US CAN-SPAM for commercial email: a physical postal address in every pitch.
+  BUSINESS_ADDRESS: optional,
+  // Protects your mailbox reputation: max outreach emails per day.
+  OUTREACH_DAILY_LIMIT: intIn(1, 200, 20),
   REPORT_EMAIL: z.email().optional().catch(undefined),
   // Scheduled jobs (Vercel Cron). Server-only secrets; never exposed to the browser.
   CRON_SECRET: optional,

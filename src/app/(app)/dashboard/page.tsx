@@ -77,7 +77,7 @@ export default async function CockpitPage({ searchParams }: { searchParams: Sear
           )}
           {canOperate && (
             <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-line pt-4">
-              <span className="mr-auto text-xs text-muted">{emailConfigured() ? "Daily emails: 09:00 briefing · 19:00 wrap-up (IST)" : "Email reports: pending setup (Resend key)"}</span>
+              <span className="mr-auto text-xs text-muted">{emailConfigured() ? "Daily emails: 09:00 briefing · 19:00 wrap-up (IST)" : "Email reports: connect your mailbox to enable"}</span>
               {emailConfigured() && (["morning", "evening"] as const).map((slot) => (
                 <form key={slot} action={emailReportNowAction}>
                   <input type="hidden" name="slot" value={slot} />

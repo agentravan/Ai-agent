@@ -127,5 +127,74 @@ export async function runProspectingCycle(ctx: AppContext, maxTargets = 2): Prom
   }
   const q = await qualifyLeads(ctx).catch((err: Error) => ({ error: err.message }));
   parts.push("error" in q ? `Qualification: ${q.error}` : `Qualified ${q.reviewed}: ${q.pitched} pitches ready for your approval, ${q.skipped} skipped`);
+  // Mailbox work: send anything you already approved (within today's limit), then read replies.
+  const s = await sendApprovedEmails(ctx).catch((err: Error) => ({ error: err.message }));
+  if ("error" in s) parts.push(`Email: ${s.error}`);
+  else if (s.sent || s.failed) parts.push(`Emailed ${s.sent} approved leads${s.failed ? ` (${s.failed} failed)` : ""}`);
+  const r = await checkReplies(ctx).catch((err: Error) => ({ error: err.message }));
+  if ("error" in r) parts.push(`Inbox: ${r.error}`);
+  else if (r.replies || r.optOuts) parts.push(`Inbox: ${r.replies} new replies, ${r.optOuts} opt-outs`);
   return parts.join(" · ");
+}
+
+const startOfTodayIso = () => { const d = new Date(); d.setUTCHours(0, 0, 0, 0); return d.toISOString(); };
+
+/** Sends approved email pitches from the Founder's own mailbox, within the daily limit. Approval is already given. */
+export async function sendApprovedEmails(ctx: AppContext, onlyId?: string): Promise<{ sent: number; failed: number; skipped: number; limitReached: boolean }> {
+  const { emailConfigured, sendEmail } = await import("@/lib/integrations/email");
+  const { env } = await import("@/lib/env");
+  const { remainingToday } = await import("./logic");
+  if (!emailConfigured()) return { sent: 0, failed: 0, skipped: 0, limitReached: false };
+  const org = ctx.organisation.id;
+  const [{ count: sentToday }, { data: optedOut }] = await Promise.all([
+    ctx.db.from("leads").select("id", { count: "exact", head: true }).eq("organisation_id", org).eq("contact_channel", "email").gte("contacted_at", startOfTodayIso()),
+    ctx.db.from("leads").select("email").eq("organisation_id", org).eq("outcome_note", "Unsubscribed").returns<{ email: string | null }[]>(),
+  ]);
+  const blocked = new Set((optedOut ?? []).map((o) => o.email?.toLowerCase()).filter(Boolean));
+  let budget = remainingToday(sentToday ?? 0, env.OUTREACH_DAILY_LIMIT);
+  let q = ctx.db.from("leads").select("*").eq("organisation_id", org).eq("status", "approved").not("email", "is", null).not("pitch_email", "is", null).order("score", { ascending: false }).limit(50);
+  if (onlyId) q = q.eq("id", onlyId);
+  const { data: queue } = await q.returns<Lead[]>();
+  let sent = 0, failed = 0, skipped = 0;
+  for (const lead of queue ?? []) {
+    if (budget <= 0) break;
+    if (blocked.has(lead.email!.toLowerCase())) { skipped++; continue; }
+    try {
+      await sendEmail({ to: lead.email!, subject: lead.pitch_subject ?? `Hello ${lead.name}`, text: lead.pitch_email!, replyTo: ctx.email, outreach: true });
+      await ctx.db.from("leads").update({ status: "contacted", contacted_at: new Date().toISOString(), contact_channel: "email" }).eq("id", lead.id).eq("organisation_id", org).eq("status", "approved");
+      sent++; budget--;
+    } catch (err) {
+      failed++;
+      await logEvent(ctx, { action: "sales.email_failed", entity: "leads", entityId: lead.id, actorType: "agent", metadata: { error: (err as Error).message } });
+      if (/login failed/i.test((err as Error).message)) break; // credentials problem: stop, don't hammer the mailbox
+    }
+  }
+  if (sent) await logEvent(ctx, { action: "sales.emails_sent", entity: "leads", actorType: "agent", metadata: { sent, failed, skipped } });
+  return { sent, failed, skipped, limitReached: budget <= 0 && (queue?.length ?? 0) > sent + skipped };
+}
+
+/** Reads the Founder's inbox for replies from contacted leads; marks replies and honours opt-outs. */
+export async function checkReplies(ctx: AppContext): Promise<{ replies: number; optOuts: number }> {
+  const { findReplies } = await import("@/lib/integrations/inbox");
+  const { isOptOut, stripQuoted } = await import("./logic");
+  const org = ctx.organisation.id;
+  const { data: open } = await ctx.db.from("leads").select("id, email, contacted_at, status").eq("organisation_id", org).eq("status", "contacted").not("email", "is", null)
+    .returns<{ id: string; email: string; contacted_at: string | null; status: string }[]>();
+  if (!open?.length) return { replies: 0, optOuts: 0 };
+  const oldest = open.reduce((m, l) => (l.contacted_at && l.contacted_at < m ? l.contacted_at : m), new Date().toISOString());
+  const since = new Date(Math.max(new Date(oldest).getTime(), Date.now() - 30 * 86_400_000));
+  const messages = await findReplies(open.map((l) => l.email), since);
+  let replies = 0, optOuts = 0;
+  for (const lead of open) {
+    const msg = messages.filter((m) => m.from === lead.email.toLowerCase() && (!lead.contacted_at || m.date >= lead.contacted_at)).at(-1);
+    if (!msg) continue;
+    // Analyse only what the client wrote — never our quoted pitch (its footer mentions "unsubscribe").
+    const fresh = stripQuoted(msg.snippet).replace(/\s+/g, " ").trim();
+    const optOut = isOptOut(`${msg.subject.replace(/^(re|fwd?):\s*/gi, "")} ${fresh}`);
+    const patch = optOut ? { status: "lost", outcome_note: "Unsubscribed" } : { status: "replied", outcome_note: `Reply: ${fresh || msg.subject}`.slice(0, 1000) };
+    const { error } = await ctx.db.from("leads").update(patch).eq("id", lead.id).eq("organisation_id", org).eq("status", "contacted");
+    if (!error) optOut ? optOuts++ : replies++;
+  }
+  if (replies || optOuts) await logEvent(ctx, { action: "sales.replies_detected", entity: "leads", actorType: "agent", metadata: { replies, optOuts } });
+  return { replies, optOuts };
 }

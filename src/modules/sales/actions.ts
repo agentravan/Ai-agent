@@ -9,7 +9,7 @@ import { must, runAction, UserFacingError } from "@/lib/utilities/action";
 import { requireContext } from "@/modules/auth/session";
 import { logEvent } from "@/modules/audit/service";
 import { OUTCOMES, whatsappLink } from "./logic";
-import { discoverForTarget, qualifyLeads, runProspectingCycle, type Lead, type Target } from "./service";
+import { checkReplies, discoverForTarget, qualifyLeads, runProspectingCycle, sendApprovedEmails, type Lead, type Target } from "./service";
 
 const PATH = "/sales";
 const categoryKeys = Object.keys(LEAD_CATEGORIES) as [string, ...string[]];
@@ -96,6 +96,8 @@ export async function approveLeadAction(form: FormData) {
     const { id } = parseForm(idSchema, form);
     const { data } = await ctx.db.from("leads").update({ status: "approved", approved_by: ctx.userId }).eq("id", id).eq("status", "pitch_ready").select("id");
     if (!data?.length) throw new UserFacingError("Lead is not waiting for approval");
+    const s = await sendApprovedEmails(ctx, id);
+    return s.sent ? "Approved — Iris emailed them from your mailbox" : "Pitch approved";
   });
 }
 
@@ -104,7 +106,8 @@ export async function approveAllAction() {
     const ctx = await requireContext("govern");
     const { data } = await ctx.db.from("leads").update({ status: "approved", approved_by: ctx.userId }).eq("organisation_id", ctx.organisation.id).eq("status", "pitch_ready").select("id");
     await logEvent(ctx, { action: "sales.pitches_approved", entity: "leads", metadata: { count: data?.length ?? 0 } });
-    return `${data?.length ?? 0} pitches approved — send them from the Ready to send list`;
+    const s = await sendApprovedEmails(ctx);
+    return `${data?.length ?? 0} approved · Iris emailed ${s.sent} from your mailbox${s.limitReached ? " (daily limit reached — the rest go tomorrow)" : ""}. WhatsApp-only leads are in Ready to send.`;
   });
 }
 
@@ -134,9 +137,9 @@ export async function sendEmailAction(form: FormData) {
     const lead = must(await ctx.db.from("leads").select("*").eq("id", id).single<Lead>());
     if (lead.status !== "approved") throw new UserFacingError("Only approved pitches can be sent");
     if (!lead.email || !lead.pitch_email) throw new UserFacingError("This lead has no email address or email pitch");
-    if (!emailConfigured()) throw new UserFacingError("Email sending is not set up yet — use WhatsApp, or ask to connect Resend");
+    if (!emailConfigured()) throw new UserFacingError("Your mailbox is not connected yet — use WhatsApp for now");
     try {
-      await sendEmail({ to: lead.email, subject: lead.pitch_subject ?? `Hello ${lead.name}`, text: lead.pitch_email, replyTo: ctx.email });
+      await sendEmail({ to: lead.email, subject: lead.pitch_subject ?? `Hello ${lead.name}`, text: lead.pitch_email, replyTo: ctx.email, outreach: true });
     } catch (err) {
       throw new UserFacingError((err as Error).message);
     }
@@ -159,6 +162,18 @@ export async function recordOutcomeAction(form: FormData) {
       const { data: unit } = await ctx.db.from("business_units").select("id").eq("organisation_id", ctx.organisation.id).eq("name", unitName).maybeSingle<{ id: string }>();
       await ctx.db.from("clients").insert({ organisation_id: ctx.organisation.id, name: lead.name, email: lead.email, phone: lead.phone, status: "active", business_unit_id: unit?.id ?? null, notes: "Won via Sales Engine" });
       return `${lead.name} won and added as an active client`;
+    }
+  });
+}
+
+export async function checkRepliesAction() {
+  await runAction(PATH, "Inbox checked", async () => {
+    const ctx = await requireContext("operate");
+    try {
+      const r = await checkReplies(ctx);
+      return `Iris checked your inbox: ${r.replies} new replies, ${r.optOuts} opt-outs`;
+    } catch (err) {
+      throw new UserFacingError(`Could not read your inbox: ${(err as Error).message}`);
     }
   });
 }

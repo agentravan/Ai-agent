@@ -25,7 +25,7 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ slot
 
   const db = createServiceDb();
   if (!db) return NextResponse.json({ status: "pending", reason: "SUPABASE_SERVICE_ROLE_KEY not configured" }, { status: 503 });
-  if (!emailConfigured()) return NextResponse.json({ status: "pending", reason: "RESEND_API_KEY not configured" }, { status: 503 });
+  if (!emailConfigured()) return NextResponse.json({ status: "pending", reason: "Mailbox not connected (MAIL_USER / MAIL_PASSWORD)" }, { status: 503 });
 
   const { data: founders } = await db.from("profiles").select("id, organisation_id, email, full_name, role, organisations(id, name, created_at)").eq("role", "founder")
     .returns<(Profile & { organisations: Organisation | null })[]>();

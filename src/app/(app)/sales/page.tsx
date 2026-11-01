@@ -8,7 +8,7 @@ import { can } from "@/lib/permissions";
 import { formatDateTime, humanize, truncate } from "@/lib/utilities/format";
 import { requireContext } from "@/modules/auth/session";
 import {
-  addManualLeadAction, addTargetAction, approveAllAction, approveLeadAction, discoverTargetAction, qualifyAction, recordOutcomeAction,
+  addManualLeadAction, addTargetAction, approveAllAction, approveLeadAction, checkRepliesAction, discoverTargetAction, qualifyAction, recordOutcomeAction,
   rejectLeadAction, runCycleAction, sendEmailAction, toggleTargetAction, whatsappAction,
 } from "@/modules/sales/actions";
 import { learnFromOutcomes, mailtoLink, whatsappNumber } from "@/modules/sales/logic";
@@ -59,7 +59,7 @@ export default async function SalesPage({ searchParams }: { searchParams: Search
   return (
     <>
       <PageHeader eyebrow="Cabin D · Sales & Social Media Engine" title="Sales Engine"
-        subtitle="Iris finds real businesses, decides who is worth pitching and why, and drafts the messages. You approve with one tap; outcomes teach the engine what converts." />
+        subtitle="Iris finds real businesses, decides who is worth pitching and why, writes the messages, emails approved leads from your own mailbox and reads your inbox for replies. You only approve." />
       <Flash params={params} />
 
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
@@ -146,7 +146,7 @@ export default async function SalesPage({ searchParams }: { searchParams: Search
         ) : <Empty>No pitches waiting. Run a cycle or qualify new leads.</Empty>}
       </Card>
 
-      <Card title={`Ready to send (${ready.length})`} description="Approved pitches. WhatsApp opens with the message pre-written — just press send." className="mt-6">
+      <Card title={`Ready to send (${ready.length})`} description={mail ? "Email pitches are sent by Iris automatically after approval (daily limit protects your mailbox). WhatsApp opens pre-written — just press send." : "Connect your mailbox so Iris can email approved leads herself. WhatsApp opens pre-written — just press send."} className="mt-6">
         {ready.length ? (
           <ul className="divide-y divide-line">
             {ready.map((l) => (
@@ -157,7 +157,7 @@ export default async function SalesPage({ searchParams }: { searchParams: Search
                     <form action={whatsappAction}><input type="hidden" name="id" value={l.id} /><button className="btn-gold"><MessageCircle className="h-4 w-4" />WhatsApp</button></form>
                   )}
                   {l.email && l.pitch_email && (mail
-                    ? <form action={sendEmailAction}><input type="hidden" name="id" value={l.id} /><SubmitButton variant="ghost" pendingText="Sending…"><Mail className="h-4 w-4" />Send email</SubmitButton></form>
+                    ? <form action={sendEmailAction}><input type="hidden" name="id" value={l.id} /><SubmitButton variant="ghost" pendingText="Sending…"><Mail className="h-4 w-4" />Send now</SubmitButton></form>
                     : <a className="btn-ghost" href={mailtoLink(l.email, l.pitch_subject ?? "", l.pitch_email)}><Mail className="h-4 w-4" />Open email</a>)}
                   {!l.email && !whatsappNumber(l.phone, l.country) && <span className="text-xs text-amber-300">No usable contact — call {l.phone ?? "n/a"}</span>}
                 </div>
@@ -167,7 +167,8 @@ export default async function SalesPage({ searchParams }: { searchParams: Search
         ) : <Empty>Approved pitches appear here.</Empty>}
       </Card>
 
-      <Card title={`Conversations (${inFlight.length})`} description="Record what happened — this is how the engine learns." className="mt-6">
+      <Card title={`Conversations (${inFlight.length})`} description={mail ? "Email replies are detected automatically from your inbox. Record WhatsApp outcomes here — this is how the engine learns." : "Record what happened — this is how the engine learns."} className="mt-6"
+        action={canOperate && mail && <form action={checkRepliesAction}><SubmitButton variant="ghost" pendingText="Reading inbox…">Check replies now</SubmitButton></form>}>
         {inFlight.length ? (
           <Table head={["Business", "Channel", "Status", "Record outcome"]}>
             {inFlight.map((l) => (
