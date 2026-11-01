@@ -15,12 +15,13 @@ export const metadata = { title: "My Desk" };
 
 const TYPE_ICON: Record<string, LucideIcon> = { call: Phone, meeting: CalendarClock, order: ShoppingCart, physical: Wrench, other: Circle };
 const RANK = { critical: 0, high: 1, medium: 2, low: 3 } as const;
+type Contact = { id: string; name: string; category: string; city: string | null; country: string | null; phone: string | null; email: string | null; status: string; outcome_note: string | null; ai_reason: string | null; updated_at: string };
 type DeskTask = Task & { leads: { name: string; phone: string | null; email: string | null; country: string | null } | null; updated_at: string };
 
 export default async function DeskPage({ searchParams }: { searchParams: SearchParams }) {
   const ctx = await requireContext();
   const org = ctx.organisation.id;
-  const [params, company, { data: mine }, counts] = await Promise.all([
+  const [params, company, { data: mine }, counts, { data: contacts }] = await Promise.all([
     searchParams,
     companySnapshot(ctx),
     ctx.db.from("tasks").select("*, leads(name, phone, email, country)").eq("organisation_id", org).eq("owner", "founder").order("created_at", { ascending: false }).limit(200).returns<DeskTask[]>(),
@@ -31,7 +32,12 @@ export default async function DeskPage({ searchParams }: { searchParams: SearchP
       ctx.db.from("tasks").select("id", { count: "exact", head: true }).eq("organisation_id", org).eq("owner", "agent").eq("status", "done"),
       ctx.db.from("projects").select("id", { count: "exact", head: true }).eq("organisation_id", org).eq("status", "active"),
     ]),
+    // People who need a human: replied or won (call/meet), and approved leads reachable only by phone.
+    ctx.db.from("leads").select("id, name, category, city, country, phone, email, status, outcome_note, ai_reason, updated_at").eq("organisation_id", org)
+      .or("status.in.(replied,won),and(status.eq.approved,email.is.null,phone.not.is.null)").order("updated_at", { ascending: false }).limit(30)
+      .returns<Contact[]>(),
   ]);
+  const people = contacts ?? [];
   const [income, clients, leads, aiDone, activeProjects] = counts;
   const revenue = (income.data ?? []).reduce((s, r) => s + Number(r.amount_cents), 0);
   const stage = growthStage(company.netProfitCents, company.northStarCents);
@@ -91,6 +97,30 @@ export default async function DeskPage({ searchParams }: { searchParams: SearchP
         <Stat label="Tasks done by AI team" value={aiDone.count ?? 0} />
       </div>
 
+      <Card title={`People to call (${people.length})`} description="Clients who replied or were won, and approved leads reachable only by phone. Tap the number to call." className="mb-6">
+        {people.length ? (
+          <ul className="divide-y divide-line">
+            {people.map((c) => {
+              const wa = whatsappLink(c.phone, c.country, `Hi ${c.name}, this is Teamwork HR Solutions — thanks for your time.`);
+              return (
+                <li key={c.id} className="flex flex-col gap-2 py-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2"><span className="font-medium text-zinc-100">{c.name}</span><Badge>{c.status}</Badge><span className="text-xs text-zinc-500">{[c.category, c.city].filter(Boolean).join(" · ")}</span></div>
+                    {c.outcome_note && <p className="mt-0.5 line-clamp-2 text-xs text-zinc-400">{c.outcome_note}</p>}
+                    {!c.outcome_note && c.ai_reason && <p className="mt-0.5 line-clamp-2 text-xs text-zinc-500">Why: {c.ai_reason}</p>}
+                  </div>
+                  <div className="flex shrink-0 flex-wrap items-center gap-2 text-sm">
+                    {c.phone ? <a href={`tel:${c.phone}`} className="btn-gold"><Phone className="h-4 w-4" />{c.phone}</a> : <span className="text-xs text-zinc-500">No phone listed</span>}
+                    {wa && <a href={wa} target="_blank" rel="noreferrer" className="btn-ghost"><MessageCircle className="h-4 w-4" />WhatsApp</a>}
+                    {c.email && <a href={`mailto:${c.email}`} className="btn-ghost">{c.email}</a>}
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        ) : <Empty icon={Phone}>No one to call yet. Approve pitches in the Sales Engine — when someone replies, they appear here with their number.</Empty>}
+      </Card>
+
       <div className="grid gap-6 xl:grid-cols-3">
         <Card title={`My tasks (${open.length})`} description="Calls, meetings, orders and physical work — created by Atlas, by the Sales Engine when a client replies, or by you" className="xl:col-span-2">
           {open.length ? (
@@ -106,9 +136,16 @@ export default async function DeskPage({ searchParams }: { searchParams: SearchP
                       <div className="min-w-0">
                         <div className="flex flex-wrap items-center gap-2"><span className="font-medium text-zinc-100">{t.title}</span><Badge>{t.priority}</Badge>{t.status === "in_progress" && <Badge>in_progress</Badge>}</div>
                         {t.description && <p className="mt-0.5 line-clamp-3 text-xs whitespace-pre-wrap text-zinc-400">{t.description}</p>}
+                        {!t.lead_id && (t.task_type === "call" || t.task_type === "meeting") && (
+                          <div className="mt-2 rounded-md border border-line bg-panel-2/40 p-2 text-xs">
+                            {people.length ? (<><p className="mb-1 text-zinc-500">Who to call:</p>{people.slice(0, 5).map((c) => <div key={c.id} className="flex flex-wrap gap-x-2"><span className="text-zinc-200">{c.name}</span>{c.phone ? <a href={`tel:${c.phone}`} className="font-medium text-gold underline underline-offset-2">{c.phone}</a> : <span className="text-zinc-500">no phone</span>}</div>)}</>)
+                              : <p className="text-zinc-500">Nobody to call yet. When a lead replies, their name and number appear here automatically.</p>}
+                          </div>
+                        )}
+                        {/lead/i.test(t.title) && !/call|meet/i.test(t.title) && <Link href="/sales" className="mt-1.5 inline-block text-xs text-gold underline underline-offset-2">Open Sales Engine → approve leads</Link>}
                         <div className="mt-1.5 flex flex-wrap gap-2 text-xs">
                           {t.due_date && <span className={overdue ? "text-rose-300" : "text-zinc-500"}>Due {t.due_date}</span>}
-                          {t.leads?.phone && <a href={`tel:${t.leads.phone}`} className="inline-flex items-center gap-1 text-zinc-300 underline decoration-zinc-600 underline-offset-2"><Phone className="h-3 w-3" />Call</a>}
+                          {t.leads?.phone && <a href={`tel:${t.leads.phone}`} className="inline-flex items-center gap-1 font-medium text-zinc-100 underline decoration-zinc-600 underline-offset-2"><Phone className="h-3 w-3" />{t.leads.phone}</a>}
                           {wa && <a href={wa} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-zinc-300 underline decoration-zinc-600 underline-offset-2"><MessageCircle className="h-3 w-3" />WhatsApp</a>}
                           {t.leads?.email && <a href={`mailto:${t.leads.email}`} className="text-zinc-300 underline decoration-zinc-600 underline-offset-2">Email</a>}
                         </div>

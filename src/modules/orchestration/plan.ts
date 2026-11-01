@@ -35,7 +35,10 @@ Respond with ONLY a JSON object, no prose, matching:
 "risk": "low"|"medium"|"high"|"critical", "kra": one of the listed KRA names,
 "approval_action": "domain.verb" (only for request_approval, e.g. "finance.spend", "external.contact", "budget.request"),
 "task_type": "call"|"meeting"|"order"|"physical"|"other" (only for create_founder_task)}]}
-Use create_founder_task ONLY for things an AI cannot do: phone calls, in-person meetings, placing/paying for orders, physical work.
+Use create_founder_task ONLY for things an AI cannot do: phone calls, in-person meetings, placing/paying for orders, physical work —
+and only for a specific person, business or order named in the instruction. Never create founder tasks for things the system
+already does: finding/qualifying leads and approving pitches (Sales Engine), calls to people who reply (added automatically),
+or Buyontime order placement (added automatically).
 Every step must name the KRA it serves. Assign work to the manager of the relevant business unit.
 Mark anything involving money, legal exposure, external communication or irreversible change as risk "high" or use request_approval.`;
 
