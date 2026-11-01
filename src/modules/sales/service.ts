@@ -43,6 +43,8 @@ export async function discoverForTarget(ctx: AppContext, target: Target, max = 2
     .map((l) => ({ l, score: scoreLead({ ...l, category: target.category, city: target.city }, target.offer) }))
     // For website offers, businesses that already have a website are not a fit.
     .filter(({ l }) => target.offer !== "website" || !l.website)
+    // A lead nobody can reach is not a lead: keep only businesses with a phone, email or Instagram.
+    .filter(({ l }) => !!(l.phone || l.email || l.instagram))
     .sort((a, b) => b.score - a.score)
     .slice(0, max);
 
