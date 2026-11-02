@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { formatInrCompact, formatUsdCompact } from "@/lib/utilities/format";
-import { addressedSeats, routeTurn, cleanSpeech, dueStandup, isPass, istDate, momToPlan, openingPrompt, parseMom, pickBoard, pickTeam, replyPrompt, transcript } from "@/modules/board/logic";
+import { addressedSeats, routeTurn, cleanSpeech, spoken, dueStandup, isPass, istDate, momToPlan, openingPrompt, parseMom, pickBoard, pickTeam, replyPrompt, transcript } from "@/modules/board/logic";
 import { growthStage, northStarLadder } from "@/modules/cockpit/metrics";
 import { MISSION, northStarLabel } from "@/modules/orchestration/mission";
 import { AiError } from "@/lib/ai/types";
@@ -44,9 +44,9 @@ describe("live conversation", () => {
     const p = openingPrompt(seats[3]!, "Gym websites in Gurugram", lines, "From the last meeting: call 5 gyms", "Harshit");
     expect(p).toContain("Gym websites in Gurugram");
     expect(p).toContain("call 5 gyms");
-    expect(p).toMatch(/the risk you see and the profit angle/);
+    expect(p).toMatch(/one risk or profit point/);
     expect(p).toMatch(/allowed with conditions/);
-    expect(p).toMatch(/never repeat what a colleague already said/);
+    expect(p).toMatch(/Never invent colleagues/);
     expect(openingPrompt(seats[0]!, "t", [], "", "Harshit", true)).toMatch(/You are chairing/);
   });
   it("finds who the Founder is talking to by name or title", () => {
@@ -67,6 +67,13 @@ describe("live conversation", () => {
     expect(routeTurn("GST lagega kya?", seats).answer).toEqual(["Themis"]);
     expect(routeTurn("Themis, contract chahiye?", seats)).toEqual({ answer: ["Themis"], may: ["Atlas", "Orion", "Ledger"] });
     expect(routeTurn("Is hafte ka focus kya ho?", seats)).toEqual({ answer: ["Atlas"], may: ["Orion", "Ledger", "Themis"] });
+  });
+  it("keeps spoken turns short, without lists or a cut-off word", () => {
+    expect(spoken("Founder, 1. Pehle leads. 2. Phir pitch.")).toBe("Pehle leads. Phir pitch.");
+    const long = "Dekho, ye plan theek hai. ".repeat(30);
+    const out = spoken(long);
+    expect(out.length).toBeLessThanOrEqual(320);
+    expect(out.endsWith(".")).toBe(true);
   });
   it("cleans speech for reading aloud", () => {
     expect(cleanSpeech("```\n**hi**\n```")).toBe("hi");

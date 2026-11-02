@@ -14,6 +14,10 @@ import { listAgents } from "@/modules/orchestration/engine";
 import type { BoardMeeting, BoardMessage } from "@/types/domain";
 
 export const metadata = { title: "Meeting" };
+
+/** Who speaks with a woman's voice (by name); everyone else with a man's. */
+const FEMALE_NAMES = /^(themis|iris|hera|vega|nova|scribe|athena|maya|kavya|priya|ananya|sara|aisha)$/i;
+const voiceGender = (name: string): "male" | "female" => (FEMALE_NAMES.test(name) ? "female" : "male");
 export const maxDuration = 300;
 
 function List({ title, items }: { title: string; items: string[] }) {
@@ -44,7 +48,7 @@ export default async function MeetingPage({ params, searchParams }: { params: Pr
   const invited = new Set(meeting.participant_ids);
   const seats: RoomSeat[] = seatsFor(meeting, agents)
     .filter((s) => !invited.size || invited.has(s.agent.id))
-    .map((s) => ({ agentId: s.agent.id, name: s.agent.name, title: s.title, color: s.color, voice: s.voice }));
+    .map((s) => ({ agentId: s.agent.id, name: s.agent.name, title: s.title, color: s.color, voice: s.voice, gender: voiceGender(s.agent.name) }));
   const scribe = agents.find((a) => a.name === "Scribe" && a.status === "active");
   const founder = ctx.profile.full_name?.split(" ")[0] || "You";
   const mom = meeting.mom;

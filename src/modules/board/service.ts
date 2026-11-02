@@ -7,7 +7,7 @@ import type { AppContext } from "@/modules/auth/session";
 import { companySnapshot, listAgents, runAgent } from "@/modules/orchestration/engine";
 import type { AgentWithPermissions, BoardMeeting, BoardMessage, MeetingKind, Mom } from "@/types/domain";
 import {
-  cleanSpeech, routeTurn, dueStandup, isPass, istDate, momPrompt, momText, momToPlan, openingPrompt, parseMom, pickBoard, pickTeam,
+  cleanSpeech, routeTurn, spoken, dueStandup, isPass, istDate, momPrompt, momText, momToPlan, openingPrompt, parseMom, pickBoard, pickTeam,
   replyPrompt, type Seat, type SpokenLine,
 } from "./logic";
 
@@ -30,6 +30,9 @@ async function loadMessages(ctx: AppContext, id: string): Promise<BoardMessage[]
 export function seatsFor(meeting: Pick<BoardMeeting, "kind" | "host_agent_id">, agents: A[]): Seat<A>[] {
   return meeting.kind === "team" && meeting.host_agent_id ? pickTeam(agents, meeting.host_agent_id) : pickBoard(agents);
 }
+
+/** Everyone who really exists: people in the room first, then the rest of the active team (so nobody invents colleagues). */
+const roster = (seats: Seat<A>[], agents: A[]) => [...new Set([...seats.map((s) => `${s.agent.name} (${s.title})`), ...agents.filter((a) => a.status === "active").map((a) => `${a.name} (${a.designation})`)])].slice(0, 30);
 
 export const founderFirstName = (ctx: AppContext) => ctx.profile.full_name?.trim().split(/\s+/)[0] || "Founder";
 
@@ -76,7 +79,7 @@ async function nextSeq(ctx: AppContext, meetingId: string): Promise<number> {
 async function speakAs(ctx: AppContext, seat: Seat<A>, input: string): Promise<{ text: string | null; error?: string }> {
   const { execution, result } = await runAgent(ctx, {
     agent: seat.agent, kind: "chat", maxTokens: 260, budgetMs: SPEAKER_BUDGET_MS, input,
-    parse: (t) => cleanSpeech(t, 2000),
+    parse: (t) => spoken(t),
   });
   return result ? { text: result } : { text: null, error: execution.error ?? "no answer" };
 }
@@ -122,7 +125,7 @@ export async function memberTurn(ctx: AppContext, meetingId: string, agentId: st
   if (mode === "open") {
     if (messages.some((m) => m.role === "member" && m.agent_id === agentId && !m.failed)) return null;
     const context = [meeting.kind === "morning" || meeting.kind === "evening" ? await standupFacts(ctx) : "", await carryOver(ctx, meeting)].filter(Boolean).join("\n\n");
-    input = openingPrompt(seat, meeting.topic, messages.map(lineOf), context, founderFirstName(ctx), seat === seats[0] && !messages.some((m) => m.role === "member" && !m.failed));
+    input = openingPrompt(seat, meeting.topic, messages.map(lineOf), context, founderFirstName(ctx), seat === seats[0] && !messages.some((m) => m.role === "member" && !m.failed), roster(seats, agents));
   } else {
     const last = [...messages].reverse().find((m) => m.role === "founder");
     if (!last) return null;
@@ -131,7 +134,7 @@ export async function memberTurn(ctx: AppContext, meetingId: string, agentId: st
     addressed = route.answer.includes(agentId) ? "me" : "other";
     // Already answered this line? (e.g. a double click)
     if (messages.some((m) => m.seq > last.seq && m.agent_id === agentId && !m.failed)) return null;
-    input = replyPrompt(seat, meeting.topic, messages.map(lineOf), last.body, addressed, founderFirstName(ctx));
+    input = replyPrompt(seat, meeting.topic, messages.map(lineOf), last.body, addressed, founderFirstName(ctx), roster(seats, agents));
   }
   const r = await speakAs(ctx, seat, input);
   if (r.text && isPass(r.text)) return null;
@@ -155,7 +158,7 @@ export async function openMeeting(ctx: AppContext, meetingId: string): Promise<B
   const lines = existing.map(lineOf);
   const out: BoardMessage[] = [];
   const say = async (seat: Seat<A>) => {
-    const r = await speakAs(ctx, seat, openingPrompt(seat, meeting.topic, lines, context, founderFirstName(ctx), seat === seats[0]));
+    const r = await speakAs(ctx, seat, openingPrompt(seat, meeting.topic, lines, context, founderFirstName(ctx), seat === seats[0], roster(seats, agents)));
     return { role: "member" as const, agent_id: seat.agent.id, speaker: `${seat.agent.name} · ${seat.title}`, body: r.text ?? `(could not join: ${r.error?.slice(0, 200)})`, failed: !r.text };
   };
   const [chair, ...rest] = pending;

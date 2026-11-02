@@ -65,31 +65,37 @@ export function transcript(lines: readonly SpokenLine[], max = 9000): string {
 }
 
 /** Meeting etiquette: what makes it sound like people, not a chatbot. */
-function talk(founder: string): string {
-  return `How to speak — like a senior Indian executive (15+ years) in a real meeting:
-- 2–4 short spoken sentences (about 60 words). No headings, lists, markdown or emojis.
-- Natural Hinglish the way professionals talk; call people by first name (${founder}, Atlas, Ledger…).
-- Never echo the question, never repeat what a colleague already said, no filler ("great question", "sab sun pa rahe hain", "chalo aage badhte hain").
-- If you agree, say it in a few words and add something new; if you disagree, say so respectfully with the reason.
-- Be concrete: one recommendation with an owner or a time. If a number is needed and you don't have the data, ask one precise question instead of guessing.`;
+function talk(founder: string, people: readonly string[] = []): string {
+  return `THIS IS SPOKEN, LIVE, ACROSS A TABLE — not a report, not a chat answer. (Ignore any bullet-point rule: you are talking.)
+Sound like a real Indian business person, not an AI:
+- ONE point per turn, 1–3 short sentences, under 45 words. Stop when the point is made — others will ask if they want more.
+- Everyday Hinglish, the way you'd talk to a friend who runs a business. No jargon or acronyms (no "MSA", "HSN", "DPDP", "ROI", "leverage", "synergy").
+- Don't start with someone's name every time, don't summarise, don't list steps, no "Founder,", no "great point", no closing lines.
+- Small human touches are fine: "dekho", "honestly", "ek minute", "haan, but…". Disagree when you disagree.
+- Only real people exist: ${[founder, ...people].join(", ")}. Never invent colleagues, tools, clients, prices or results.
+- If you need data, ask one short question instead of guessing.
+Examples of how people actually talk here:
+GOOD: "Dekho, India mein cold calls pe reply nahi aa raha — data clear hai. Main ek hafta US salons try karna chahunga, email se."
+GOOD: "Haan, but payment pehle lena. Half advance, baaki delivery pe."
+BAD (AI-like): "Great question, Founder! Here is a comprehensive 5-step plan: 1) Lead generation via…"`;
 }
 
 /** Each member's first turn. The chair opens the meeting; the others respond to the chair. */
-export function openingPrompt(seat: { role: BoardRole; title: string }, agenda: string, lines: readonly SpokenLine[], context = "", founder = "Founder", chair = false): string {
+export function openingPrompt(seat: { role: BoardRole; title: string }, agenda: string, lines: readonly SpokenLine[], context = "", founder = "Founder", chair = false, people: readonly string[] = []): string {
   const job = chair
-    ? `You are chairing. Open the meeting in one line, frame the agenda, give your view (risk and profit in a phrase each), and hand over to one colleague by name with a direct question.`
-    : `Respond to what was said from your lens (${ROLE_LENS[seat.role]}): your view, the risk you see and the profit angle — only what is new.`;
+    ? `You are chairing. Say in a sentence why we're here and your honest first take, then ask one colleague a direct question by name.`
+    : `React to what was just said from your side (${ROLE_LENS[seat.role]}) — the one risk or profit point that matters most and is new.`;
   return `Live meeting. You are ${seat.title} — ${PERSONALITY[seat.role]}. ${founder} (the Founder) is in the room. Agenda: """${agenda}"""${context ? `\n\nContext:\n${context}` : ""}
 
 Said so far:
 ${transcript(lines)}
 
 ${job}
-${talk(founder)}`;
+${talk(founder, people)}`;
 }
 
 /** Answering the Founder during the meeting. */
-export function replyPrompt(seat: { role: BoardRole; title: string }, agenda: string, lines: readonly SpokenLine[], founderMessage: string, addressed: "me" | "other" | "all", founder = "Founder"): string {
+export function replyPrompt(seat: { role: BoardRole; title: string }, agenda: string, lines: readonly SpokenLine[], founderMessage: string, addressed: "me" | "other" | "all", founder = "Founder", people: readonly string[] = []): string {
   const rule = addressed === "me"
     ? `${founder} is asking YOU. Answer directly first, then your advice.`
     : `Someone else is answering. Reply exactly PASS — unless there is a serious point from your lens (a real risk, a cost, a legal problem) that would otherwise be missed; then say it in one or two sentences.`;
@@ -100,7 +106,7 @@ ${transcript(lines)}
 
 ${founder} just said: """${founderMessage}"""
 ${rule}
-${talk(founder)}`;
+${talk(founder, people)}`;
 }
 
 /** Topic words that tell the room whose question it is when nobody is named. */
@@ -140,6 +146,24 @@ export function addressedSeats<A extends { id: string; name: string }>(message: 
 }
 
 export const isPass = (text: string) => /^\W*pass\W*$/i.test(text.trim()) || text.trim().length < 3;
+
+/**
+ * Keeps a spoken turn short and natural: strips list markers and cuts at a sentence end within the limit,
+ * so nobody is cut off mid-word or reads out a numbered plan.
+ */
+export function spoken(text: string, maxChars = 320): string {
+  let t = cleanSpeech(text, 4000)
+    .replace(/^(founder|harshit)\s*[,:—-]\s*/i, "")
+    .replace(/^\s*(?:[-*•]|\d{1,2}[.)])\s+/gm, "") // list markers at line start
+    .replace(/(^|[.!?]\s+)\d{1,2}[.)]\s+/g, "$1") // "… 2. Next" spoken inline
+    .replace(/\s*\n+\s*/g, " ")
+    .trim();
+  if (t.length <= maxChars) return t;
+  const cut = t.slice(0, maxChars);
+  const end = Math.max(cut.lastIndexOf(". "), cut.lastIndexOf("? "), cut.lastIndexOf("! "), cut.lastIndexOf("। "));
+  t = end > maxChars * 0.35 ? cut.slice(0, end + 1) : `${cut.slice(0, cut.lastIndexOf(" "))}…`;
+  return t.trim();
+}
 
 /** Spoken text: no code fences or markdown symbols, capped for storage and reading aloud. */
 export function cleanSpeech(text: string, max = 6000): string {

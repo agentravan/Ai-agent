@@ -6,18 +6,34 @@ import { FileText, Mic, MicOff, MessageSquare, PhoneOff, Play, Send, Volume2, Vo
 import { endMeetingAction, memberTurnAction, sayAction } from "@/modules/board/actions";
 import type { BoardMessage } from "@/types/domain";
 
-export interface RoomSeat { agentId: string; name: string; title: string; color: string; voice: number }
+export interface RoomSeat { agentId: string; name: string; title: string; color: string; voice: number; gender: "male" | "female" }
 
-/** Each person sounds different: a different system voice where available, plus pitch and pace. */
-const PERSONA = [
-  { pitch: 0.85, rate: 1.0 }, { pitch: 1.05, rate: 1.1 }, { pitch: 0.95, rate: 1.02 }, { pitch: 1.2, rate: 1.0 },
-  { pitch: 1.1, rate: 1.05 }, { pitch: 0.9, rate: 1.08 }, { pitch: 1.15, rate: 0.98 },
-] as const;
+/**
+ * Human-sounding voices: browsers ship neural voices for free (Edge: "Microsoft … Online (Natural)",
+ * Chrome: "Google …"). Pitch tricks make voices sound robotic, so we keep natural pitch/pace and give each
+ * person a different real voice instead — men and women where the browser has both.
+ */
+export type VoiceGender = "male" | "female";
+const FEMALE = /neerja|swara|aria|jenny|sonia|libby|natasha|heera|kalpana|zira|samantha|karen|moira|tessa|veena|female|woman|google uk english female|google हिन्दी/i;
+const MALE = /prabhat|madhur|ravi|hemant|guy|ryan|thomas|william|davis|daniel|rishi|male|man\b|google uk english male/i;
 
-function voicesFor(synth: SpeechSynthesis): SpeechSynthesisVoice[] {
-  const all = synth.getVoices();
-  const indian = all.filter((v) => v.lang === "en-IN" || v.lang.startsWith("hi"));
-  return [...indian, ...all.filter((v) => v.lang.startsWith("en") && !indian.includes(v))];
+function rankVoice(v: SpeechSynthesisVoice): number {
+  let score = 0;
+  if (/natural|neural|online|premium|enhanced/i.test(v.name)) score += 100; // neural voices sound human
+  else if (/^google/i.test(v.name)) score += 60;
+  if (v.lang === "en-IN") score += 30;
+  else if (v.lang.startsWith("hi")) score += 25;
+  else if (v.lang.startsWith("en")) score += 10;
+  else score -= 100;
+  return score;
+}
+
+/** Best available voice for a speaker: their gender if possible, a different voice per person (by slot). */
+export function pickVoice(voices: SpeechSynthesisVoice[], gender: VoiceGender, slot: number): SpeechSynthesisVoice | undefined {
+  const usable = voices.filter((v) => rankVoice(v) > 0).sort((a, b) => rankVoice(b) - rankVoice(a));
+  const matching = usable.filter((v) => (gender === "female" ? FEMALE.test(v.name) : MALE.test(v.name) && !FEMALE.test(v.name)));
+  const pool = matching.length ? matching : usable;
+  return pool.length ? pool[slot % pool.length] : undefined;
 }
 
 const plain = (t: string) => t.replace(/[*#_`>]/g, "").replace(/\s+/g, " ").trim();
@@ -136,18 +152,19 @@ export function MeetingRoom({ meetingId, topic, seats, founder, scribeName, init
     }
     const u = new SpeechSynthesisUtterance(body);
     const seat = seatOf(current.agent_id);
-    const slot = current.role === "scribe" ? 4 : (seat?.voice ?? 0) % PERSONA.length;
-    const voices = voicesFor(synth);
-    if (voices.length) { const v = voices[slot % voices.length]!; u.voice = v; u.lang = v.lang; }
-    u.pitch = PERSONA[slot]!.pitch;
-    u.rate = PERSONA[slot]!.rate;
+    const gender = current.role === "scribe" ? "female" : seat?.gender ?? "male";
+    // Same-gender people get different voices (slot = how many of that gender sit before them).
+    const slot = current.role === "scribe" ? 1 : seats.filter((x) => x.gender === gender).findIndex((x) => x.agentId === seat?.agentId);
+    const v = pickVoice(synth.getVoices(), gender, Math.max(0, slot));
+    if (v) { u.voice = v; u.lang = v.lang; }
+    u.rate = 1.04; // natural pace; no pitch tricks (they sound robotic)
     u.onend = done;
     u.onerror = done;
     synth.speak(u);
     // Safety net: some browsers never fire onend for long texts.
     const guard = setTimeout(done, Math.max(20_000, body.length * 120));
     return () => clearTimeout(guard);
-  }, [current, seatOf]);
+  }, [current, seatOf, seats]);
 
   useEffect(() => () => { if (typeof window !== "undefined" && "speechSynthesis" in window) window.speechSynthesis.cancel(); }, []);
 
