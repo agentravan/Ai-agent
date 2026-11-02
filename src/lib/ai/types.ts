@@ -10,6 +10,8 @@ export interface GenerateRequest {
 
 export interface GenerateResult {
   text: string;
+  /** Why the model stopped, when the provider reports it (e.g. "length" = ran out of tokens). */
+  finishReason?: string;
   inputTokens: number;
   outputTokens: number;
 }

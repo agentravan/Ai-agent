@@ -53,6 +53,12 @@ Setup:
 3. The ₹80,000 profit gate is unchanged: no paid tools or upgrades until net profit crosses it.
 4. Board meetings run several AI calls in a row (1–4 min). If the time limit is hit, press **Continue meeting** — nobody speaks twice.
 
+## AI reliability (free models)
+- Free "thinking" models can be slow or return empty answers. Empty answers now count as a failed attempt (retried), and a timeout while the answer is streaming is retried too.
+- Add backup free models in Vercel: `OPENAI_COMPATIBLE_FALLBACK_MODELS=model-a:free,model-b:free` (same OpenRouter key). Pick current IDs from openrouter.ai/models (filter: free). They are tried in order if the main model fails.
+- Recommended with backups: `AI_TIMEOUT_MS=75000`, `AI_MAX_ATTEMPTS=1`. `AI_RUN_BUDGET_MS` (default 240000) caps one run across all retries so it never hits the 300 s limit.
+- The autopilot needs `SUPABASE_SERVICE_ROLE_KEY` in Vercel; without it, tasks only run when you press **Start work**.
+
 ## Local development
 ```bash
 cp .env.example .env.local      # fill Supabase URL + publishable key

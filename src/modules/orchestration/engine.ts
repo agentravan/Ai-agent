@@ -1,7 +1,7 @@
 import "server-only";
 import { estimateCostCents, providerChain } from "@/lib/ai/registry";
 import { withRetry } from "@/lib/ai/retry";
-import { AiUnavailableError, type AiProvider, type GenerateResult } from "@/lib/ai/types";
+import { AiError, AiUnavailableError, type AiProvider, type GenerateResult } from "@/lib/ai/types";
 import { env } from "@/lib/env";
 import { UserFacingError, must } from "@/lib/utilities/action";
 import { logEvent } from "@/modules/audit/service";
@@ -139,6 +139,13 @@ export async function runAgent<T = string>(ctx: AppContext, opts: RunOptions<T>)
   try {
     let totalAttempts = 0;
     let lastError: unknown;
+    // One run never outlives the serverless time limit: each attempt gets min(AI_TIMEOUT_MS, time left).
+    const deadline = Date.now() + env.AI_RUN_BUDGET_MS;
+    const attemptTimeout = () => {
+      const left = deadline - Date.now();
+      if (left < 15_000) throw new AiError("AI took too long — out of time for this run; it will retry later", false);
+      return Math.min(env.AI_TIMEOUT_MS, left);
+    };
     let done: { value: { out: GenerateResult; parsed: T }; used: AiProvider } | null = null;
     for (const p of chain) {
       if (p !== provider) {
@@ -153,8 +160,10 @@ export async function runAgent<T = string>(ctx: AppContext, opts: RunOptions<T>)
               prompt: opts.input,
               json: opts.json,
               maxTokens: opts.maxTokens ?? 1500,
-              signal: AbortSignal.timeout(env.AI_TIMEOUT_MS),
+              signal: AbortSignal.timeout(attemptTimeout()),
             });
+            // An empty answer is a failed attempt, never a finished task (free "thinking" models can spend all tokens reasoning).
+            if (!out.text.trim()) throw new AiError(`AI returned an empty answer${out.finishReason ? ` (stopped: ${out.finishReason})` : ""}`, true);
             const parsed = opts.parse ? opts.parse(out.text) : (out.text as unknown as T);
             return { out, parsed };
           },
@@ -164,6 +173,7 @@ export async function runAgent<T = string>(ctx: AppContext, opts: RunOptions<T>)
         break;
       } catch (err) {
         lastError = err;
+        if (deadline - Date.now() < 15_000) break;
       }
     }
     if (!done) throw lastError;

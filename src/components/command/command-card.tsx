@@ -13,7 +13,16 @@ type StoredPlan = { applied_at?: string; outcomes?: StepOutcome[] };
 const instructionOf = (input: string) => (input.split("\n\nAvailable")[0] ?? input).replace(/^Founder (instruction|command): /, "");
 
 /** Plain-language "you asked → Atlas did" card for one instruction. */
-export function CommandCard({ execution: c, agentName, canOperate, returnTo }: { execution: Execution; agentName: string; canOperate: boolean; returnTo: "/ceo" | "/command" }) {
+/** Approval ids raised by these plans, to look up their current status. */
+export function approvalRefs(executions: Execution[]): string[] {
+  return executions.flatMap((e) => ((e.plan ?? {}) as StoredPlan).outcomes?.filter((o) => o.outcome === "approval" && o.ref).map((o) => o.ref!) ?? []);
+}
+
+export function CommandCard({ execution: c, agentName, canOperate, returnTo, approvalStatus = {} }: {
+  execution: Execution; agentName: string; canOperate: boolean; returnTo: "/ceo" | "/command";
+  /** Current status of approvals raised by this plan (approval id → status), so decided steps stop showing "waiting". */
+  approvalStatus?: Record<string, string>;
+}) {
   const plan = planSchema.safeParse(c.plan);
   const stored = (c.plan ?? {}) as StoredPlan;
   return (
@@ -32,8 +41,10 @@ export function CommandCard({ execution: c, agentName, canOperate, returnTo }: {
           <ul className="mt-2 space-y-1.5">
             {plan.data.steps.map((s, i) => {
               const o = stored.outcomes?.[i];
-              const Icon = !o ? Clock : o.outcome === "executed" ? CheckCircle2 : o.outcome === "approval" ? AlertTriangle : XCircle;
-              const tone = !o ? "text-zinc-500" : o.outcome === "executed" ? "text-emerald-400" : o.outcome === "approval" ? "text-amber-400" : "text-rose-400";
+              const decided = o?.outcome === "approval" && o.ref ? approvalStatus[o.ref] : undefined;
+              const state = !o ? "pending" : o.outcome === "approval" ? (decided === "approved" ? "executed" : decided === "rejected" ? "denied" : "approval") : o.outcome;
+              const Icon = state === "pending" ? Clock : state === "executed" ? CheckCircle2 : state === "approval" ? AlertTriangle : XCircle;
+              const tone = state === "pending" ? "text-zinc-500" : state === "executed" ? "text-emerald-400" : state === "approval" ? "text-amber-400" : "text-rose-400";
               const label = s.action === "create_project" ? "Project" : s.action === "create_task" ? "Task" : s.action === "create_opportunity" ? "Opportunity" : "Needs your OK";
               return (
                 <li key={i} className="flex items-start gap-2.5 text-sm">
@@ -41,7 +52,9 @@ export function CommandCard({ execution: c, agentName, canOperate, returnTo }: {
                   <span className="min-w-0">
                     <span className="text-zinc-500">{label}:</span> <span className="text-zinc-200">{s.title}</span>
                     {s.assignee && s.action === "create_task" && <span className="text-zinc-500"> → {s.assignee}</span>}
-                    {o?.outcome === "approval" && <> · <Link href="/approvals" className="text-amber-300 underline underline-offset-2">waiting for your approval</Link></>}
+                    {state === "approval" && <> · <Link href="/approvals" className="text-amber-300 underline underline-offset-2">waiting for your approval</Link></>}
+                    {decided === "approved" && <span className="text-emerald-400"> · approved by you</span>}
+                    {decided === "rejected" && <span className="text-rose-300"> · rejected by you</span>}
                     {o?.outcome === "denied" && <span className="block text-xs text-rose-300">{o.detail}</span>}
                   </span>
                 </li>

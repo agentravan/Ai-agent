@@ -17,10 +17,14 @@ const schema = z.object({
   OPENAI_COMPATIBLE_BASE_URL: z.url().optional().catch(undefined),
   OPENAI_COMPATIBLE_API_KEY: optional,
   OPENAI_COMPATIBLE_MODEL: optional,
+  // Comma-separated backup models on the same endpoint, tried in order when the main model fails or times out (max 3).
+  OPENAI_COMPATIBLE_FALLBACK_MODELS: optional,
   AI_COST_INPUT_CENTS_PER_MTOK: z.coerce.number().min(0).catch(0),
   AI_COST_OUTPUT_CENTS_PER_MTOK: z.coerce.number().min(0).catch(0),
   AI_TIMEOUT_MS: intIn(1_000, 280_000, 60_000),
   AI_MAX_ATTEMPTS: intIn(1, 5, 3),
+  // Total time one agent run may use across retries and backup models (stays under the 300 s function limit).
+  AI_RUN_BUDGET_MS: intIn(30_000, 290_000, 240_000),
   // When the main AI provider fails: "free" tries other configured non-Anthropic providers (default, keeps ₹0),
   // "all" may also fall back to Anthropic (paid), "off" never falls back.
   AI_FALLBACK: z.enum(["free", "all", "off"]).catch("free"),

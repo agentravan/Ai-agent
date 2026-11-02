@@ -4,12 +4,20 @@ import { ollamaProvider } from "./providers/ollama";
 import { openAiCompatibleProvider } from "./providers/openai-compatible";
 import type { AiProvider, ProviderId } from "./types";
 
+/** Backup models for the OpenAI-compatible endpoint (deduplicated, max 3, never the main model). */
+export function fallbackModels(e: Env = defaultEnv): string[] {
+  const list = (e.OPENAI_COMPATIBLE_FALLBACK_MODELS ?? "").split(",").map((m) => m.trim()).filter(Boolean);
+  return [...new Set(list)].filter((m) => m !== e.OPENAI_COMPATIBLE_MODEL).slice(0, 3);
+}
+
 /** All providers that have the configuration they need, in preference order (free first). */
 export function configuredProviders(e: Env = defaultEnv): AiProvider[] {
   const list: AiProvider[] = [];
   if (e.OLLAMA_BASE_URL) list.push(ollamaProvider(e.OLLAMA_BASE_URL, e.OLLAMA_MODEL));
   if (e.OPENAI_COMPATIBLE_BASE_URL && e.OPENAI_COMPATIBLE_MODEL)
     list.push(openAiCompatibleProvider(e.OPENAI_COMPATIBLE_BASE_URL, e.OPENAI_COMPATIBLE_MODEL, e.OPENAI_COMPATIBLE_API_KEY));
+  if (e.OPENAI_COMPATIBLE_BASE_URL)
+    for (const model of fallbackModels(e)) list.push(openAiCompatibleProvider(e.OPENAI_COMPATIBLE_BASE_URL, model, e.OPENAI_COMPATIBLE_API_KEY));
   if (e.ANTHROPIC_API_KEY) list.push(anthropicProvider(e.ANTHROPIC_API_KEY, e.ANTHROPIC_MODEL));
   return list;
 }
@@ -29,7 +37,8 @@ export function providerChain(e: Env = defaultEnv): AiProvider[] {
   const primary = activeProvider(e);
   if (!primary) return [];
   if (e.AI_FALLBACK === "off") return [primary];
-  const backups = configuredProviders(e).filter((p) => p.id !== primary.id && (e.AI_FALLBACK === "all" || p.id !== "anthropic"));
+  // Same-endpoint backup models share the primary's id, so compare by model as well as provider.
+  const backups = configuredProviders(e).filter((p) => !(p.id === primary.id && p.model === primary.model) && (e.AI_FALLBACK === "all" || p.id !== "anthropic"));
   return [primary, ...backups];
 }
 
