@@ -43,7 +43,7 @@ Discussion so far:
 ${transcript(lines)}
 
 Your turn as ${ROLE_TITLE[role]}. ${ROLE_BRIEF[role]}
-Build on what others said; don't repeat them. Max 130 words, short sentences that sound natural when read aloud.
+Build on what was said; don't repeat it. Max 130 words, short sentences that sound natural when read aloud.
 End with your recommendation in one line starting "Meri salah:" (or "My recommendation:" if the Founder wrote in English).`;
 }
 

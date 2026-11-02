@@ -39,12 +39,12 @@ export async function runMeeting(ctx: AppContext, meetingId: string, budgetMs: n
   };
 
   let spoke = 0;
-  for (const [seq, { role, agent }] of board.entries()) {
-    if (bySeq.get(seq) && !bySeq.get(seq)!.failed) continue;
-    if (left() < CLOSING_RESERVE_MS) break;
+  /** One member's turn: they hear what has been said so far. */
+  const speak = async (seq: number) => {
+    const { role, agent } = board[seq]!;
     const { execution, result } = await runAgent(ctx, {
       agent, kind: "chat", maxTokens: 600,
-      // One speaker may not eat the whole meeting: leave time for the others and the closing plan.
+      // One speaker may not eat the whole meeting: leave time for the closing plan.
       budgetMs: Math.max(30_000, Math.min(90_000, left() - CLOSING_RESERVE_MS)),
       input: speakerPrompt(role, meeting.topic, lines()),
       parse: (t) => { const s = cleanSpeech(t); if (s.length < 2) throw new AiError("Empty reply", true); return s; },
@@ -54,7 +54,13 @@ export async function runMeeting(ctx: AppContext, meetingId: string, budgetMs: n
       ? { agent_id: agent.id, speaker, body: result, failed: false }
       : { agent_id: agent.id, speaker, body: `Could not speak: ${(execution.error ?? "unknown error").slice(0, 300)}`, failed: true });
     if (result) spoke++;
-  }
+  };
+  const due = (seq: number) => !bySeq.get(seq) || bySeq.get(seq)!.failed;
+
+  // The CEO sets the direction first; COO, CFO and Legal Head then respond to it at the same time (≈ half the wait).
+  if (due(0) && left() >= CLOSING_RESERVE_MS) await speak(0);
+  const rest = board.map((_, seq) => seq).filter((seq) => seq > 0 && due(seq));
+  if (rest.length && left() >= CLOSING_RESERVE_MS) await Promise.all(rest.map(speak));
 
   const pending = board.filter((_, seq) => !bySeq.get(seq) || bySeq.get(seq)!.failed).length;
   if (pending > 0 && left() < CLOSING_RESERVE_MS) return { status: "in_progress", spoke, pending };
