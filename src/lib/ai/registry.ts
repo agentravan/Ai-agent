@@ -11,12 +11,12 @@ export function fallbackModels(e: Env = defaultEnv): string[] {
 }
 
 /** Backup OpenAI-compatible services on other endpoints (AI_BACKUP_1_*, AI_BACKUP_2_*), in order. */
-export function backupServices(e: Env = defaultEnv): { baseUrl: string; model: string; apiKey?: string }[] {
+export function backupServices(e: Env = defaultEnv): { baseUrl: string; model: string; apiKey: string | undefined }[] {
   const slots = [
     { baseUrl: e.AI_BACKUP_1_BASE_URL, model: e.AI_BACKUP_1_MODEL, apiKey: e.AI_BACKUP_1_API_KEY },
     { baseUrl: e.AI_BACKUP_2_BASE_URL, model: e.AI_BACKUP_2_MODEL, apiKey: e.AI_BACKUP_2_API_KEY },
   ];
-  return slots.filter((b): b is { baseUrl: string; model: string; apiKey?: string } => !!b.baseUrl && !!b.model);
+  return slots.flatMap((b) => (b.baseUrl && b.model ? [{ baseUrl: b.baseUrl, model: b.model, apiKey: b.apiKey }] : []));
 }
 
 /** All providers that have the configuration they need, in preference order (free first). */
