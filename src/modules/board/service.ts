@@ -80,10 +80,59 @@ async function speakAs(ctx: AppContext, seat: Seat<A>, input: string): Promise<{
 
 async function saveLines(ctx: AppContext, meetingId: string, rows: Omit<BoardMessage, "id" | "meeting_id" | "seq" | "created_at">[]): Promise<BoardMessage[]> {
   if (!rows.length) return [];
-  const start = await nextSeq(ctx, meetingId);
-  const { data } = await ctx.db.from("board_messages")
-    .insert(rows.map((r, i) => ({ ...r, organisation_id: ctx.organisation.id, meeting_id: meetingId, seq: start + i }))).select("*").returns<BoardMessage[]>();
-  return (data ?? []).sort((a, b) => a.seq - b.seq);
+  // Several members can finish at the same moment: retry on a sequence clash instead of losing a line.
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const start = await nextSeq(ctx, meetingId);
+    const { data, error } = await ctx.db.from("board_messages")
+      .insert(rows.map((r, i) => ({ ...r, organisation_id: ctx.organisation.id, meeting_id: meetingId, seq: start + i }))).select("*").returns<BoardMessage[]>();
+    if (!error) return (data ?? []).sort((a, b) => a.seq - b.seq);
+    if (error.code !== "23505") throw new Error(`Saving the meeting failed: ${error.message}`);
+    await new Promise((r) => setTimeout(r, 40 + Math.random() * 120));
+  }
+  throw new Error("Saving the meeting failed: too many people talking at once");
+}
+
+/** Saves what the Founder said and tells the room who was addressed (empty = everyone). */
+export async function founderLine(ctx: AppContext, meetingId: string, text: string, founderName: string): Promise<{ message: BoardMessage; addressed: string[] }> {
+  const meeting = await loadMeeting(ctx, meetingId);
+  if (meeting.status !== "in_progress") throw new Error("This meeting has ended");
+  const seats = seatsFor(meeting, await listAgents(ctx));
+  const [message] = await saveLines(ctx, meetingId, [{ role: "founder", agent_id: null, speaker: founderName, body: text.slice(0, 2000), failed: false }]);
+  return { message: message!, addressed: [...addressedSeats(text, seats)] };
+}
+
+/**
+ * One member's turn, run in parallel for each person so the room hears whoever is ready first.
+ * "open": their opening view (once). "reply": answer the Founder's latest line (or pass → null).
+ */
+export async function memberTurn(ctx: AppContext, meetingId: string, agentId: string, mode: "open" | "reply"): Promise<BoardMessage | null> {
+  const meeting = await loadMeeting(ctx, meetingId);
+  if (meeting.status !== "in_progress") return null;
+  const [messages, agents] = await Promise.all([loadMessages(ctx, meetingId), listAgents(ctx)]);
+  const seats = seatsFor(meeting, agents);
+  const seat = seats.find((s) => s.agent.id === agentId);
+  if (!seat) throw new Error("This person is not in the meeting");
+  const label = `${seat.agent.name} · ${seat.title}`;
+  let input: string;
+  let addressed: "me" | "other" | "all" = "all";
+  if (mode === "open") {
+    if (messages.some((m) => m.role === "member" && m.agent_id === agentId && !m.failed)) return null;
+    const context = [meeting.kind === "morning" || meeting.kind === "evening" ? await standupFacts(ctx) : "", await carryOver(ctx, meeting)].filter(Boolean).join("\n\n");
+    input = openingPrompt(seat, meeting.topic, messages.map(lineOf), context);
+  } else {
+    const last = [...messages].reverse().find((m) => m.role === "founder");
+    if (!last) return null;
+    const targets = addressedSeats(last.body, seats);
+    addressed = targets.size === 0 ? "all" : targets.has(agentId) ? "me" : "other";
+    // Already answered this line? (e.g. a double click)
+    if (messages.some((m) => m.seq > last.seq && m.agent_id === agentId && !m.failed)) return null;
+    input = replyPrompt(seat, meeting.topic, messages.map(lineOf), last.body, addressed);
+  }
+  const r = await speakAs(ctx, seat, input);
+  if (r.text && isPass(r.text)) return null;
+  if (!r.text && mode === "reply" && addressed !== "me") return null; // silent failure is fine for people not asked
+  const [saved] = await saveLines(ctx, meetingId, [{ role: "member", agent_id: agentId, speaker: label, body: r.text ?? `(could not ${mode === "open" ? "join" : "answer"}: ${r.error?.slice(0, 200)})`, failed: !r.text }]);
+  return saved ?? null;
 }
 
 /** Opening round: the chair speaks first, then everyone else responds to it at the same time. Idempotent. */
@@ -114,28 +163,6 @@ export async function openMeeting(ctx: AppContext, meetingId: string): Promise<B
     out.push(...await saveLines(ctx, meetingId, await Promise.all(pending.map(say))));
   }
   return out;
-}
-
-/** The Founder speaks; whoever was addressed answers, others add a point only if it matters (everyone else passes). */
-export async function founderSays(ctx: AppContext, meetingId: string, text: string, founderName: string): Promise<BoardMessage[]> {
-  const meeting = await loadMeeting(ctx, meetingId);
-  if (meeting.status !== "in_progress") throw new Error("This meeting has ended");
-  const [existing, agents] = await Promise.all([loadMessages(ctx, meetingId), listAgents(ctx)]);
-  const seats = seatsFor(meeting, agents);
-  const mine = await saveLines(ctx, meetingId, [{ role: "founder", agent_id: null, speaker: founderName, body: text.slice(0, 2000), failed: false }]);
-  const lines = [...existing, ...mine].map(lineOf);
-  const targets = addressedSeats(text, seats);
-  const replies = await Promise.all(seats.map(async (seat) => {
-    const addressed = targets.size === 0 ? "all" : targets.has(seat.agent.id) ? "me" : "other";
-    const r = await speakAs(ctx, seat, replyPrompt(seat, meeting.topic, lines, text, addressed));
-    if (!r.text || isPass(r.text)) return addressed === "me" && !r.text ? { seat, body: `(could not answer: ${r.error?.slice(0, 200)})`, failed: true } : null;
-    return { seat, body: r.text, failed: false };
-  }));
-  const rows = replies.filter((r): r is NonNullable<typeof r> => !!r)
-    // The person addressed answers first, then the others in seating order.
-    .sort((a, b) => Number(targets.has(b.seat.agent.id)) - Number(targets.has(a.seat.agent.id)))
-    .map((r) => ({ role: "member" as const, agent_id: r.seat.agent.id, speaker: `${r.seat.agent.name} · ${r.seat.title}`, body: r.body, failed: r.failed }));
-  return [...mine, ...await saveLines(ctx, meetingId, rows)];
 }
 
 /** Emails the minutes to the Founder (when a mailbox is connected). */

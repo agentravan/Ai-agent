@@ -2,8 +2,8 @@
 
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import { FileText, Mic, MicOff, MessageSquare, PhoneOff, Send, Volume2, VolumeX } from "lucide-react";
-import { askMeetingAction, endMeetingAction, openMeetingAction } from "@/modules/board/actions";
+import { FileText, Mic, MicOff, MessageSquare, PhoneOff, Play, Send, Volume2, VolumeX } from "lucide-react";
+import { endMeetingAction, memberTurnAction, sayAction } from "@/modules/board/actions";
 import type { BoardMessage } from "@/types/domain";
 
 export interface RoomSeat { agentId: string; name: string; title: string; color: string; voice: number }
@@ -78,7 +78,6 @@ export function MeetingRoom({ meetingId, topic, seats, founder, scribeName, init
   const [listening, setListening] = useState(false);
   const [showChat, setShowChat] = useState(false);
   const recRef = useRef<Recognition | null>(null);
-  const opened = useRef(false);
   const seatOf = useCallback((id: string | null) => seats.find((s) => s.agentId === id), [seats]);
 
   const receive = useCallback((incoming: BoardMessage[]) => {
@@ -87,15 +86,33 @@ export function MeetingRoom({ meetingId, topic, seats, founder, scribeName, init
     setQueue((q) => [...q, ...incoming.filter((x) => x.role !== "founder" && !x.failed)]);
   }, []);
 
-  // Opening round as soon as the Founder walks in.
-  useEffect(() => {
-    if (!live || opened.current || !canSpeak) return;
-    const spoken = new Set(initial.filter((m) => m.role === "member" && !m.failed).map((m) => m.agent_id));
-    if (seats.every((s) => spoken.has(s.agentId))) return;
-    opened.current = true;
-    setBusy("Everyone is joining and sharing their first view…");
-    openMeetingAction(meetingId).then((r) => (r.ok ? receive(r.messages) : setError(r.error))).finally(() => setBusy(null));
-  }, [live, canSpeak, initial, seats, meetingId, receive]);
+  // Nobody speaks until the Founder starts the meeting (Start button, or simply saying something).
+  const [started, setStarted] = useState(() => initial.some((m) => m.role === "member" && !m.failed) || initial.some((m) => m.role === "founder"));
+  const [thinking, setThinking] = useState<Set<string>>(new Set());
+
+  /** Runs members' turns in parallel; each voice starts as soon as that member is ready. */
+  const runTurns = useCallback(async (mode: "open" | "reply", ids: string[]) => {
+    setThinking(new Set(ids));
+    let silent = 0;
+    await Promise.all(ids.map(async (id) => {
+      const r = await memberTurnAction(meetingId, id, mode);
+      setThinking((t) => { const n = new Set(t); n.delete(id); return n; });
+      if (!r.ok) { setError(r.error); return; }
+      if (r.message) receive([r.message]); else silent++;
+    }));
+    if (mode === "reply" && silent === ids.length) setError("Nobody had anything to add — try asking someone by name.");
+  }, [meetingId, receive]);
+
+  const startMeeting = async () => {
+    if (busy || !seats.length) return;
+    setStarted(true);
+    setError(null);
+    setBusy("open");
+    const [chair, ...rest] = seats;
+    await runTurns("open", [chair!.agentId]); // the chair opens…
+    await runTurns("open", rest.map((s) => s.agentId)); // …then everyone responds, whoever is ready first speaks first
+    setBusy(null);
+  };
 
   // Take the next line from the queue…
   useEffect(() => {
@@ -139,13 +156,18 @@ export function MeetingRoom({ meetingId, topic, seats, founder, scribeName, init
     if (!msg || busy) return;
     setText("");
     setError(null);
-    if (typeof window !== "undefined" && "speechSynthesis" in window) window.speechSynthesis.cancel();
+    setStarted(true);
+    if ("speechSynthesis" in window) window.speechSynthesis.cancel();
     setQueue([]);
     setCurrent(null);
-    setBusy("The board is thinking…");
-    const r = await askMeetingAction(meetingId, msg);
+    setBusy("reply");
+    const r = await sayAction(meetingId, msg);
+    if (!r.ok) { setBusy(null); setError(r.error); return; }
+    setMessages((m) => [...m, r.message]);
+    // The person addressed is asked first so their answer usually arrives first; everyone else may add a point or pass.
+    const order = [...seats].sort((a, b) => Number(r.addressed.includes(b.agentId)) - Number(r.addressed.includes(a.agentId))).map((s) => s.agentId);
+    await runTurns("reply", order);
     setBusy(null);
-    if (r.ok) receive(r.messages); else setError(r.error);
   };
 
   const toggleMic = () => {
@@ -171,12 +193,15 @@ export function MeetingRoom({ meetingId, topic, seats, founder, scribeName, init
     if (typeof window !== "undefined" && "speechSynthesis" in window) window.speechSynthesis.cancel();
     setQueue([]);
     setCurrent(null);
-    setBusy(`${scribeName ?? "The secretary"} is writing the minutes…`);
+    setBusy("minutes");
     const r = await endMeetingAction(meetingId);
     setBusy(null);
     if (r.ok) router.refresh(); else setError(r.error ?? "Could not end the meeting");
   };
 
+  const thinkingNames = seats.filter((s) => thinking.has(s.agentId)).map((s) => s.name);
+  const busyText = busy === "minutes" ? `${scribeName ?? "The secretary"} is writing the minutes…`
+    : thinkingNames.length ? `${thinkingNames.join(", ")} ${thinkingNames.length > 1 ? "are" : "is"} thinking…` : busy ? "…" : null;
   const speakingId = current?.role === "scribe" ? "scribe" : current?.agent_id ?? null;
   const caption = current ? { who: current.speaker.split(" · ")[0], text: plain(current.body) } : null;
 
@@ -194,7 +219,8 @@ export function MeetingRoom({ meetingId, topic, seats, founder, scribeName, init
         <div className="relative min-h-0 flex-1 overflow-y-auto p-3" style={{ backgroundImage: "radial-gradient(ellipse at top, rgb(30 41 59 / 0.35), transparent 60%)" }}>
           <div className="grid grid-cols-2 gap-3 lg:grid-cols-3">
             {seats.map((s) => (
-              <Tile key={s.agentId} name={s.name} title={s.title} color={s.color} speaking={speakingId === s.agentId}>
+              <Tile key={s.agentId} name={s.name} title={s.title} color={s.color} speaking={speakingId === s.agentId}
+                badge={thinking.has(s.agentId) ? <span className="flex items-center gap-1 rounded bg-black/55 px-1.5 py-0.5 text-[10px] text-zinc-300"><span className="h-1.5 w-1.5 animate-pulse rounded-full" style={{ background: s.color }} />thinking</span> : undefined}>
                 <Avatar color={s.color} speaking={speakingId === s.agentId} />
               </Tile>
             ))}
@@ -208,10 +234,17 @@ export function MeetingRoom({ meetingId, topic, seats, founder, scribeName, init
             </Tile>
           </div>
 
-          {(caption || busy) && (
+          {live && canSpeak && !started && (
+            <div className="mt-6 flex flex-col items-center gap-3 text-center">
+              <p className="max-w-md text-sm text-zinc-400">Sab aa gaye hain aur aapka intezaar kar rahe hain. Bolo (🎤) ya likho — ya {seats[0]?.name ?? "the chair"} ko meeting shuru karne do.</p>
+              <button type="button" onClick={startMeeting} className="flex h-11 items-center gap-2 rounded-full bg-zinc-100 px-5 text-sm font-medium text-zinc-900 hover:bg-white"><Play className="h-4 w-4" />Start — {seats[0]?.name ?? "chair"} opens</button>
+            </div>
+          )}
+
+          {(caption || busyText) && (
             <div className="pointer-events-none sticky bottom-0 mt-4 flex justify-center">
               <p className="max-w-3xl rounded-lg bg-black/75 px-4 py-2 text-center text-sm leading-relaxed text-zinc-100 backdrop-blur">
-                {caption ? <><span className="font-semibold" style={{ color: seatOf(current!.agent_id)?.color ?? "#e5e7eb" }}>{caption.who}: </span>{caption.text.length > 420 ? `${caption.text.slice(0, 420)}…` : caption.text}</> : <span className="text-zinc-400">{busy}</span>}
+                {caption ? <><span className="font-semibold" style={{ color: seatOf(current!.agent_id)?.color ?? "#e5e7eb" }}>{caption.who}: </span>{caption.text.length > 420 ? `${caption.text.slice(0, 420)}…` : caption.text}</> : <span className="text-zinc-400">{busyText}</span>}
               </p>
             </div>
           )}

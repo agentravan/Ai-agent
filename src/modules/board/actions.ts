@@ -11,7 +11,7 @@ import { logEvent } from "@/modules/audit/service";
 import { applyPlanOnce, describeOutcomes } from "@/modules/orchestration/apply-once";
 import { listAgents } from "@/modules/orchestration/engine";
 import type { BoardMeeting, BoardMessage, Execution } from "@/types/domain";
-import { endMeeting, founderSays, openMeeting, resendMom, runStandup, seatsFor } from "./service";
+import { endMeeting, founderLine, memberTurn, resendMom, runStandup, seatsFor } from "./service";
 
 const PATH = "/board";
 const uuid = z.uuid();
@@ -22,7 +22,6 @@ const startSchema = z.object({
 });
 const idSchema = z.object({ id: z.uuid() });
 
-type Live = { ok: true; messages: BoardMessage[] } | { ok: false; error: string };
 const safe = (err: unknown) =>
   err instanceof UserFacingError || err instanceof AiError || err instanceof AiUnavailableError ? err.message
     : (console.error("[meeting]", err), "Something went wrong — please try again.");
@@ -51,25 +50,25 @@ export async function startMeetingAction(form: FormData) {
   redirect(`${PATH}/${id}`);
 }
 
-/** Called by the room when it opens: everyone gives their opening view. */
-export async function openMeetingAction(id: string): Promise<Live> {
-  try {
-    const ctx = await requireContext("operate");
-    return { ok: true, messages: await openMeeting(ctx, uuid.parse(id)) };
-  } catch (err) {
-    return { ok: false, error: safe(err) };
-  }
-}
-
-/** The Founder speaks in the meeting (typed or spoken). */
-export async function askMeetingAction(id: string, text: string): Promise<Live> {
+/** The Founder speaks (typed or by mic). Members then answer in parallel via memberTurnAction. */
+export async function sayAction(id: string, text: string): Promise<{ ok: true; message: BoardMessage; addressed: string[] } | { ok: false; error: string }> {
   try {
     const ctx = await requireContext("operate");
     const message = z.string().trim().min(1, "Say something first").max(2000).parse(text);
     const name = ctx.profile.full_name?.split(" ")[0] || "Founder";
-    return { ok: true, messages: await founderSays(ctx, uuid.parse(id), message, `${name} · Founder`) };
+    return { ok: true, ...(await founderLine(ctx, uuid.parse(id), message, `${name} · Founder`)) };
   } catch (err) {
     return { ok: false, error: err instanceof z.ZodError ? ((err as z.ZodError).issues[0]?.message ?? "Invalid message") : safe(err) };
+  }
+}
+
+/** One member's turn ("open" = first view, "reply" = answer the Founder). Null message = they passed. */
+export async function memberTurnAction(id: string, agentId: string, mode: "open" | "reply"): Promise<{ ok: true; message: BoardMessage | null } | { ok: false; error: string }> {
+  try {
+    const ctx = await requireContext("operate");
+    return { ok: true, message: await memberTurn(ctx, uuid.parse(id), uuid.parse(agentId), mode === "open" ? "open" : "reply") };
+  } catch (err) {
+    return { ok: false, error: safe(err) };
   }
 }
 
