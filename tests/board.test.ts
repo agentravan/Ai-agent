@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { formatInrCompact, formatUsdCompact } from "@/lib/utilities/format";
-import { addressedSeats, cleanSpeech, dueStandup, isPass, istDate, momToPlan, openingPrompt, parseMom, pickBoard, pickTeam, replyPrompt, transcript } from "@/modules/board/logic";
+import { addressedSeats, routeTurn, cleanSpeech, dueStandup, isPass, istDate, momToPlan, openingPrompt, parseMom, pickBoard, pickTeam, replyPrompt, transcript } from "@/modules/board/logic";
 import { growthStage, northStarLadder } from "@/modules/cockpit/metrics";
 import { MISSION, northStarLabel } from "@/modules/orchestration/mission";
 import { AiError } from "@/lib/ai/types";
@@ -41,11 +41,13 @@ describe("live conversation", () => {
     expect(transcript([])).toMatch(/nobody has spoken/);
   });
   it("asks every member for their lens, the risk and the profit angle", () => {
-    const p = openingPrompt(seats[3]!, "Gym websites in Gurugram", lines, "From the last meeting: call 5 gyms");
+    const p = openingPrompt(seats[3]!, "Gym websites in Gurugram", lines, "From the last meeting: call 5 gyms", "Harshit");
     expect(p).toContain("Gym websites in Gurugram");
     expect(p).toContain("call 5 gyms");
-    expect(p).toMatch(/main risk, the profit angle/);
+    expect(p).toMatch(/the risk you see and the profit angle/);
     expect(p).toMatch(/allowed with conditions/);
+    expect(p).toMatch(/never repeat what a colleague already said/);
+    expect(openingPrompt(seats[0]!, "t", [], "", "Harshit", true)).toMatch(/You are chairing/);
   });
   it("finds who the Founder is talking to by name or title", () => {
     expect([...addressedSeats("Ledger, price kya rakhein?", seats)]).toEqual(["Ledger"]);
@@ -54,10 +56,17 @@ describe("live conversation", () => {
   });
   it("lets members who were not asked pass", () => {
     expect(replyPrompt(seats[1]!, "t", lines, "Ledger?", "other")).toMatch(/exactly PASS/);
-    expect(replyPrompt(seats[2]!, "t", lines, "Ledger?", "me")).toMatch(/asking YOU/);
+    expect(replyPrompt(seats[2]!, "t", lines, "Ledger?", "me", "Harshit")).toMatch(/Harshit is asking YOU/);
     expect(isPass("PASS")).toBe(true);
     expect(isPass(" pass. ")).toBe(true);
     expect(isPass("Pass karte hain is idea ko, but…")).toBe(false);
+  });
+  it("routes the Founder's line like a real meeting", () => {
+    expect(routeTurn("kya meri awaaz aa rahi hai", seats)).toEqual({ answer: ["Atlas"], may: [] });
+    expect(routeTurn("Gym website ka price kya rakhein?", seats).answer).toEqual(["Ledger"]);
+    expect(routeTurn("GST lagega kya?", seats).answer).toEqual(["Themis"]);
+    expect(routeTurn("Themis, contract chahiye?", seats)).toEqual({ answer: ["Themis"], may: ["Atlas", "Orion", "Ledger"] });
+    expect(routeTurn("Is hafte ka focus kya ho?", seats)).toEqual({ answer: ["Atlas"], may: ["Orion", "Ledger", "Themis"] });
   });
   it("cleans speech for reading aloud", () => {
     expect(cleanSpeech("```\n**hi**\n```")).toBe("hi");

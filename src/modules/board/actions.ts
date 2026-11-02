@@ -11,7 +11,7 @@ import { logEvent } from "@/modules/audit/service";
 import { applyPlanOnce, describeOutcomes } from "@/modules/orchestration/apply-once";
 import { listAgents } from "@/modules/orchestration/engine";
 import type { BoardMeeting, BoardMessage, Execution } from "@/types/domain";
-import { endMeeting, founderLine, memberTurn, resendMom, runStandup, seatsFor } from "./service";
+import { endMeeting, founderFirstName, founderLine, memberTurn, resendMom, runStandup, seatsFor } from "./service";
 
 const PATH = "/board";
 const uuid = z.uuid();
@@ -51,12 +51,12 @@ export async function startMeetingAction(form: FormData) {
 }
 
 /** The Founder speaks (typed or by mic). Members then answer in parallel via memberTurnAction. */
-export async function sayAction(id: string, text: string): Promise<{ ok: true; message: BoardMessage; addressed: string[] } | { ok: false; error: string }> {
+export async function sayAction(id: string, text: string): Promise<{ ok: true; message: BoardMessage; addressed: string[]; others: string[] } | { ok: false; error: string }> {
   try {
     const ctx = await requireContext("operate");
     const message = z.string().trim().min(1, "Say something first").max(2000).parse(text);
-    const name = ctx.profile.full_name?.split(" ")[0] || "Founder";
-    return { ok: true, ...(await founderLine(ctx, uuid.parse(id), message, `${name} · Founder`)) };
+    const name = founderFirstName(ctx);
+    return { ok: true, ...(await founderLine(ctx, uuid.parse(id), message, name === "Founder" ? "Founder" : `${name} · Founder`)) };
   } catch (err) {
     return { ok: false, error: err instanceof z.ZodError ? ((err as z.ZodError).issues[0]?.message ?? "Invalid message") : safe(err) };
   }

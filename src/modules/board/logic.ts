@@ -14,6 +14,15 @@ const ROLE_COLOR: Record<Exclude<BoardRole, "member">, string> = { ceo: "#3b82f6
 const MEMBER_COLORS = ["#14b8a6", "#ec4899", "#eab308", "#06b6d4", "#f43f5e", "#84cc16", "#8b5cf6", "#f59e0b"];
 export const SCRIBE_COLOR = "#e5e7eb";
 
+/** How each person behaves in a room — like experienced Indian executives, not chatbots. */
+const PERSONALITY: Record<BoardRole, string> = {
+  ceo: "the chair: calm, decisive, sees the big picture; you frame the discussion, make the call when views differ, and hand the floor to the right person by name",
+  coo: "practical and fast: you think in owners, deadlines and next steps; you push back on vague plans",
+  cfo: "careful with money and blunt about it: cash first, no spending before the profit gate; you question numbers that have no basis",
+  legal: "precise and calm: you flag only real legal risks, say plainly what is allowed and on what conditions, and suggest the lawful way to do it",
+  member: "a hands-on team lead: you speak about your own work — what is done, what is blocked, what you need",
+};
+
 /** What each C-suite member must always weigh, so a meeting adds up to a decision, not four similar opinions. */
 const ROLE_LENS: Record<BoardRole, string> = {
   ceo: "strategy and which opportunity wins — the big picture and the next milestone",
@@ -55,37 +64,68 @@ export function transcript(lines: readonly SpokenLine[], max = 9000): string {
   return text.length > max ? `…${text.slice(-max)}` : text;
 }
 
-const TALK = `Talk like a real person in a live meeting, not a report: short spoken sentences, address colleagues or the Founder by name,
-agree or disagree with what was said and say why. No headings, no markdown, no bullet lists. Same language as the Founder (Hinglish if they used it).`;
+/** Meeting etiquette: what makes it sound like people, not a chatbot. */
+function talk(founder: string): string {
+  return `How to speak — like a senior Indian executive (15+ years) in a real meeting:
+- 2–4 short spoken sentences (about 60 words). No headings, lists, markdown or emojis.
+- Natural Hinglish the way professionals talk; call people by first name (${founder}, Atlas, Ledger…).
+- Never echo the question, never repeat what a colleague already said, no filler ("great question", "sab sun pa rahe hain", "chalo aage badhte hain").
+- If you agree, say it in a few words and add something new; if you disagree, say so respectfully with the reason.
+- Be concrete: one recommendation with an owner or a time. If a number is needed and you don't have the data, ask one precise question instead of guessing.`;
+}
 
-/** Each member's first turn: their view, through their own lens, with risk and profit. */
-export function openingPrompt(seat: { role: BoardRole; title: string }, agenda: string, lines: readonly SpokenLine[], context = ""): string {
-  return `You are in a meeting as ${seat.title}. Agenda: """${agenda}"""${context ? `\n\nContext:\n${context}` : ""}
+/** Each member's first turn. The chair opens the meeting; the others respond to the chair. */
+export function openingPrompt(seat: { role: BoardRole; title: string }, agenda: string, lines: readonly SpokenLine[], context = "", founder = "Founder", chair = false): string {
+  const job = chair
+    ? `You are chairing. Open the meeting in one line, frame the agenda, give your view (risk and profit in a phrase each), and hand over to one colleague by name with a direct question.`
+    : `Respond to what was said from your lens (${ROLE_LENS[seat.role]}): your view, the risk you see and the profit angle — only what is new.`;
+  return `Live meeting. You are ${seat.title} — ${PERSONALITY[seat.role]}. ${founder} (the Founder) is in the room. Agenda: """${agenda}"""${context ? `\n\nContext:\n${context}` : ""}
 
 Said so far:
 ${transcript(lines)}
 
-Your turn. Speak from your lens: ${ROLE_LENS[seat.role]}.
-Cover: your view, the main risk, the profit angle, and one recommendation. Max 110 words.
-${TALK}`;
+${job}
+${talk(founder)}`;
 }
 
-/** Answering the Founder during the meeting. Members not addressed only speak if they add something important. */
-export function replyPrompt(seat: { role: BoardRole; title: string }, agenda: string, lines: readonly SpokenLine[], founderMessage: string, addressed: "me" | "other" | "all"): string {
+/** Answering the Founder during the meeting. */
+export function replyPrompt(seat: { role: BoardRole; title: string }, agenda: string, lines: readonly SpokenLine[], founderMessage: string, addressed: "me" | "other" | "all", founder = "Founder"): string {
   const rule = addressed === "me"
-    ? "The Founder is asking YOU. Answer directly and completely, then add your advice."
-    : addressed === "other"
-      ? "The Founder asked someone else. Reply exactly PASS unless you must add a critical point from your lens (a risk, a cost, a legal issue) — then one or two sentences."
-      : "Answer from your lens if you have something useful; otherwise reply exactly PASS. Don't repeat colleagues.";
-  return `You are in a live meeting as ${seat.title}. Agenda: """${agenda}"""
+    ? `${founder} is asking YOU. Answer directly first, then your advice.`
+    : `Someone else is answering. Reply exactly PASS — unless there is a serious point from your lens (a real risk, a cost, a legal problem) that would otherwise be missed; then say it in one or two sentences.`;
+  return `Live meeting. You are ${seat.title} — ${PERSONALITY[seat.role]}. Agenda: """${agenda}"""
 
 Conversation so far:
 ${transcript(lines)}
 
-The Founder just said: """${founderMessage}"""
+${founder} just said: """${founderMessage}"""
 ${rule}
-Weigh risk and profit where relevant (${ROLE_LENS[seat.role]}). Max 90 words.
-${TALK}`;
+${talk(founder)}`;
+}
+
+/** Topic words that tell the room whose question it is when nobody is named. */
+const TOPIC: Partial<Record<BoardRole, RegExp>> = {
+  cfo: /\b(price|pricing|paisa|paise|rupe|₹|cost|kharch|budget|profit|margin|revenue|invoice|payment|cash|fee|rate|kitna)/i,
+  legal: /\b(legal|law|kanoon|contract|agreement|gst|tax|privacy|data|spam|compliance|license|licence|terms|policy)/i,
+  coo: /\b(kaise karen|kaise karein|process|execute|execution|team|kab tak|deadline|timeline|kaam|task|setup|deliver|tools?|automation)/i,
+};
+
+/** Small talk and meeting mechanics: only the chair replies, like a real chairperson would. */
+const SMALL_TALK = /^(hi|hello|hey|namaste|ok|okay|theek|thik|haan|ha|yes|no|nahi|thanks|thank you|shukriya|good|achha|acha)\b|awaaz|aawaz|voice|sun (pa )?rahe|audible|can you hear|mic\b/i;
+
+/**
+ * Who should answer the Founder: people named (or whose topic it is) must answer; for a general question the chair
+ * answers and the others may add a serious point; for small talk only the chair replies (others are not even asked).
+ */
+export function routeTurn<A extends { id: string; name: string }>(message: string, seats: readonly Seat<A>[]): { answer: string[]; may: string[] } {
+  const named = [...addressedSeats(message, seats)];
+  const ids = seats.map((s) => s.agent.id);
+  const chair = ids[0];
+  if (named.length) return { answer: named, may: ids.filter((id) => !named.includes(id)) };
+  if (SMALL_TALK.test(message.trim()) && message.trim().split(/\s+/).length <= 8) return { answer: chair ? [chair] : [], may: [] };
+  const topical = seats.filter((s) => TOPIC[s.role]?.test(message)).map((s) => s.agent.id);
+  const answer = topical.length ? topical : chair ? [chair] : [];
+  return { answer, may: ids.filter((id) => !answer.includes(id)) };
 }
 
 /** Who the Founder is talking to: names or titles mentioned ("Ledger", "CFO", "legal"). Empty = everyone. */

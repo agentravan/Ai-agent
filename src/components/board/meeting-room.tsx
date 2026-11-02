@@ -100,7 +100,7 @@ export function MeetingRoom({ meetingId, topic, seats, founder, scribeName, init
       if (!r.ok) { setError(r.error); return; }
       if (r.message) receive([r.message]); else silent++;
     }));
-    if (mode === "reply" && silent === ids.length) setError("Nobody had anything to add — try asking someone by name.");
+    if (mode === "reply" && ids.length && silent === ids.length) setError("Nobody answered — try asking someone by name, e.g. “Ledger, …”.");
   }, [meetingId, receive]);
 
   const startMeeting = async () => {
@@ -153,7 +153,16 @@ export function MeetingRoom({ meetingId, topic, seats, founder, scribeName, init
 
   const send = async (said: string) => {
     const msg = said.trim();
-    if (!msg || busy) return;
+    if (!msg) return;
+    // "Stop / ruko" just silences the room — no need to ask anyone anything.
+    if (/^(stop|ruko|ruk jao|chup|wait|bas|hold on)[.! ]*$/i.test(msg)) {
+      setText("");
+      if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+      setQueue([]);
+      setCurrent(null);
+      return;
+    }
+    if (busy) return;
     setText("");
     setError(null);
     setStarted(true);
@@ -164,9 +173,8 @@ export function MeetingRoom({ meetingId, topic, seats, founder, scribeName, init
     const r = await sayAction(meetingId, msg);
     if (!r.ok) { setBusy(null); setError(r.error); return; }
     setMessages((m) => [...m, r.message]);
-    // The person addressed is asked first so their answer usually arrives first; everyone else may add a point or pass.
-    const order = [...seats].sort((a, b) => Number(r.addressed.includes(b.agentId)) - Number(r.addressed.includes(a.agentId))).map((s) => s.agentId);
-    await runTurns("reply", order);
+    // Like a real meeting: the person whose question it is answers; others only chime in if it matters (small talk: just the chair).
+    await runTurns("reply", [...r.addressed, ...r.others]);
     setBusy(null);
   };
 
