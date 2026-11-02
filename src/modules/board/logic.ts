@@ -58,7 +58,7 @@ export function pickTeam<A extends AgentLike>(agents: readonly A[], hostId: stri
 export interface SpokenLine { speaker: string; body: string; failed?: boolean; role?: string }
 
 export function transcript(lines: readonly SpokenLine[], max = 9000): string {
-  const spoken = lines.filter((l) => !l.failed && l.role !== "system");
+  const spoken = lines.filter((l) => !l.failed); // includes Idea Court verdicts recorded during the meeting
   if (!spoken.length) return "(nobody has spoken yet)";
   const text = spoken.map((l) => `${l.speaker}: ${l.body}`).join("\n\n");
   return text.length > max ? `…${text.slice(-max)}` : text;

@@ -59,3 +59,19 @@ export async function adoptVerdictAction(form: FormData) {
     }
   });
 }
+
+/** Opens a trial from inside a live meeting (the verdict is recorded back into that meeting). */
+export async function trialFromMeetingAction(meetingId: string, idea: string, proposedBy: string | null): Promise<{ ok: true; trial: Trial } | { ok: false; error: string }> {
+  try {
+    const ctx = await requireContext("operate");
+    const c = fileSchema.parse({ idea, proposed_by: proposedBy ?? undefined, meeting_id: meetingId });
+    const { data, error } = await ctx.db.from("idea_trials").insert({
+      organisation_id: ctx.organisation.id, idea: c.idea, proposed_by: c.proposed_by || null, meeting_id: c.meeting_id ?? null, created_by: ctx.userId,
+    }).select("*").single<Trial>();
+    if (error || !data) throw new UserFacingError("Could not open the court");
+    await logEvent(ctx, { action: "court.case_filed", entity: "idea_trials", entityId: data.id, metadata: { meeting_id: meetingId } });
+    return { ok: true, trial: data };
+  } catch (err) {
+    return { ok: false, error: err instanceof z.ZodError ? ((err as z.ZodError).issues[0]?.message ?? "Invalid idea") : err instanceof UserFacingError ? err.message : "Could not open the court" };
+  }
+}

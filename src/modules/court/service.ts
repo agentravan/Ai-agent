@@ -70,6 +70,17 @@ export async function advanceTrial(ctx: AppContext, id: string): Promise<Trial> 
   if (!result) return fail(execution.error);
   const { votes, verdict: _judgeSays, ...ruling } = result;
   const decided = await update({ jury: votes, verdict: majority(votes), ruling, stage: "decided" });
+  // A trial held during a meeting is part of that meeting: the verdict goes into the transcript (and so into the minutes).
+  if (decided.meeting_id && decided.verdict) {
+    const { data: m } = await ctx.db.from("board_meetings").select("status").eq("id", decided.meeting_id).eq("organisation_id", ctx.organisation.id).maybeSingle<{ status: string }>();
+    if (m?.status === "in_progress") {
+      const { data: lastSeq } = await ctx.db.from("board_messages").select("seq").eq("meeting_id", decided.meeting_id).order("seq", { ascending: false }).limit(1).maybeSingle<{ seq: number }>();
+      await ctx.db.from("board_messages").insert({
+        organisation_id: ctx.organisation.id, meeting_id: decided.meeting_id, seq: (lastSeq?.seq ?? -1) + 1, role: "system", speaker: "Idea Court",
+        body: `Verdict on "${decided.idea.slice(0, 200)}": ${decided.verdict.toUpperCase()} (${votes.filter((v) => v.vote === "build").length} build, ${votes.filter((v) => v.vote === "fix").length} fix, ${votes.filter((v) => v.vote === "kill").length} kill). ${ruling.summary} Fix: ${ruling.fix} Next test: ${ruling.next_test} Vision: ${ruling.vision}`.slice(0, 6000),
+      });
+    }
+  }
   await logEvent(ctx, { action: "court.verdict", entity: "idea_trials", entityId: id, actorType: "agent", metadata: { verdict: decided.verdict } });
   return decided;
 }

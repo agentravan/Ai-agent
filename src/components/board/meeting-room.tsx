@@ -2,7 +2,10 @@
 
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import { FileText, Mic, MicOff, MessageSquare, PhoneOff, Play, Send, Volume2, VolumeX } from "lucide-react";
+import { FileText, Mic, MicOff, MessageSquare, PhoneOff, Play, Scale, Send, Volume2, VolumeX, X } from "lucide-react";
+import { CourtRoom } from "@/components/court/court-room";
+import { trialFromMeetingAction } from "@/modules/court/actions";
+import type { Trial } from "@/modules/court/service";
 import { endMeetingAction, memberTurnAction, sayAction } from "@/modules/board/actions";
 import type { BoardMessage } from "@/types/domain";
 import { hasNaturalVoice, pickVoice } from "./voices";
@@ -66,6 +69,12 @@ export function MeetingRoom({ meetingId, topic, seats, founder, scribeName, init
   const [muted, setMuted] = useState(false);
   const [listening, setListening] = useState(false);
   const [showChat, setShowChat] = useState(false);
+  // Idea Court inside the meeting: draft (idea + who proposed it), then the live trial.
+  const [courtDraft, setCourtDraft] = useState<{ idea: string; by: string | null } | null>(null);
+  const [trial, setTrial] = useState<Trial | null>(null);
+  const [filing, setFiling] = useState(false);
+  // Keep new server-side lines (e.g. a court verdict) when the page refreshes.
+  useEffect(() => { setMessages((m) => [...m, ...initial.filter((x) => !m.some((y) => y.id === x.id))].sort((a, b) => a.seq - b.seq)); }, [initial]);
   const recRef = useRef<Recognition | null>(null);
   const seatOf = useCallback((id: string | null) => seats.find((s) => s.agentId === id), [seats]);
 
@@ -178,6 +187,26 @@ export function MeetingRoom({ meetingId, topic, seats, founder, scribeName, init
     setBusy(null);
   };
 
+  /** The latest real proposal in the room — what the Founder most likely wants to test. */
+  const lastIdea = () => {
+    const m = [...messages].reverse().find((x) => x.role === "member" && !x.failed);
+    return m ? { idea: m.body, by: m.speaker.split(" · ")[0] ?? null } : { idea: "", by: null };
+  };
+  const openCourt = (idea?: { idea: string; by: string | null }) => {
+    if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+    setQueue([]);
+    setCurrent(null);
+    setCourtDraft(idea ?? lastIdea());
+  };
+  const fileTrial = async () => {
+    if (!courtDraft || filing) return;
+    setFiling(true);
+    const r = await trialFromMeetingAction(meetingId, courtDraft.idea, courtDraft.by);
+    setFiling(false);
+    if (r.ok) { setTrial(r.trial); setCourtDraft(null); } else setError(r.error);
+  };
+  const closeCourt = () => { setTrial(null); setCourtDraft(null); router.refresh(); };
+
   const toggleMic = () => {
     if (listening) { recRef.current?.stop(); return; }
     const W = window as unknown as { SpeechRecognition?: new () => Recognition; webkitSpeechRecognition?: new () => Recognition };
@@ -265,7 +294,10 @@ export function MeetingRoom({ meetingId, topic, seats, founder, scribeName, init
               {messages.map((m) => (
                 <li key={m.id}>
                   <p className="text-xs font-medium" style={{ color: m.role === "founder" ? "#fbbf24" : m.role === "scribe" ? "#e5e7eb" : seatOf(m.agent_id)?.color }}>{m.speaker}</p>
-                  <p className={`mt-0.5 whitespace-pre-wrap ${m.failed ? "text-amber-300" : "text-zinc-300"}`}>{m.body}</p>
+                  <p className={`mt-0.5 whitespace-pre-wrap ${m.failed ? "text-amber-300" : m.role === "system" ? "text-amber-200" : "text-zinc-300"}`}>{m.body}</p>
+                  {live && canSpeak && m.role === "member" && !m.failed && (
+                    <button type="button" onClick={() => openCourt({ idea: m.body, by: m.speaker.split(" · ")[0] ?? null })} className="mt-1 text-[11px] text-amber-300 hover:text-amber-200">⚖ Put on trial</button>
+                  )}
                 </li>
               ))}
             </ol>
@@ -295,11 +327,47 @@ export function MeetingRoom({ meetingId, topic, seats, founder, scribeName, init
           <MessageSquare className="h-5 w-5" />
         </button>
         {live && canSpeak && (
+          <button type="button" onClick={() => openCourt()} disabled={!!busy} title="Idea Court — put an idea on trial" className="flex h-11 items-center gap-2 rounded-full bg-amber-500/15 px-4 text-sm font-medium text-amber-200 hover:bg-amber-500/25 disabled:opacity-50">
+            <Scale className="h-4 w-4" />Court
+          </button>
+        )}
+        {live && canSpeak && (
           <button type="button" onClick={end} disabled={!!busy} className="flex h-11 items-center gap-2 rounded-full bg-rose-600 px-4 text-sm font-medium text-white hover:bg-rose-500 disabled:opacity-50">
             <PhoneOff className="h-4 w-4" />End &amp; minutes
           </button>
         )}
       </div>
+      {(courtDraft || trial) && (
+        <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/80 p-3 backdrop-blur-sm sm:p-6" role="dialog" aria-label="Idea Court">
+          <div className="w-full max-w-5xl">
+            <div className="mb-2 flex items-center justify-between text-zinc-200">
+              <p className="flex items-center gap-2 text-sm font-medium"><Scale className="h-4 w-4 text-amber-300" />Idea Court — during this meeting</p>
+              <button type="button" onClick={closeCourt} className="grid h-9 w-9 place-items-center rounded-full bg-zinc-800 hover:bg-zinc-700" title="Back to the meeting"><X className="h-4 w-4" /></button>
+            </div>
+            {trial ? (
+              <>
+                <CourtRoom initial={trial} canRun={canSpeak} />
+                <p className="mt-2 text-center text-xs text-zinc-400">The verdict is added to this meeting, so Scribe's minutes include it. Close to return to the meeting.</p>
+              </>
+            ) : courtDraft && (
+              <div className="rounded-2xl border border-white/10 bg-zinc-950 p-4">
+                <label className="text-xs font-medium text-zinc-400" htmlFor="court-idea">Exhibit A — the idea on trial</label>
+                <textarea id="court-idea" value={courtDraft.idea} onChange={(e) => setCourtDraft({ ...courtDraft, idea: e.target.value })} rows={4} maxLength={2000}
+                  className="mt-1 w-full rounded-lg border border-white/10 bg-zinc-900 p-3 text-sm text-zinc-100 focus:border-white/25 focus:outline-none" placeholder="Which idea should the court test?" />
+                <div className="mt-2 flex flex-wrap items-center gap-2">
+                  <span className="text-xs text-zinc-500">Proposed by</span>
+                  {["Founder", ...seats.map((x) => x.name)].map((n) => (
+                    <button key={n} type="button" onClick={() => setCourtDraft({ ...courtDraft, by: n })} className={`rounded-full px-3 py-1 text-xs ${courtDraft.by === n ? "bg-amber-400 text-zinc-900" : "bg-zinc-800 text-zinc-300 hover:bg-zinc-700"}`}>{n}</button>
+                  ))}
+                </div>
+                <button type="button" onClick={fileTrial} disabled={filing || courtDraft.idea.trim().length < 5} className="mt-4 flex h-11 items-center gap-2 rounded-full bg-amber-400 px-5 text-sm font-semibold text-zinc-900 hover:bg-amber-300 disabled:opacity-40">
+                  <Scale className="h-4 w-4" />{filing ? "Opening the court…" : "Put it on trial"}
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
