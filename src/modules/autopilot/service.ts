@@ -5,6 +5,7 @@ import { emailConfigured, sendEmail } from "@/lib/integrations/email";
 import { logEvent } from "@/modules/audit/service";
 import type { AppContext } from "@/modules/auth/session";
 import { recoverStaleExecutions } from "@/modules/orchestration/engine";
+import { checkDueKeywords } from "@/modules/rank/service";
 import { runReadyTasks } from "@/modules/tasks/service";
 import { alertProblems, autoRetryDecision, isEventfulCycle, shouldAlert, type AutopilotSummary } from "./policy";
 
@@ -107,6 +108,11 @@ export async function runAutopilot(ctx: AppContext, budgetMs: number, now = new 
   const aiConfigured = providerChain().length > 0;
   const results = aiConfigured ? await runReadyTasks(ctx, budgetMs - (Date.now() - started)) : [];
   const succeeded = results.filter((r) => r.ok).length;
+
+  // Daily Google rank checks (only when a Places key is set and time is left). Never blocks the cycle.
+  if (budgetMs - (Date.now() - started) > 30_000) {
+    await checkDueKeywords(ctx, now).catch((err: Error) => console.error("[autopilot] rank checks failed", err.message));
+  }
 
   const summary: AutopilotSummary = {
     requeued,

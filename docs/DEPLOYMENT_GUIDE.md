@@ -28,13 +28,24 @@ Every 30 minutes `/api/cron/autopilot` runs one cycle per organisation:
 2. Puts failed tasks back in the queue: at most 3 automatic retries, waiting 30 min → 1 h → 2 h. After that the task stays failed and the Founder is told.
 3. Agents work ready tasks within the time budget (each task at most once per cycle). Risky steps still go to the Approval Center.
 4. If the main AI provider fails, the run fails over to the next configured provider (`AI_FALLBACK`, default `free` = never paid Anthropic).
-5. Emails the Founder (at most once per 12 h) only when something needs a human: tasks out of retries, every task in a cycle failing, or work waiting with no AI configured.
+5. Checks Google rank for keywords not checked in the last 20 h (max 5 per cycle, only with `GOOGLE_PLACES_API_KEY`).
+6. Emails the Founder (at most once per 12 h) only when something needs a human: tasks out of retries, every task in a cycle failing, or work waiting with no AI configured.
 
 Setup:
 - Vercel: `CRON_SECRET` and `SUPABASE_SERVICE_ROLE_KEY` (already needed for reports). Mailbox variables are only needed for alert emails.
 - GitHub → Settings → Secrets and variables → Actions: secret `CRON_SECRET` (same value as Vercel), optional variable `APP_URL`.
 - `.github/workflows/autopilot.yml` must be on the repository's **default branch**: GitHub only runs scheduled workflows from there. Without it, the daily Vercel cron (14:00 IST) still runs one cycle.
 - Run it by hand: Actions → Autopilot → Run workflow.
+
+## Agency toolkit (Agent Library, Google leads, LinkedIn Desk, Rank Tracker)
+1. Apply `supabase/migrations/20261102000000_agency_toolkit.sql` (Supabase → SQL Editor, or `supabase db push`). It is additive: no existing data changes.
+2. **Agent Library** (`/workforce/library`) and **LinkedIn Desk** (`/linkedin`) work immediately. LinkedIn drafts need an AI provider; you approve, copy and post them yourself — the app never logs in to LinkedIn.
+3. **Google leads + Rank Tracker** (optional, may cost money): Google Cloud console → create a project → enable **Places API (New)** → APIs & Services → Credentials → create an API key and restrict it to *Places API (New)*. Google requires a billing account; set a budget alert. Add `GOOGLE_PLACES_API_KEY` in Vercel (Production + Preview) and redeploy.
+   - Lead searches request phone/website fields (billed per request; `GOOGLE_PLACES_MAX_PAGES`, default 2 = 40 businesses per search).
+   - Rank checks request place IDs only (Google's free "IDs only" search); matching your business the first time is one small paid request.
+   - Without the key, leads keep coming from OpenStreetMap (₹0) and the Rank Tracker shows as unavailable.
+   - Google's terms limit how long Places data may be cached; leads keep the Google place ID so details can be refreshed.
+4. To refresh the library from upstream: `git clone --depth 1 https://github.com/msitarzewski/agency-agents /tmp/aa && node scripts/import-agency-agents.mjs /tmp/aa`.
 
 ## Local development
 ```bash

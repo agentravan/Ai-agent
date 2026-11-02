@@ -68,6 +68,27 @@ begin
     raise exception 'founder task with agent allowed';
   exception when check_violation then null; end;
   assert (select north_star_target_cents from public.organisations) = 100000000000000, 'north star default';
+  -- Agency toolkit: Google Places leads, LinkedIn approval gate, rank tracker, content permission.
+  insert into public.leads (organisation_id, name, source, source_ref) values (private.auth_org_id(), 'Gym G', 'google_places', 'ChIJabc');
+  assert (select count(*) from public.agent_permissions p join public.agents a on a.id = p.agent_id
+           where a.name = 'Iris' and p.permission = 'content.draft') = 1, 'Iris can draft content';
+  insert into public.linkedin_drafts (organisation_id, kind, brief, body) values (private.auth_org_id(), 'post', 'Gym tips', 'Hello') returning id into t2;
+  begin
+    update public.linkedin_drafts set status = 'posted', posted_at = now() where id = t2;
+    raise exception 'posted without approval';
+  exception when check_violation then null; end;
+  update public.linkedin_drafts set status = 'approved', approved_by = auth.uid() where id = t2;
+  begin
+    update public.linkedin_drafts set body = 'Changed' where id = t2;
+    raise exception 'approved content edited';
+  exception when check_violation then null; end;
+  update public.linkedin_drafts set status = 'posted', posted_at = now() where id = t2;
+  insert into public.rank_keywords (organisation_id, keyword, business) values (private.auth_org_id(), 'best gym in mumbai', 'Gym G Bandra') returning id into t1;
+  insert into public.rank_checks (organisation_id, keyword_id, position, scanned) values (private.auth_org_id(), t1, 3, 60);
+  begin
+    insert into public.rank_checks (organisation_id, keyword_id, position) values (private.auth_org_id(), t1, 61);
+    raise exception 'rank position out of range allowed';
+  exception when check_violation then null; end;
   insert into public.tasks (organisation_id, title, owner, external_ref) values (private.auth_org_id(), 'Place order BOT1', 'founder', 'buyontime:BOT1');
   begin
     insert into public.tasks (organisation_id, title, owner, external_ref) values (private.auth_org_id(), 'dup', 'founder', 'buyontime:BOT1');
@@ -112,6 +133,11 @@ do $$ declare l uuid; begin
   begin
     update public.leads set status = 'approved' where id = l;
     raise exception 'member approved outreach';
+  exception when insufficient_privilege then null; end;
+  insert into public.linkedin_drafts (organisation_id, kind, brief, body) values (private.auth_org_id(), 'comment_reply', 'Reply', 'Thanks!') returning id into l;
+  begin
+    update public.linkedin_drafts set status = 'approved' where id = l;
+    raise exception 'member approved LinkedIn content';
   exception when insufficient_privilege then null; end;
 end $$;
 

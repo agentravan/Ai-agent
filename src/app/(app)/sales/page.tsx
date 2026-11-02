@@ -3,6 +3,7 @@ import { Badge, Card, Empty, Field, Flash, PageHeader, Select, Stat, Table, Td, 
 import { SubmitButton } from "@/components/ui/submit-button";
 import { aiStatus } from "@/lib/ai/registry";
 import { emailConfigured } from "@/lib/integrations/email";
+import { googlePlacesConfigured } from "@/lib/integrations/google-places";
 import { LEAD_CATEGORIES } from "@/lib/integrations/osm";
 import { can } from "@/lib/permissions";
 import { formatDateTime, humanize, truncate } from "@/lib/utilities/format";
@@ -18,6 +19,7 @@ export const metadata = { title: "Sales Engine" };
 export const maxDuration = 300;
 
 const CATEGORY_OPTIONS = Object.entries(LEAD_CATEGORIES).map(([value, c]) => ({ value, label: c.label }));
+const SOURCE_LABEL: Record<string, string> = { openstreetmap: "OpenStreetMap", google_places: "Google Maps", manual: "Manual" };
 const OFFER_OPTIONS = [{ value: "website", label: "Website + social media" }, { value: "hr_services", label: "HR services (ask what they need)" }, { value: "ecommerce", label: "E-commerce store" }];
 
 function Pitch({ lead }: { lead: Lead }) {
@@ -71,7 +73,7 @@ export default async function SalesPage({ searchParams }: { searchParams: Search
       </div>
 
       <div className="mt-6 grid gap-6 xl:grid-cols-3">
-        <Card title="Hunting targets" description="The engine searches these daily and on demand (free OpenStreetMap data)" className="xl:col-span-2"
+        <Card title="Hunting targets" description={googlePlacesConfigured() ? "The engine searches these daily and on demand (Google Places, with OpenStreetMap as backup)" : "The engine searches these daily and on demand (free OpenStreetMap data — add a Google Places key for more phone numbers)"} className="xl:col-span-2"
           action={canOperate && ai.available && (targets?.length ?? 0) > 0 && <form action={runCycleAction}><SubmitButton variant="ghost" pendingText="Hunting…">Run full cycle now</SubmitButton></form>}>
           {targets?.length ? (
             <ul className="divide-y divide-line">
@@ -202,12 +204,12 @@ export default async function SalesPage({ searchParams }: { searchParams: Search
                   <Td><div className="text-zinc-50">{l.name}</div><div className="text-xs text-muted">{truncate(l.address, 60)}</div></Td>
                   <Td className="num">{l.score}</Td>
                   <Td className="text-xs text-muted">{[l.phone && "phone", l.email && "email", l.instagram && "instagram"].filter(Boolean).join(", ") || "none"}</Td>
-                  <Td className="text-xs text-muted">{l.source === "openstreetmap" ? "OpenStreetMap" : "Manual"}</Td>
+                  <Td className="text-xs text-muted">{SOURCE_LABEL[l.source] ?? "Manual"}</Td>
                 </tr>
               ))}
             </Table>
           ) : <Empty>No unreviewed leads.</Empty>}
-          <p className="mt-3 text-xs text-zinc-500">{by("disqualified").length} leads skipped with reasons · Map data © OpenStreetMap contributors (ODbL).</p>
+          <p className="mt-3 text-xs text-zinc-500">{by("disqualified").length} leads skipped with reasons · Map data © OpenStreetMap contributors (ODbL){L.some((l) => l.source === "google_places") ? " · Business data from Google Maps" : ""}.</p>
         </Card>
         {canOperate && (
           <Card title="Add a lead manually" description="From Google Maps, Instagram or a referral">

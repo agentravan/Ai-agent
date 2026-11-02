@@ -54,6 +54,8 @@ export interface Agent {
   status: AgentStatus;
   business_unit_id: string | null;
   monthly_cost_limit_cents: number;
+  /** Set when hired from the Agency Agents library. */
+  template_slug?: string | null;
   created_at: string;
 }
 
@@ -165,3 +167,18 @@ export interface FinancialRecord {
 }
 export interface Budget { id: string; name: string; department_id: string | null; period_start: string; period_end: string; amount_cents: number; currency: string }
 export interface Client { id: string; name: string; status: "lead" | "active" | "churned"; business_unit_id: string | null }
+
+/** LinkedIn content desk drafts (the Founder posts approved text by hand). */
+export const LINKEDIN_KINDS = ["post", "comment_reply", "dm_reply"] as const;
+export type LinkedinKind = (typeof LINKEDIN_KINDS)[number];
+export interface LinkedinDraft {
+  id: string; organisation_id: string; kind: LinkedinKind; brief: string; context: string | null; body: string | null;
+  status: "draft" | "approved" | "posted" | "discarded"; agent_id: string | null; posted_at: string | null; created_at: string;
+}
+
+/** Local rank tracker: where a business ranks on Google for a keyword. */
+export interface RankKeyword {
+  id: string; organisation_id: string; keyword: string; business: string; place_id: string | null; place_name: string | null;
+  place_address: string | null; active: boolean; last_position: number | null; last_checked_at: string | null; last_error: string | null; created_at: string;
+}
+export interface RankCheck { id: string; keyword_id: string; position: number | null; scanned: number; checked_at: string }

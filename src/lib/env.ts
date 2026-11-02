@@ -46,6 +46,11 @@ const schema = z.object({
   // Lead discovery (OpenStreetMap — free public data).
   OVERPASS_URL: z.url().default("https://overpass-api.de/api/interpreter"),
   NOMINATIM_URL: z.url().default("https://nominatim.openstreetmap.org"),
+  // Optional Google Places API (New) key: better leads (phone numbers) and the local rank tracker.
+  // Server-only. Without it, leads come from OpenStreetMap and rank tracking shows as unavailable.
+  GOOGLE_PLACES_API_KEY: optional,
+  // Max Google Places result pages (20 each) per lead search. Phone/website fields are billed per request.
+  GOOGLE_PLACES_MAX_PAGES: intIn(1, 3, 2),
 });
 
 export type Env = z.infer<typeof schema>;

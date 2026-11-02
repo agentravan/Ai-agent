@@ -13,6 +13,10 @@ An AI CEO, COO and executive workforce plan, delegate and execute work. Every ag
 - **Empire Command:** natural language → schema-validated plan → per-step execute, approval or deny, with execution tracking.
 - **Approval center:** pending requests with action details, approve/reject (exactly once), history.
 - **Audit system:** database-trigger audit of all business tables plus semantic agent/user events, with filters.
+- **Agent Library:** 280+ ready-made AI employees (sales, marketing, SEO, developers, designers…) from [Agency Agents](https://github.com/msitarzewski/agency-agents) (MIT), hired in one click under full governance.
+- **Google Maps leads (optional):** with `GOOGLE_PLACES_API_KEY`, the Sales Engine finds businesses with phone numbers via Google Places; OpenStreetMap remains the ₹0 default and fallback.
+- **LinkedIn Desk:** AI drafts posts and replies to comments/DMs; Founder approves, copies and posts (no LinkedIn login or automation).
+- **Rank Tracker:** daily Google position for "best gym in bandra"-style keywords, with history and trend.
 - **AI providers:** Ollama (free, default), any OpenAI-compatible endpoint, Claude (optional). If none is configured, AI features are clearly marked unavailable.
 
 ## Stack
