@@ -27,14 +27,15 @@ describe("backup services on other endpoints", () => {
   const env = readEnv({
     ...base, OPENAI_COMPATIBLE_FALLBACK_MODELS: "b:free",
     AI_BACKUP_1_BASE_URL: "https://integrate.api.nvidia.com/v1", AI_BACKUP_1_API_KEY: "k1", AI_BACKUP_1_MODEL: "nv-model",
-    AI_BACKUP_2_BASE_URL: "https://openrouter.ai/api/v1", AI_BACKUP_2_MODEL: "main:free",
+    AI_BACKUP_2_BASE_URL: "https://openrouter.ai/api/v1", AI_BACKUP_2_API_KEY: "k2", AI_BACKUP_2_MODEL: "main:free",
     AI_BACKUP_3_BASE_URL: "https://ignored.example/v1",
   });
   it("orders main model → same-service backups → other services, keeping same model ids on other services", () => {
     expect(providerChain(env).map((p) => p.model)).toEqual(["main:free", "b:free", "nv-model", "main:free"]);
   });
-  it("skips incomplete slots", () => {
+  it("skips incomplete slots and backups without a key", () => {
     expect(backupServices(readEnv({ AI_BACKUP_1_BASE_URL: "https://x.example/v1" }))).toEqual([]);
+    expect(backupServices(readEnv({ AI_BACKUP_1_BASE_URL: "https://x.example/v1", AI_BACKUP_1_MODEL: "m" }))).toEqual([]);
   });
   it("turns off long thinking only where the service supports it", () => {
     expect(speedHints("integrate.api.nvidia.com")).toEqual({ chat_template_kwargs: { enable_thinking: false } });

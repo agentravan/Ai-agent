@@ -145,6 +145,16 @@ export function addressedSeats<A extends { id: string; name: string }>(message: 
   return hit;
 }
 
+/** What the room sees when someone could not answer: plain words, not provider JSON (details stay in the run log). */
+export function friendlyFailure(error: string | null | undefined): string {
+  const e = (error ?? "").toLowerCase();
+  if (/401|403|cookie auth|api key|unauthor/.test(e)) return "(AI key problem — couldn't answer. Check the AI keys in Settings.)";
+  if (/429|rate.?limit|quota|per-day|free-models/.test(e)) return "(AI free limit reached for now — try again later or add the Gemini key.)";
+  if (/503|overload|upstream|unavailable/.test(e)) return "(AI is overloaded right now — try again in a minute.)";
+  if (/time|abort/.test(e)) return "(Took too long to think — ask again.)";
+  return "(Couldn't answer just now — try again.)";
+}
+
 export const isPass = (text: string) => /^\W*pass\W*$/i.test(text.trim()) || text.trim().length < 3;
 
 /**

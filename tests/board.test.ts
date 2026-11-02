@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { formatInrCompact, formatUsdCompact } from "@/lib/utilities/format";
-import { addressedSeats, routeTurn, cleanSpeech, spoken, dueStandup, isPass, istDate, momToPlan, openingPrompt, parseMom, pickBoard, pickTeam, replyPrompt, transcript } from "@/modules/board/logic";
+import { addressedSeats, friendlyFailure, routeTurn, cleanSpeech, spoken, dueStandup, isPass, istDate, momToPlan, openingPrompt, parseMom, pickBoard, pickTeam, replyPrompt, transcript } from "@/modules/board/logic";
 import { growthStage, northStarLadder } from "@/modules/cockpit/metrics";
 import { MISSION, northStarLabel } from "@/modules/orchestration/mission";
 import { AiError } from "@/lib/ai/types";
@@ -74,6 +74,11 @@ describe("live conversation", () => {
     const out = spoken(long);
     expect(out.length).toBeLessThanOrEqual(320);
     expect(out.endsWith(".")).toBe(true);
+  });
+  it("explains failures in plain words", () => {
+    expect(friendlyFailure('AI provider returned 401: {"error":{"message":"No cookie auth credentials found"}}')).toMatch(/key problem/);
+    expect(friendlyFailure("AI provider returned 429: rate-limited")).toMatch(/free limit/);
+    expect(friendlyFailure("503 Service temporarily overloaded")).toMatch(/overloaded/);
   });
   it("cleans speech for reading aloud", () => {
     expect(cleanSpeech("```\n**hi**\n```")).toBe("hi");
