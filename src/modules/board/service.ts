@@ -10,10 +10,13 @@ import {
   cleanSpeech, friendlyFailure, routeTurn, spoken, dueStandup, isPass, istDate, momPrompt, momText, momToPlan, openingPrompt, parseMom, pickBoard, pickTeam,
   replyPrompt, type Seat, type SpokenLine,
 } from "./logic";
+import { founderRule } from "@/modules/learning/logic";
 
 type A = AgentWithPermissions;
 /** A live meeting can't wait long: fail over to the next model quickly. */
 const SPEAKER_BUDGET_MS = 30_000;
+/** One provider gets at most 8 s in a live meeting; if it hangs, the next backup answers inside the same 30 s. */
+const SPEAKER_ATTEMPT_MS = 8_000;
 
 async function loadMeeting(ctx: AppContext, id: string): Promise<BoardMeeting> {
   const { data } = await ctx.db.from("board_meetings").select("*").eq("id", id).eq("organisation_id", ctx.organisation.id).single<BoardMeeting>();
@@ -78,7 +81,7 @@ async function nextSeq(ctx: AppContext, meetingId: string): Promise<number> {
 
 async function speakAs(ctx: AppContext, seat: Seat<A>, input: string): Promise<{ text: string | null; error?: string }> {
   const { execution, result } = await runAgent(ctx, {
-    agent: seat.agent, kind: "chat", maxTokens: 260, budgetMs: SPEAKER_BUDGET_MS, input,
+    agent: seat.agent, kind: "chat", maxTokens: 260, budgetMs: SPEAKER_BUDGET_MS, attemptMs: SPEAKER_ATTEMPT_MS, input,
     parse: (t) => spoken(t),
   });
   return result ? { text: result } : { text: null, error: execution.error ?? "no answer" };
@@ -105,6 +108,14 @@ export async function founderLine(ctx: AppContext, meetingId: string, text: stri
   const seats = seatsFor(meeting, await listAgents(ctx));
   const [message] = await saveLines(ctx, meetingId, [{ role: "founder", agent_id: null, speaker: founderName, body: text.slice(0, 2000), failed: false }]);
   const route = routeTurn(text, seats);
+  // Self-learning: a standing rule from the Founder ("ab se…", "never…") is remembered by everyone in the room.
+  const rule = founderRule(text);
+  if (rule && seats.length) {
+    await ctx.db.from("agent_memories").insert(seats.map((s) => ({
+      organisation_id: ctx.organisation.id, agent_id: s.agent.id, kind: "fact", importance: 5,
+      content: `Founder's standing rule (${istDate(new Date())}): ${rule}`,
+    })));
+  }
   return { message: message!, addressed: route.answer, others: route.may };
 }
 

@@ -132,7 +132,8 @@ export function routeTurn<A extends { id: string; name: string }>(message: strin
   const named = [...addressedSeats(message, seats)];
   const ids = seats.map((s) => s.agent.id);
   const chair = ids[0];
-  if (named.length) return { answer: named, may: ids.filter((id) => !named.includes(id)) };
+  // Named someone? Only they think and answer — like a real meeting, the others just listen.
+  if (named.length) return { answer: named, may: [] };
   if (SMALL_TALK.test(message.trim()) && message.trim().split(/\s+/).length <= 8) return { answer: chair ? [chair] : [], may: [] };
   const topical = seats.filter((s) => TOPIC[s.role]?.test(message)).map((s) => s.agent.id);
   const answer = topical.length ? topical : chair ? [chair] : [];

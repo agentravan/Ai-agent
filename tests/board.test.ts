@@ -71,7 +71,8 @@ describe("live conversation", () => {
     expect(routeTurn("kya meri awaaz aa rahi hai", seats)).toEqual({ answer: ["Atlas"], may: [] });
     expect(routeTurn("Gym website ka price kya rakhein?", seats).answer).toEqual(["Ledger"]);
     expect(routeTurn("GST lagega kya?", seats).answer).toEqual(["Themis"]);
-    expect(routeTurn("Themis, contract chahiye?", seats)).toEqual({ answer: ["Themis"], may: ["Atlas", "Orion", "Ledger"] });
+    expect(routeTurn("Themis, contract chahiye?", seats)).toEqual({ answer: ["Themis"], may: [] });
+    expect(routeTurn("Atlas give me the full proof plan ki tum ise kaise successfully karoge", seats)).toEqual({ answer: ["Atlas"], may: [] });
     expect(routeTurn("Is hafte ka focus kya ho?", seats)).toEqual({ answer: ["Atlas"], may: ["Orion", "Ledger", "Themis"] });
   });
   it("keeps spoken turns short, without lists or a cut-off word", () => {
