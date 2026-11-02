@@ -18,7 +18,8 @@ const founderTaskSchema = z.object({
 });
 const statusSchema = z.object({ id: z.uuid(), status: z.enum(["in_progress", "done", "cancelled"]) });
 const goalsSchema = z.object({
-  north_star_crore: z.coerce.number().positive().max(1e9),
+  north_star_usd_billion: z.coerce.number({ message: "Enter the North Star in US$ billion" }).positive("North Star must be above 0").max(500, "North Star can be at most $500 billion"),
+  usd_inr_rate: z.coerce.number({ message: "Enter the dollar rate" }).min(1).max(150, "Rate looks wrong — enter rupees per 1 US$"),
   gate_inr: z.coerce.number().min(0).max(1e12),
 });
 
@@ -43,9 +44,11 @@ export async function setFounderTaskStatusAction(form: FormData) {
 export async function updateGoalsAction(form: FormData) {
   await runAction(PATH, "Goals updated", async () => {
     const ctx = await requireContext("own");
-    const { north_star_crore, gate_inr } = parseForm(goalsSchema, form);
+    const { north_star_usd_billion, usd_inr_rate, gate_inr } = parseForm(goalsSchema, form);
+    // The database derives the INR North Star (north_star_target_cents) from these two values.
     must(await ctx.db.from("organisations").update({
-      north_star_target_cents: Math.round(north_star_crore * 1e7 * 100),
+      north_star_usd: Math.max(1, Math.round(north_star_usd_billion * 1e9)),
+      usd_inr_rate: Math.round(usd_inr_rate * 100) / 100,
       upgrade_profit_gate_cents: Math.round(gate_inr * 100),
     }).eq("id", ctx.organisation.id).select("id").single());
   });

@@ -6,13 +6,16 @@ insert into auth.users (id, email) values
 
 do $$ begin
   assert (select count(*) from public.organisations) = 2, 'one org per founder';
-  assert (select count(*) from public.agents) = 16, 'eight starter agents each (4 executives + 4 managers)';
+  assert (select count(*) from public.agents) = 18, 'nine starter agents each (4 executives + Legal Head + 4 managers)';
+  assert (select count(*) from public.agents where name = 'Themis' and tier = 'executive') = 2, 'Legal Head seeded';
+  assert (select bool_and(north_star_usd = 100000000000 and north_star_target_cents = 100000000000 * 95 * 100) from public.organisations), '$100B north star in INR paise';
   assert (select count(*) from public.business_units) = 8, 'four business units each';
   assert (select count(*) from public.kras) = 20, 'ten KRAs each';
   assert (select count(*) from public.business_units where manager_agent_id is null) = 0, 'every unit has a manager';
   perform private.seed_executive_office(id) from public.organisations;
   perform private.seed_sales_engine(id) from public.organisations;
-  assert (select count(*) from public.agents) = 16, 'seed is idempotent';
+  perform private.seed_board(id) from public.organisations;
+  assert (select count(*) from public.agents) = 18, 'seed is idempotent';
   assert (select count(*) from public.profiles where role = 'founder') = 2, 'founder role';
 end $$;
 
@@ -22,7 +25,7 @@ select set_config('request.jwt.claim.sub', '11111111-1111-1111-1111-111111111111
 do $$
 declare other_agent uuid; t1 uuid; t2 uuid; appr uuid;
 begin
-  assert (select count(*) from public.agents) = 8, 'RLS: sees only own agents';
+  assert (select count(*) from public.agents) = 9, 'RLS: sees only own agents';
   assert (select count(*) from public.kras) = 10, 'RLS: sees only own KRAs';
   assert (select count(*) from public.organisations) = 1, 'RLS: sees only own org';
 
@@ -67,7 +70,7 @@ begin
     values (private.auth_org_id(), 'bad', 'founder', (select id from public.agents limit 1));
     raise exception 'founder task with agent allowed';
   exception when check_violation then null; end;
-  assert (select north_star_target_cents from public.organisations) = 100000000000000, 'north star default';
+  assert (select north_star_usd from public.organisations) = 100000000000, 'north star default $100B';
   -- Agency toolkit: Google Places leads, LinkedIn approval gate, rank tracker, content permission.
   insert into public.leads (organisation_id, name, source, source_ref) values (private.auth_org_id(), 'Gym G', 'google_places', 'ChIJabc');
   assert (select count(*) from public.agent_permissions p join public.agents a on a.id = p.agent_id
@@ -89,6 +92,17 @@ begin
     insert into public.rank_checks (organisation_id, keyword_id, position) values (private.auth_org_id(), t1, 61);
     raise exception 'rank position out of range allowed';
   exception when check_violation then null; end;
+  -- Board meetings; the INR North Star follows the Founder's USD target and rate.
+  insert into public.board_meetings (organisation_id, topic, created_by) values (private.auth_org_id(), 'Phase 0 revenue', auth.uid()) returning id into t1;
+  insert into public.board_messages (organisation_id, meeting_id, seq, speaker, body) values (private.auth_org_id(), t1, 0, 'Atlas', 'Start with websites');
+  begin
+    insert into public.board_messages (organisation_id, meeting_id, seq, speaker, body) values (private.auth_org_id(), t1, 0, 'Orion', 'dup');
+    raise exception 'duplicate board message seq allowed';
+  exception when unique_violation then null; end;
+  update public.organisations set usd_inr_rate = 90 where id = private.auth_org_id();
+  assert (select north_star_target_cents from public.organisations) = 100000000000::bigint * 90 * 100, 'north star follows rate';
+  update public.organisations set north_star_target_cents = 1 where id = private.auth_org_id();
+  assert (select north_star_target_cents from public.organisations) = 100000000000::bigint * 90 * 100, 'north star cannot drift from USD target';
   insert into public.tasks (organisation_id, title, owner, external_ref) values (private.auth_org_id(), 'Place order BOT1', 'founder', 'buyontime:BOT1');
   begin
     insert into public.tasks (organisation_id, title, owner, external_ref) values (private.auth_org_id(), 'dup', 'founder', 'buyontime:BOT1');

@@ -47,6 +47,12 @@ Setup:
    - Google's terms limit how long Places data may be cached; leads keep the Google place ID so details can be refreshed.
 4. To refresh the library from upstream: `git clone --depth 1 https://github.com/msitarzewski/agency-agents /tmp/aa && node scripts/import-agency-agents.mjs /tmp/aa`.
 
+## Board Room & $100B North Star
+1. Apply `supabase/migrations/20261102000100_board_of_directors.sql` after the agency toolkit migration. It adds the Legal Head (Themis), board meeting tables, and sets every organisation's North Star to **$100 billion**.
+2. The North Star is stored in US$ (`north_star_usd`) with your dollar rate (`usd_inr_rate`, default ₹95/$). The database converts it to rupees automatically; change both on **My Desk → Company goals**.
+3. The ₹80,000 profit gate is unchanged: no paid tools or upgrades until net profit crosses it.
+4. Board meetings run several AI calls in a row (1–4 min). If the time limit is hit, press **Continue meeting** — nobody speaks twice.
+
 ## Local development
 ```bash
 cp .env.example .env.local      # fill Supabase URL + publishable key

@@ -38,7 +38,12 @@ export interface Profile {
   role: AppRole;
 }
 
-export interface Organisation { id: string; name: string; created_at: string; north_star_target_cents?: number; upgrade_profit_gate_cents?: number }
+export interface Organisation {
+  id: string; name: string; created_at: string;
+  /** INR paise, derived in the database from north_star_usd × usd_inr_rate. */
+  north_star_target_cents?: number; upgrade_profit_gate_cents?: number;
+  north_star_usd?: number; usd_inr_rate?: number;
+}
 export const FOUNDER_TASK_TYPES = ["call", "meeting", "order", "physical", "other"] as const;
 export interface Department { id: string; name: string; description: string | null }
 
@@ -182,3 +187,10 @@ export interface RankKeyword {
   place_address: string | null; active: boolean; last_position: number | null; last_checked_at: string | null; last_error: string | null; created_at: string;
 }
 export interface RankCheck { id: string; keyword_id: string; position: number | null; scanned: number; checked_at: string }
+
+/** Board meetings: the Founder sets a topic, each C-suite member speaks, the CEO closes with a plan. */
+export interface BoardMeeting {
+  id: string; organisation_id: string; topic: string; status: "in_progress" | "done" | "failed"; summary: string | null;
+  plan_execution_id: string | null; error: string | null; created_at: string;
+}
+export interface BoardMessage { id: string; meeting_id: string; seq: number; agent_id: string | null; speaker: string; body: string; failed: boolean; created_at: string }

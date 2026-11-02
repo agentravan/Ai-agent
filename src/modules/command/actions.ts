@@ -4,38 +4,14 @@ import { parseForm, commandSchema, idSchema } from "@/lib/validation/forms";
 import { must, runAction, UserFacingError } from "@/lib/utilities/action";
 import { requireContext } from "@/modules/auth/session";
 import { logEvent } from "@/modules/audit/service";
-import { applyPlan, type StepOutcome } from "@/modules/orchestration/apply";
-import type { AppContext } from "@/modules/auth/session";
-import { companySnapshot, listAgents, loadAgentByTier, runAgent } from "@/modules/orchestration/engine";
-import { parsePlan, PLAN_FORMAT_INSTRUCTIONS, planSchema } from "@/modules/orchestration/plan";
-import type { Execution, Kra } from "@/types/domain";
-
-const listKras = async (ctx: Awaited<ReturnType<typeof requireContext>>) =>
-  (await ctx.db.from("kras").select("id, name, description, business_unit_id").eq("organisation_id", ctx.organisation.id).order("name").returns<Kra[]>()).data ?? [];
+import { applyPlanOnce, describeOutcomes, listKras } from "@/modules/orchestration/apply-once";
+import { listAgents, loadAgentByTier, runAgent } from "@/modules/orchestration/engine";
+import { parsePlan, PLAN_FORMAT_INSTRUCTIONS } from "@/modules/orchestration/plan";
+import type { Execution } from "@/types/domain";
 
 const backTo = (form: FormData) => (form.get("return_to") === "/ceo" ? "/ceo" : "/command");
-
-/** Claims a plan exactly once and runs every step through governance. */
-async function applyOnce(ctx: AppContext, exec: Execution): Promise<StepOutcome[] | null> {
-  const plan = planSchema.safeParse(exec.plan);
-  if (exec.status !== "succeeded" || exec.kind !== "command" || !plan.success) throw new UserFacingError("This execution has no executable plan");
-  const claimed = await ctx.db.from("agent_executions")
-    .update({ plan: { ...plan.data, applied_at: new Date().toISOString(), applied_by: ctx.userId } })
-    .eq("id", exec.id).eq("organisation_id", ctx.organisation.id).is("plan->>applied_at", null).select("id");
-  if (!claimed.data?.length) return null;
-  const [ceo, agents, kras, company] = await Promise.all([loadAgentByTier(ctx, "ceo"), listAgents(ctx), listKras(ctx), companySnapshot(ctx)]);
-  const actor = agents.find((a) => a.id === exec.agent_id) ?? ceo;
-  if (!actor) throw new UserFacingError("Planning agent no longer exists");
-  const outcomes = await applyPlan(ctx, plan.data, actor, { agents, kras, netProfitCents: company.netProfitCents, upgradeGateCents: company.gateCents }, exec.id);
-  await ctx.db.from("agent_executions").update({ plan: { ...plan.data, applied_at: new Date().toISOString(), applied_by: ctx.userId, outcomes } }).eq("id", exec.id).eq("organisation_id", ctx.organisation.id);
-  await logEvent(ctx, { action: "command.plan_executed", entity: "agent_executions", entityId: exec.id, metadata: { outcomes } });
-  return outcomes;
-}
-
-const describe = (o: StepOutcome[]) => {
-  const n = (k: string) => o.filter((x) => x.outcome === k).length;
-  return `${n("executed")} set up${n("approval") ? `, ${n("approval")} waiting for your approval` : ""}${n("denied") ? `, ${n("denied")} blocked` : ""}`;
-};
+const applyOnce = applyPlanOnce;
+const describe = describeOutcomes;
 
 /** Founder instruction → Atlas plans → safe steps are executed immediately (risky ones go to Approvals). */
 export async function issueCommandAction(form: FormData) {

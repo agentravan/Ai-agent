@@ -10,23 +10,34 @@ import type { AgentWithPermissions, Execution } from "@/types/domain";
 import { checkAgentCanRun, checkCostLimit, monthStartIso, STALE_EXECUTION_MS } from "./policy";
 import { growthStage, upgradeUnlocked } from "@/modules/cockpit/metrics";
 import { formatInr } from "@/lib/utilities/format";
+import { MISSION, northStarLabel } from "./mission";
 
-export interface CompanySnapshot { netProfitCents: number; northStarCents: number; gateCents: number }
+export interface CompanySnapshot { netProfitCents: number; northStarCents: number; gateCents: number; northStarUsd: number; usdInrRate: number }
 
 /** Where the company stands against its North Star (used by every agent and by the funding gate). */
 export async function companySnapshot(ctx: AppContext): Promise<CompanySnapshot> {
+  type OrgGoals = { north_star_target_cents: number; upgrade_profit_gate_cents: number; north_star_usd: number; usd_inr_rate: number };
   const [{ data: org }, { data: money }] = await Promise.all([
-    ctx.db.from("organisations").select("north_star_target_cents, upgrade_profit_gate_cents").eq("id", ctx.organisation.id).maybeSingle<{ north_star_target_cents: number; upgrade_profit_gate_cents: number }>(),
+    ctx.db.from("organisations").select("north_star_target_cents, upgrade_profit_gate_cents, north_star_usd, usd_inr_rate").eq("id", ctx.organisation.id).maybeSingle<OrgGoals>(),
     ctx.db.from("financial_records").select("kind, amount_cents").eq("organisation_id", ctx.organisation.id).limit(20000).returns<{ kind: string; amount_cents: number }[]>(),
   ]);
   const net = (money ?? []).reduce((s, r) => s + (r.kind === "income" ? 1 : -1) * Number(r.amount_cents), 0);
-  return { netProfitCents: net, northStarCents: Number(org?.north_star_target_cents ?? 100_000_000_000_000), gateCents: Number(org?.upgrade_profit_gate_cents ?? 8_000_000) };
+  const northStarUsd = Number(org?.north_star_usd ?? 100_000_000_000);
+  const usdInrRate = Number(org?.usd_inr_rate ?? 95);
+  return {
+    netProfitCents: net,
+    northStarCents: Number(org?.north_star_target_cents ?? Math.round(northStarUsd * usdInrRate * 100)),
+    gateCents: Number(org?.upgrade_profit_gate_cents ?? 8_000_000),
+    northStarUsd,
+    usdInrRate,
+  };
 }
 
 function goalBriefing(c: CompanySnapshot): string {
   const g = growthStage(c.netProfitCents, c.northStarCents);
   const unlocked = upgradeUnlocked(c.netProfitCents, c.gateCents);
-  return `Company North Star: ${formatInr(c.northStarCents)} (₹1,00,000 crore). Net profit so far: ${formatInr(c.netProfitCents)}.
+  return `${MISSION}
+Company North Star: ${northStarLabel(c.northStarUsd, c.usdInrRate, c.northStarCents)}. Net profit so far: ${formatInr(c.netProfitCents)}.
 Next milestone: ${g.next ? `${g.next.label} (${g.pctToNext}% of the way)` : "North Star reached"}. Every plan must move us to the next milestone fastest, using the AI workforce.
 Spending rule: ${unlocked ? `the ${formatInr(c.gateCents)} profit gate is crossed — the CFO may propose funding for system upgrades via Founder approval, with expected return.` : `no paid upgrades, tools or spending until net profit reaches ${formatInr(c.gateCents)}; grow with free methods only.`}`;
 }

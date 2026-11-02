@@ -114,7 +114,8 @@ export const MILESTONES: { label: string; cents: number }[] = [
   { label: "₹100 crore", cents: 100_000_000_000 },
   { label: "₹1,000 crore", cents: 1_000_000_000_000 },
   { label: "₹10,000 crore", cents: 10_000_000_000_000 },
-  { label: "₹1,00,000 crore — North Star", cents: 100_000_000_000_000 },
+  { label: "₹1 lakh crore", cents: 100_000_000_000_000 },
+  { label: "₹5 lakh crore", cents: 500_000_000_000_000 },
 ];
 
 export interface GrowthStage {
@@ -124,8 +125,13 @@ export interface GrowthStage {
   pctOfNorthStar: number;   // linear % of the North Star (very small for a long time — shown with decimals)
 }
 
-export function growthStage(netProfitCents: number, northStarCents = MILESTONES.at(-1)!.cents): GrowthStage {
-  const ladder = MILESTONES.filter((m) => m.cents <= northStarCents);
+/** Milestones below the North Star, ending with the North Star itself. */
+export function northStarLadder(northStarCents: number, northStarLabel = "North Star"): { label: string; cents: number }[] {
+  return [...MILESTONES.filter((m) => m.cents < northStarCents), { label: northStarLabel, cents: northStarCents }];
+}
+
+export function growthStage(netProfitCents: number, northStarCents = 100_000_000_000_000, northStarLabel?: string): GrowthStage {
+  const ladder = northStarLadder(northStarCents, northStarLabel);
   const value = Math.max(0, netProfitCents);
   let reached = -1;
   ladder.forEach((m, i) => { if (value >= m.cents) reached = i; });
