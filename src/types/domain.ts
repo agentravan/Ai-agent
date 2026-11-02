@@ -38,7 +38,12 @@ export interface Profile {
   role: AppRole;
 }
 
-export interface Organisation { id: string; name: string; created_at: string; north_star_target_cents?: number; upgrade_profit_gate_cents?: number }
+export interface Organisation {
+  id: string; name: string; created_at: string;
+  /** INR paise, derived in the database from north_star_usd × usd_inr_rate. */
+  north_star_target_cents?: number; upgrade_profit_gate_cents?: number;
+  north_star_usd?: number; usd_inr_rate?: number;
+}
 export const FOUNDER_TASK_TYPES = ["call", "meeting", "order", "physical", "other"] as const;
 export interface Department { id: string; name: string; description: string | null }
 
@@ -54,6 +59,8 @@ export interface Agent {
   status: AgentStatus;
   business_unit_id: string | null;
   monthly_cost_limit_cents: number;
+  /** Set when hired from the Agency Agents library. */
+  template_slug?: string | null;
   created_at: string;
 }
 
@@ -165,3 +172,41 @@ export interface FinancialRecord {
 }
 export interface Budget { id: string; name: string; department_id: string | null; period_start: string; period_end: string; amount_cents: number; currency: string }
 export interface Client { id: string; name: string; status: "lead" | "active" | "churned"; business_unit_id: string | null }
+
+/** LinkedIn content desk drafts (the Founder posts approved text by hand). */
+export const LINKEDIN_KINDS = ["post", "comment_reply", "dm_reply"] as const;
+export type LinkedinKind = (typeof LINKEDIN_KINDS)[number];
+export interface LinkedinDraft {
+  id: string; organisation_id: string; kind: LinkedinKind; brief: string; context: string | null; body: string | null;
+  status: "draft" | "approved" | "posted" | "discarded"; agent_id: string | null; posted_at: string | null; created_at: string;
+}
+
+/** Local rank tracker: where a business ranks on Google for a keyword. */
+export interface RankKeyword {
+  id: string; organisation_id: string; keyword: string; business: string; place_id: string | null; place_name: string | null;
+  place_address: string | null; active: boolean; last_position: number | null; last_checked_at: string | null; last_error: string | null; created_at: string;
+}
+export interface RankCheck { id: string; keyword_id: string; position: number | null; scanned: number; checked_at: string }
+
+/** Meetings: board (C-suite), team (a leader and their reports), daily morning / evening stand-ups. */
+export const MEETING_KINDS = ["board", "team", "morning", "evening"] as const;
+export type MeetingKind = (typeof MEETING_KINDS)[number];
+export interface Mom {
+  summary: string;
+  decisions: string[];
+  action_items: { owner: string; task: string; due: string; needs_approval: boolean }[];
+  risks: string[];
+  opportunities: string[];
+  follow_ups: string[];
+  next_agenda: string[];
+}
+export interface BoardMeeting {
+  id: string; organisation_id: string; topic: string; status: "in_progress" | "done" | "failed"; summary: string | null;
+  plan_execution_id: string | null; error: string | null; created_at: string;
+  kind: MeetingKind; host_agent_id: string | null; participant_ids: string[]; meeting_date: string | null;
+  mom: Mom | null; mom_execution_id: string | null; mom_emailed_at: string | null; ended_at: string | null;
+}
+export interface BoardMessage {
+  id: string; meeting_id: string; seq: number; agent_id: string | null; speaker: string; body: string; failed: boolean;
+  role: "member" | "founder" | "scribe" | "system"; created_at: string;
+}

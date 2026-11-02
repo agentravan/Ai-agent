@@ -1,5 +1,6 @@
 import "server-only";
-import { discoverBusinesses, LEAD_CATEGORIES, type LeadCategory } from "@/lib/integrations/osm";
+import { discoverGooglePlaces, googlePlacesConfigured } from "@/lib/integrations/google-places";
+import { discoverBusinesses, LEAD_CATEGORIES, type DiscoveredLead, type LeadCategory } from "@/lib/integrations/osm";
 import { agentHas } from "@/lib/permissions";
 import { UserFacingError } from "@/lib/utilities/action";
 import { logEvent } from "@/modules/audit/service";
@@ -34,10 +35,28 @@ async function salesUnitId(ctx: AppContext): Promise<string | null> {
   return data?.id ?? null;
 }
 
+export type LeadSource = "google_places" | "openstreetmap";
+
+/**
+ * Google Places when a key is configured (better phone coverage), otherwise OpenStreetMap (₹0).
+ * If Google fails (quota, billing, key), the hunt still runs on OpenStreetMap and the reason is reported.
+ */
+async function findBusinesses(category: LeadCategory, city: string, country: string): Promise<{ leads: DiscoveredLead[]; area: string; source: LeadSource; note?: string }> {
+  if (googlePlacesConfigured()) {
+    try {
+      return { ...(await discoverGooglePlaces(LEAD_CATEGORIES[category].search, city, country)), source: "google_places" };
+    } catch (err) {
+      const note = `Google Places failed (${(err as Error).message}); used OpenStreetMap instead`;
+      return { ...(await discoverBusinesses(category, city, country)), source: "openstreetmap", note };
+    }
+  }
+  return { ...(await discoverBusinesses(category, city, country)), source: "openstreetmap" };
+}
+
 /** Finds real businesses for a target and stores the best-fitting new ones as leads (deduplicated). */
-export async function discoverForTarget(ctx: AppContext, target: Target, max = 25): Promise<{ found: number; added: number; area: string }> {
+export async function discoverForTarget(ctx: AppContext, target: Target, max = 25): Promise<{ found: number; added: number; area: string; source: LeadSource; note?: string }> {
   if (!(target.category in LEAD_CATEGORIES)) throw new UserFacingError(`Unknown category "${target.category}"`);
-  const { leads, area } = await discoverBusinesses(target.category as LeadCategory, target.city, target.country);
+  const { leads, area, source, note } = await findBusinesses(target.category as LeadCategory, target.city, target.country);
   const unitId = await salesUnitId(ctx);
   const candidates = leads
     .map((l) => ({ l, score: scoreLead({ ...l, category: target.category, city: target.city }, target.offer) }))
@@ -56,7 +75,7 @@ export async function discoverForTarget(ctx: AppContext, target: Target, max = 2
         candidates.map(({ l, score }) => ({
           organisation_id: ctx.organisation.id, target_id: target.id, business_unit_id: unitId, name: l.name, category: target.category,
           city: target.city, country: target.country, address: l.address, phone: l.phone, email: l.email, website: l.website,
-          instagram: l.instagram, source: "openstreetmap", source_ref: l.sourceRef, score,
+          instagram: l.instagram, source, source_ref: l.sourceRef, score,
         })),
         { onConflict: "organisation_id,source,source_ref", ignoreDuplicates: true },
       )
@@ -65,8 +84,8 @@ export async function discoverForTarget(ctx: AppContext, target: Target, max = 2
     added = data?.length ?? 0;
   }
   await ctx.db.from("prospect_targets").update({ last_run_at: new Date().toISOString() }).eq("id", target.id).eq("organisation_id", ctx.organisation.id);
-  await logEvent(ctx, { action: "sales.leads_discovered", entity: "prospect_targets", entityId: target.id, actorType: "agent", metadata: { found: leads.length, added, area } });
-  return { found: leads.length, added, area };
+  await logEvent(ctx, { action: "sales.leads_discovered", entity: "prospect_targets", entityId: target.id, actorType: "agent", metadata: { found: leads.length, added, area, source, ...(note ? { note } : {}) } });
+  return { found: leads.length, added, area, source, note };
 }
 
 /** AI qualification: decides pitch/skip with reasons and drafts messages, using what past outcomes taught. */
@@ -130,7 +149,7 @@ export async function runProspectingCycle(ctx: AppContext, maxTargets = 2): Prom
   for (const t of targets ?? []) {
     try {
       const r = await discoverForTarget(ctx, t);
-      parts.push(`${LEAD_CATEGORIES[t.category as LeadCategory]?.label ?? t.category} in ${t.city}: ${r.added} new of ${r.found} found`);
+      parts.push(`${LEAD_CATEGORIES[t.category as LeadCategory]?.label ?? t.category} in ${t.city}: ${r.added} new of ${r.found} found${r.note ? ` (${r.note})` : ""}`);
     } catch (err) {
       parts.push(`${t.category} in ${t.city}: ${(err as Error).message}`);
     }

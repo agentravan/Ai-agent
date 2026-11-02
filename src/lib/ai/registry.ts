@@ -4,12 +4,30 @@ import { ollamaProvider } from "./providers/ollama";
 import { openAiCompatibleProvider } from "./providers/openai-compatible";
 import type { AiProvider, ProviderId } from "./types";
 
+/** Backup models for the OpenAI-compatible endpoint (deduplicated, max 3, never the main model). */
+export function fallbackModels(e: Env = defaultEnv): string[] {
+  const list = (e.OPENAI_COMPATIBLE_FALLBACK_MODELS ?? "").split(",").map((m) => m.trim()).filter(Boolean);
+  return [...new Set(list)].filter((m) => m !== e.OPENAI_COMPATIBLE_MODEL).slice(0, 3);
+}
+
+/** Backup OpenAI-compatible services on other endpoints (AI_BACKUP_1_*, AI_BACKUP_2_*), in order. */
+export function backupServices(e: Env = defaultEnv): { baseUrl: string; model: string; apiKey: string | undefined }[] {
+  const slots = [
+    { baseUrl: e.AI_BACKUP_1_BASE_URL, model: e.AI_BACKUP_1_MODEL, apiKey: e.AI_BACKUP_1_API_KEY },
+    { baseUrl: e.AI_BACKUP_2_BASE_URL, model: e.AI_BACKUP_2_MODEL, apiKey: e.AI_BACKUP_2_API_KEY },
+  ];
+  return slots.flatMap((b) => (b.baseUrl && b.model ? [{ baseUrl: b.baseUrl, model: b.model, apiKey: b.apiKey }] : []));
+}
+
 /** All providers that have the configuration they need, in preference order (free first). */
 export function configuredProviders(e: Env = defaultEnv): AiProvider[] {
   const list: AiProvider[] = [];
   if (e.OLLAMA_BASE_URL) list.push(ollamaProvider(e.OLLAMA_BASE_URL, e.OLLAMA_MODEL));
   if (e.OPENAI_COMPATIBLE_BASE_URL && e.OPENAI_COMPATIBLE_MODEL)
     list.push(openAiCompatibleProvider(e.OPENAI_COMPATIBLE_BASE_URL, e.OPENAI_COMPATIBLE_MODEL, e.OPENAI_COMPATIBLE_API_KEY));
+  if (e.OPENAI_COMPATIBLE_BASE_URL)
+    for (const model of fallbackModels(e)) list.push(openAiCompatibleProvider(e.OPENAI_COMPATIBLE_BASE_URL, model, e.OPENAI_COMPATIBLE_API_KEY));
+  for (const b of backupServices(e)) list.push(openAiCompatibleProvider(b.baseUrl, b.model, b.apiKey));
   if (e.ANTHROPIC_API_KEY) list.push(anthropicProvider(e.ANTHROPIC_API_KEY, e.ANTHROPIC_MODEL));
   return list;
 }
@@ -19,6 +37,20 @@ export function activeProvider(e: Env = defaultEnv): AiProvider | null {
   const list = configuredProviders(e);
   if (e.AI_PROVIDER) return list.find((p) => p.id === e.AI_PROVIDER) ?? null;
   return list[0] ?? null;
+}
+
+/**
+ * Providers to try in order when running an agent: the active one first, then the other configured
+ * providers allowed by AI_FALLBACK. Anthropic (paid) is only a fallback when AI_FALLBACK="all".
+ */
+export function providerChain(e: Env = defaultEnv): AiProvider[] {
+  const list = configuredProviders(e);
+  // Same selection rule as activeProvider, on this one list so backups can be compared by identity.
+  const primary = e.AI_PROVIDER ? list.find((p) => p.id === e.AI_PROVIDER) : list[0];
+  if (!primary) return [];
+  if (e.AI_FALLBACK === "off") return [primary];
+  const backups = list.filter((p) => p !== primary && (e.AI_FALLBACK === "all" || p.id !== "anthropic"));
+  return [primary, ...backups];
 }
 
 export interface AiStatus {

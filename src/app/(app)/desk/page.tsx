@@ -3,9 +3,9 @@ import { CheckCircle2, Circle, Lock, LockOpen, MessageCircle, Phone, ShoppingCar
 import { Badge, Card, Empty, Field, Flash, PageHeader, Select, Stat, type SearchParams } from "@/components/ui";
 import { SubmitButton } from "@/components/ui/submit-button";
 import { can } from "@/lib/permissions";
-import { formatDateTime, formatInr } from "@/lib/utilities/format";
+import { formatDateTime, formatInr, formatInrCompact, formatUsdCompact } from "@/lib/utilities/format";
 import { requireContext } from "@/modules/auth/session";
-import { growthStage, MILESTONES, upgradeUnlocked } from "@/modules/cockpit/metrics";
+import { growthStage, northStarLadder, upgradeUnlocked } from "@/modules/cockpit/metrics";
 import { addFounderTaskAction, setFounderTaskStatusAction, updateGoalsAction } from "@/modules/desk/actions";
 import { companySnapshot } from "@/modules/orchestration/engine";
 import { whatsappLink } from "@/modules/sales/logic";
@@ -44,7 +44,8 @@ export default async function DeskPage({ searchParams }: { searchParams: SearchP
   const waContacts = waRows ?? [];
   const [income, clients, leads, aiDone, activeProjects] = counts;
   const revenue = (income.data ?? []).reduce((s, r) => s + Number(r.amount_cents), 0);
-  const stage = growthStage(company.netProfitCents, company.northStarCents);
+  const northStarName = `${formatUsdCompact(company.northStarUsd)} — North Star`;
+  const stage = growthStage(company.netProfitCents, company.northStarCents, northStarName);
   const unlocked = upgradeUnlocked(company.netProfitCents, company.gateCents);
   const all = mine ?? [];
   const open = all.filter((t) => ["todo", "in_progress", "blocked"].includes(t.status))
@@ -63,7 +64,8 @@ export default async function DeskPage({ searchParams }: { searchParams: SearchP
         <div className="pointer-events-none absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-gold/50 to-transparent" aria-hidden />
         <div className="flex flex-col gap-6 lg:flex-row">
           <div className="flex-1">
-            <p className="text-[11px] font-semibold tracking-[0.18em] text-gold uppercase">Road to ₹1,00,000 crore</p>
+            <p className="text-[11px] font-semibold tracking-[0.18em] text-gold uppercase">Road to {formatUsdCompact(company.northStarUsd)}</p>
+            <p className="mt-0.5 text-xs text-zinc-500">≈ {formatInrCompact(company.northStarCents)} at ₹{company.usdInrRate}/$</p>
             <div className="num mt-3 text-3xl font-semibold text-zinc-50">{formatInr(company.netProfitCents)}</div>
             <p className="text-sm text-zinc-400">net profit earned so far</p>
             {stage.next && (
@@ -79,7 +81,7 @@ export default async function DeskPage({ searchParams }: { searchParams: SearchP
             </div>
           </div>
           <ol className="w-full space-y-1.5 lg:w-80">
-            {MILESTONES.filter((m) => m.cents <= company.northStarCents).map((m, i) => {
+            {northStarLadder(company.northStarCents, northStarName).map((m, i) => {
               const reached = i <= stage.reached;
               const current = i === stage.reached + 1;
               return (
@@ -197,7 +199,8 @@ export default async function DeskPage({ searchParams }: { searchParams: SearchP
           {isFounder && (
             <Card title="Company goals" description="Every AI employee plans against these">
               <form action={updateGoalsAction} className="grid gap-3">
-                <Field label="North Star (₹ crore)"><input name="north_star_crore" type="number" min="1" step="any" defaultValue={company.northStarCents / 1e9} className="input" /></Field>
+                <Field label="North Star (US$ billion)"><input name="north_star_usd_billion" type="number" min="0.000000001" max="500" step="any" defaultValue={company.northStarUsd / 1e9} className="input" /></Field>
+                <Field label="Dollar rate (₹ per 1 US$)" hint="Used to convert the North Star into rupees; update it now and then"><input name="usd_inr_rate" type="number" min="1" max="150" step="0.01" defaultValue={company.usdInrRate} className="input" /></Field>
                 <Field label="Profit before paid upgrades (₹)"><input name="gate_inr" type="number" min="0" step="1" defaultValue={company.gateCents / 100} className="input" /></Field>
                 <div><SubmitButton variant="ghost">Save goals</SubmitButton></div>
               </form>

@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
-  BadgeCheck, Bot, Briefcase, Building2, ClipboardCheck, Crown, Gauge, Megaphone, ShoppingBag, Lightbulb, type LucideIcon, ScrollText, Settings, Target, Terminal, Wallet, Workflow,
+  BadgeCheck, Bot, Briefcase, Building2, ClipboardCheck, Crown, Gauge, Landmark, Megaphone, Scale, MessageSquareText, ShoppingBag, Lightbulb, type LucideIcon, ScrollText, Settings, Target, Terminal, TrendingUp, Wallet, Workflow,
 } from "lucide-react";
 import { cn } from "@/lib/utilities/format";
 
@@ -17,11 +17,15 @@ export const NAV_GROUPS: { label: string; items: Item[] }[] = [
     { href: "/command", label: "Empire Command", icon: Terminal },
   ] },
   { label: "Executive Office", items: [
+    { href: "/board", label: "Board Room", icon: Landmark },
+    { href: "/court", label: "Idea Court", icon: Scale },
     { href: "/ceo", label: "CEO Office", icon: Crown },
     { href: "/coo", label: "COO Office", icon: Workflow },
   ] },
   { label: "Operations", items: [
     { href: "/sales", label: "Sales Engine", icon: Megaphone },
+    { href: "/linkedin", label: "LinkedIn Desk", icon: MessageSquareText },
+    { href: "/rank", label: "Rank Tracker", icon: TrendingUp },
     { href: "/buyontime", label: "Buyontime", icon: ShoppingBag },
     { href: "/projects", label: "Projects & Tasks", icon: Briefcase },
     { href: "/workforce", label: "Agent Registry", icon: Bot },

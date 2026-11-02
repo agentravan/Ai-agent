@@ -58,12 +58,12 @@ export async function runTask(ctx: AppContext, task: Task): Promise<TaskRunResul
 const PRIORITY_RANK = { critical: 0, high: 1, medium: 2, low: 3 } as const;
 
 /** Picks the next task that can run now: assigned to an active agent, not started, all dependencies done. */
-export async function nextReadyTask(ctx: AppContext, projectId?: string): Promise<Task | null> {
+export async function nextReadyTask(ctx: AppContext, projectId?: string, exclude?: ReadonlySet<string>): Promise<Task | null> {
   let q = ctx.db.from("tasks").select("*, agents!tasks_organisation_id_assigned_agent_id_fkey(status)").eq("organisation_id", ctx.organisation.id)
     .eq("status", "todo").not("assigned_agent_id", "is", null).order("created_at").limit(100);
   if (projectId) q = q.eq("project_id", projectId);
   const { data } = await q.returns<(Task & { agents: { status: string } | null })[]>();
-  const candidates = (data ?? []).filter((t) => t.agents?.status === "active")
+  const candidates = (data ?? []).filter((t) => t.agents?.status === "active" && !exclude?.has(t.id))
     .sort((a, b) => PRIORITY_RANK[a.priority] - PRIORITY_RANK[b.priority] || a.created_at.localeCompare(b.created_at));
   for (const t of candidates) {
     if (checkTaskRunnable(t.status, await dependencyStatuses(ctx, t.id)).ok) {
@@ -78,10 +78,14 @@ export async function nextReadyTask(ctx: AppContext, projectId?: string): Promis
 export async function runReadyTasks(ctx: AppContext, budgetMs: number, projectId?: string, worstCaseTaskMs = 130_000): Promise<TaskRunResult[]> {
   const started = Date.now();
   const results: TaskRunResult[] = [];
+  // Each task is attempted at most once per cycle: a task that fails fast (e.g. cost limit) goes back to "todo",
+  // and without this it would be picked again and again until the budget ran out.
+  const tried = new Set<string>();
   // Only start a task if a slow run can still finish inside the budget.
   while (Date.now() - started + worstCaseTaskMs <= budgetMs) {
-    const task = await nextReadyTask(ctx, projectId);
+    const task = await nextReadyTask(ctx, projectId, tried);
     if (!task) break;
+    tried.add(task.id);
     results.push(await runTask(ctx, task).catch((err: Error) => ({ taskId: task.id, title: task.title, agent: "?", ok: false, message: err.message })));
   }
   return results;

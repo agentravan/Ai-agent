@@ -1,7 +1,7 @@
 import "server-only";
-import { activeProvider, estimateCostCents } from "@/lib/ai/registry";
+import { estimateCostCents, providerChain } from "@/lib/ai/registry";
 import { withRetry } from "@/lib/ai/retry";
-import { AiUnavailableError } from "@/lib/ai/types";
+import { AiError, AiUnavailableError, type AiProvider, type GenerateResult } from "@/lib/ai/types";
 import { env } from "@/lib/env";
 import { UserFacingError, must } from "@/lib/utilities/action";
 import { logEvent } from "@/modules/audit/service";
@@ -10,23 +10,34 @@ import type { AgentWithPermissions, Execution } from "@/types/domain";
 import { checkAgentCanRun, checkCostLimit, monthStartIso, STALE_EXECUTION_MS } from "./policy";
 import { growthStage, upgradeUnlocked } from "@/modules/cockpit/metrics";
 import { formatInr } from "@/lib/utilities/format";
+import { MISSION, northStarLabel } from "./mission";
 
-export interface CompanySnapshot { netProfitCents: number; northStarCents: number; gateCents: number }
+export interface CompanySnapshot { netProfitCents: number; northStarCents: number; gateCents: number; northStarUsd: number; usdInrRate: number }
 
 /** Where the company stands against its North Star (used by every agent and by the funding gate). */
 export async function companySnapshot(ctx: AppContext): Promise<CompanySnapshot> {
+  type OrgGoals = { north_star_target_cents: number; upgrade_profit_gate_cents: number; north_star_usd: number; usd_inr_rate: number };
   const [{ data: org }, { data: money }] = await Promise.all([
-    ctx.db.from("organisations").select("north_star_target_cents, upgrade_profit_gate_cents").eq("id", ctx.organisation.id).maybeSingle<{ north_star_target_cents: number; upgrade_profit_gate_cents: number }>(),
+    ctx.db.from("organisations").select("north_star_target_cents, upgrade_profit_gate_cents, north_star_usd, usd_inr_rate").eq("id", ctx.organisation.id).maybeSingle<OrgGoals>(),
     ctx.db.from("financial_records").select("kind, amount_cents").eq("organisation_id", ctx.organisation.id).limit(20000).returns<{ kind: string; amount_cents: number }[]>(),
   ]);
   const net = (money ?? []).reduce((s, r) => s + (r.kind === "income" ? 1 : -1) * Number(r.amount_cents), 0);
-  return { netProfitCents: net, northStarCents: Number(org?.north_star_target_cents ?? 100_000_000_000_000), gateCents: Number(org?.upgrade_profit_gate_cents ?? 8_000_000) };
+  const northStarUsd = Number(org?.north_star_usd ?? 100_000_000_000);
+  const usdInrRate = Number(org?.usd_inr_rate ?? 95);
+  return {
+    netProfitCents: net,
+    northStarCents: Number(org?.north_star_target_cents ?? Math.round(northStarUsd * usdInrRate * 100)),
+    gateCents: Number(org?.upgrade_profit_gate_cents ?? 8_000_000),
+    northStarUsd,
+    usdInrRate,
+  };
 }
 
 function goalBriefing(c: CompanySnapshot): string {
   const g = growthStage(c.netProfitCents, c.northStarCents);
   const unlocked = upgradeUnlocked(c.netProfitCents, c.gateCents);
-  return `Company North Star: ${formatInr(c.northStarCents)} (₹1,00,000 crore). Net profit so far: ${formatInr(c.netProfitCents)}.
+  return `${MISSION}
+Company North Star: ${northStarLabel(c.northStarUsd, c.usdInrRate, c.northStarCents)}. Net profit so far: ${formatInr(c.netProfitCents)}.
 Next milestone: ${g.next ? `${g.next.label} (${g.pctToNext}% of the way)` : "North Star reached"}. Every plan must move us to the next milestone fastest, using the AI workforce.
 Spending rule: ${unlocked ? `the ${formatInr(c.gateCents)} profit gate is crossed — the CFO may propose funding for system upgrades via Founder approval, with expected return.` : `no paid upgrades, tools or spending until net profit reaches ${formatInr(c.gateCents)}; grow with free methods only.`}`;
 }
@@ -50,6 +61,8 @@ export interface RunOptions<T> {
   taskId?: string | null;
   json?: boolean;
   maxTokens?: number;
+  /** Optional tighter time limit for this run (e.g. one speaker in a multi-step board meeting). */
+  budgetMs?: number;
   /** Validates/parses output; throw a retryable AiError to make the model try again. */
   parse?: (text: string) => T;
 }
@@ -90,7 +103,10 @@ export async function runAgent<T = string>(ctx: AppContext, opts: RunOptions<T>)
   const runCheck = checkAgentCanRun(agent, perms);
   if (!runCheck.ok) throw new UserFacingError(`${agent.name}: ${runCheck.reason}`);
 
-  const provider = activeProvider();
+  // Main provider first, then configured backups (AI_FALLBACK). Backups get one attempt each so a
+  // failover still fits the serverless time limit.
+  const chain = providerChain();
+  const provider = chain[0];
   if (!provider) throw new AiUnavailableError();
 
   const providerIsFree = env.AI_COST_INPUT_CENTS_PER_MTOK === 0 && env.AI_COST_OUTPUT_CENTS_PER_MTOK === 0;
@@ -123,24 +139,53 @@ export async function runAgent<T = string>(ctx: AppContext, opts: RunOptions<T>)
     ctx.db.from("agent_executions").update(patch).eq("id", execution.id).eq("organisation_id", ctx.organisation.id).select("*").single<Execution>();
 
   try {
-    const { value, attempts } = await withRetry(
-      async () => {
-        const out = await provider.generate({
-          system,
-          prompt: opts.input,
-          json: opts.json,
-          maxTokens: opts.maxTokens ?? 1500,
-          signal: AbortSignal.timeout(env.AI_TIMEOUT_MS),
-        });
-        const parsed = opts.parse ? opts.parse(out.text) : (out.text as unknown as T);
-        return { out, parsed };
-      },
-      { attempts: env.AI_MAX_ATTEMPTS, onAttempt: async (attempts) => void (await update({ attempts })) },
-    );
+    let totalAttempts = 0;
+    let lastError: unknown;
+    // One run never outlives the serverless time limit: each attempt gets min(AI_TIMEOUT_MS, time left).
+    const deadline = Date.now() + Math.min(env.AI_RUN_BUDGET_MS, opts.budgetMs ?? Infinity);
+    const attemptTimeout = () => {
+      const left = deadline - Date.now();
+      if (left < 15_000) throw new AiError("AI took too long — out of time for this run; it will retry later", false);
+      return Math.min(env.AI_TIMEOUT_MS, left);
+    };
+    let done: { value: { out: GenerateResult; parsed: T }; used: AiProvider } | null = null;
+    for (const p of chain) {
+      if (p !== provider) {
+        console.warn("[ai] provider failed, failing over", { from: provider.id, to: p.id });
+        await update({ provider: p.id, model: p.model });
+      }
+      try {
+        const { value } = await withRetry(
+          async () => {
+            const out = await p.generate({
+              system,
+              prompt: opts.input,
+              json: opts.json,
+              maxTokens: opts.maxTokens ?? 1500,
+              signal: AbortSignal.timeout(attemptTimeout()),
+            });
+            // An empty answer is a failed attempt, never a finished task (free "thinking" models can spend all tokens reasoning).
+            if (!out.text.trim()) throw new AiError(`AI returned an empty answer${out.finishReason ? ` (stopped: ${out.finishReason})` : ""}`, true);
+            const parsed = opts.parse ? opts.parse(out.text) : (out.text as unknown as T);
+            return { out, parsed };
+          },
+          { attempts: p === provider ? env.AI_MAX_ATTEMPTS : 1, onAttempt: async () => void (await update({ attempts: ++totalAttempts })) },
+        );
+        done = { value, used: p };
+        break;
+      } catch (err) {
+        lastError = err;
+        if (deadline - Date.now() < 15_000) break;
+      }
+    }
+    if (!done) throw lastError;
+    const { value, used } = done;
     const final = must(
       await update({
         status: "succeeded",
-        attempts,
+        attempts: totalAttempts,
+        provider: used.id,
+        model: used.model,
         output: value.out.text,
         plan: opts.parse ? value.parsed : null,
         input_tokens: value.out.inputTokens,
@@ -149,7 +194,7 @@ export async function runAgent<T = string>(ctx: AppContext, opts: RunOptions<T>)
         finished_at: new Date().toISOString(),
       }),
     );
-    await logEvent(ctx, { action: "agent.execution_succeeded", entity: "agent_executions", entityId: final.id, actorType: "agent", metadata: { agent_id: agent.id, kind: opts.kind } });
+    await logEvent(ctx, { action: "agent.execution_succeeded", entity: "agent_executions", entityId: final.id, actorType: "agent", metadata: { agent_id: agent.id, kind: opts.kind, provider: used.id, ...(used !== provider ? { failed_over_from: provider.id } : {}) } });
     return { execution: final, result: value.parsed };
   } catch (err) {
     const message = (err as Error).message?.slice(0, 2000) || "Unknown error";

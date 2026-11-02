@@ -1,5 +1,5 @@
 import { AiStatusPanel } from "@/components/dashboard/ai-status";
-import { CommandCard } from "@/components/command/command-card";
+import { approvalRefs, CommandCard } from "@/components/command/command-card";
 import { Card, Empty, Flash, PageHeader, type SearchParams } from "@/components/ui";
 import { SubmitButton } from "@/components/ui/submit-button";
 import { aiStatus } from "@/lib/ai/registry";
@@ -24,6 +24,11 @@ export default async function CommandPage({ searchParams }: { searchParams: Sear
   const names = new Map(agents.map((a) => [a.id, a.name]));
   const canOperate = can(ctx.profile.role, "operate");
 
+  const refs = approvalRefs(commands ?? []);
+  const { data: decided } = refs.length
+    ? await ctx.db.from("approvals").select("id, status").eq("organisation_id", ctx.organisation.id).in("id", refs).returns<{ id: string; status: string }[]>()
+    : { data: [] as { id: string; status: string }[] };
+  const approvalStatus = Object.fromEntries((decided ?? []).map((a) => [a.id, a.status]));
   return (
     <>
       <PageHeader eyebrow="Overview" title="Empire Command" subtitle="Give an instruction in plain language. The AI CEO drafts a structured plan; you review it; governance decides what runs and what needs approval." />
@@ -44,7 +49,7 @@ export default async function CommandPage({ searchParams }: { searchParams: Sear
 
       <h2 className="mt-8 mb-3 text-sm font-semibold text-zinc-200">Instructions & what was set up</h2>
       {!commands?.length ? <Empty>No commands issued yet.</Empty> : (
-        <div className="space-y-4">{commands.map((c) => <CommandCard key={c.id} execution={c} agentName={names.get(c.agent_id ?? "") ?? "CEO"} canOperate={canOperate} returnTo="/command" />)}</div>
+        <div className="space-y-4">{commands.map((c) => <CommandCard key={c.id} execution={c} agentName={names.get(c.agent_id ?? "") ?? "CEO"} canOperate={canOperate} returnTo="/command" approvalStatus={approvalStatus} />)}</div>
       )}
     </>
   );

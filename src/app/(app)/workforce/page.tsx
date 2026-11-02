@@ -26,7 +26,8 @@ export default async function WorkforcePage({ searchParams }: { searchParams: Se
 
   return (
     <>
-      <PageHeader eyebrow="Operations" title="Agent Registry" subtitle="Your AI workforce: designations, instructions, departments, reporting lines, permissions and status." />
+      <PageHeader eyebrow="Operations" title="Agent Registry" subtitle="Your AI workforce: designations, instructions, departments, reporting lines, permissions and status."
+        action={<Link href="/workforce/library" className="btn-gold">Hire from Agent Library</Link>} />
       <Flash params={params} />
       <Card>
         <Table head={["Agent", "Tier", "Division · Unit", "Reports to", "Permissions", "Status", ""]}>

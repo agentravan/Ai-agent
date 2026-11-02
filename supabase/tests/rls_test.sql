@@ -6,13 +6,20 @@ insert into auth.users (id, email) values
 
 do $$ begin
   assert (select count(*) from public.organisations) = 2, 'one org per founder';
-  assert (select count(*) from public.agents) = 16, 'eight starter agents each (4 executives + 4 managers)';
+  assert (select count(*) from public.agents) = 22, 'eleven starter agents each (4 executives + Legal Head + 4 managers + Scribe + Nyaya)';
+  assert (select count(*) from public.agents where name = 'Nyaya') = 2, 'Idea Court seeded';
+  assert (select count(*) from public.agents where name = 'Scribe') = 2, 'Scribe seeded';
+  assert (select count(*) from public.agents where name = 'Themis' and tier = 'executive') = 2, 'Legal Head seeded';
+  assert (select bool_and(north_star_usd = 100000000000 and north_star_target_cents = 100000000000 * 95 * 100) from public.organisations), '$100B north star in INR paise';
   assert (select count(*) from public.business_units) = 8, 'four business units each';
   assert (select count(*) from public.kras) = 20, 'ten KRAs each';
   assert (select count(*) from public.business_units where manager_agent_id is null) = 0, 'every unit has a manager';
   perform private.seed_executive_office(id) from public.organisations;
   perform private.seed_sales_engine(id) from public.organisations;
-  assert (select count(*) from public.agents) = 16, 'seed is idempotent';
+  perform private.seed_board(id) from public.organisations;
+  perform private.seed_scribe(id) from public.organisations;
+  perform private.seed_court(id) from public.organisations;
+  assert (select count(*) from public.agents) = 22, 'seed is idempotent';
   assert (select count(*) from public.profiles where role = 'founder') = 2, 'founder role';
 end $$;
 
@@ -22,7 +29,7 @@ select set_config('request.jwt.claim.sub', '11111111-1111-1111-1111-111111111111
 do $$
 declare other_agent uuid; t1 uuid; t2 uuid; appr uuid;
 begin
-  assert (select count(*) from public.agents) = 8, 'RLS: sees only own agents';
+  assert (select count(*) from public.agents) = 11, 'RLS: sees only own agents';
   assert (select count(*) from public.kras) = 10, 'RLS: sees only own KRAs';
   assert (select count(*) from public.organisations) = 1, 'RLS: sees only own org';
 
@@ -67,7 +74,54 @@ begin
     values (private.auth_org_id(), 'bad', 'founder', (select id from public.agents limit 1));
     raise exception 'founder task with agent allowed';
   exception when check_violation then null; end;
-  assert (select north_star_target_cents from public.organisations) = 100000000000000, 'north star default';
+  assert (select north_star_usd from public.organisations) = 100000000000, 'north star default $100B';
+  -- Agency toolkit: Google Places leads, LinkedIn approval gate, rank tracker, content permission.
+  insert into public.leads (organisation_id, name, source, source_ref) values (private.auth_org_id(), 'Gym G', 'google_places', 'ChIJabc');
+  assert (select count(*) from public.agent_permissions p join public.agents a on a.id = p.agent_id
+           where a.name = 'Iris' and p.permission = 'content.draft') = 1, 'Iris can draft content';
+  insert into public.linkedin_drafts (organisation_id, kind, brief, body) values (private.auth_org_id(), 'post', 'Gym tips', 'Hello') returning id into t2;
+  begin
+    update public.linkedin_drafts set status = 'posted', posted_at = now() where id = t2;
+    raise exception 'posted without approval';
+  exception when check_violation then null; end;
+  update public.linkedin_drafts set status = 'approved', approved_by = auth.uid() where id = t2;
+  begin
+    update public.linkedin_drafts set body = 'Changed' where id = t2;
+    raise exception 'approved content edited';
+  exception when check_violation then null; end;
+  update public.linkedin_drafts set status = 'posted', posted_at = now() where id = t2;
+  insert into public.rank_keywords (organisation_id, keyword, business) values (private.auth_org_id(), 'best gym in mumbai', 'Gym G Bandra') returning id into t1;
+  insert into public.rank_checks (organisation_id, keyword_id, position, scanned) values (private.auth_org_id(), t1, 3, 60);
+  begin
+    insert into public.rank_checks (organisation_id, keyword_id, position) values (private.auth_org_id(), t1, 61);
+    raise exception 'rank position out of range allowed';
+  exception when check_violation then null; end;
+  -- Board meetings; the INR North Star follows the Founder's USD target and rate.
+  insert into public.board_meetings (organisation_id, topic, created_by) values (private.auth_org_id(), 'Phase 0 revenue', auth.uid()) returning id into t1;
+  insert into public.board_messages (organisation_id, meeting_id, seq, speaker, body) values (private.auth_org_id(), t1, 0, 'Atlas', 'Start with websites');
+  begin
+    insert into public.board_messages (organisation_id, meeting_id, seq, speaker, body) values (private.auth_org_id(), t1, 0, 'Orion', 'dup');
+    raise exception 'duplicate board message seq allowed';
+  exception when unique_violation then null; end;
+  insert into public.board_messages (organisation_id, meeting_id, seq, speaker, body, role) values (private.auth_org_id(), t1, 500, 'Founder', 'Price kya rakhein?', 'founder');
+  insert into public.board_meetings (organisation_id, topic, kind, meeting_date) values (private.auth_org_id(), 'Morning stand-up', 'morning', '2026-11-02');
+  begin
+    insert into public.board_meetings (organisation_id, topic, kind, meeting_date) values (private.auth_org_id(), 'Morning again', 'morning', '2026-11-02');
+    raise exception 'two morning stand-ups on one day allowed';
+  exception when unique_violation then null; end;
+  insert into public.board_meetings (organisation_id, topic, kind, meeting_date) values (private.auth_org_id(), 'Evening review', 'evening', '2026-11-02');
+  update public.organisations set usd_inr_rate = 90 where id = private.auth_org_id();
+  assert (select north_star_target_cents from public.organisations) = 100000000000::bigint * 90 * 100, 'north star follows rate';
+  update public.organisations set north_star_target_cents = 1 where id = private.auth_org_id();
+  assert (select north_star_target_cents from public.organisations) = 100000000000::bigint * 90 * 100, 'north star cannot drift from USD target';
+  -- Idea Court: only a decided trial can be adopted as team vision.
+  insert into public.idea_trials (organisation_id, idea, proposed_by) values (private.auth_org_id(), 'Websites for US salons', 'Atlas') returning id into t1;
+  begin
+    update public.idea_trials set adopted_at = now() where id = t1;
+    raise exception 'undecided trial adopted';
+  exception when check_violation then null; end;
+  update public.idea_trials set stage = 'decided', verdict = 'fix' where id = t1;
+  update public.idea_trials set adopted_at = now() where id = t1;
   insert into public.tasks (organisation_id, title, owner, external_ref) values (private.auth_org_id(), 'Place order BOT1', 'founder', 'buyontime:BOT1');
   begin
     insert into public.tasks (organisation_id, title, owner, external_ref) values (private.auth_org_id(), 'dup', 'founder', 'buyontime:BOT1');
@@ -112,6 +166,16 @@ do $$ declare l uuid; begin
   begin
     update public.leads set status = 'approved' where id = l;
     raise exception 'member approved outreach';
+  exception when insufficient_privilege then null; end;
+  insert into public.linkedin_drafts (organisation_id, kind, brief, body) values (private.auth_org_id(), 'comment_reply', 'Reply', 'Thanks!') returning id into l;
+  begin
+    update public.linkedin_drafts set status = 'approved' where id = l;
+    raise exception 'member approved LinkedIn content';
+  exception when insufficient_privilege then null; end;
+  insert into public.idea_trials (organisation_id, idea, stage, verdict) values (private.auth_org_id(), 'Member idea', 'decided', 'build') returning id into l;
+  begin
+    update public.idea_trials set adopted_at = now() where id = l;
+    raise exception 'member adopted a verdict';
   exception when insufficient_privilege then null; end;
 end $$;
 

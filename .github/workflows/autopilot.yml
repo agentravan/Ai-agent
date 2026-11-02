@@ -1,0 +1,40 @@
+# Runs AI Empire OS autopilot every 30 minutes (free on GitHub Actions).
+# Setup (once): repo Settings → Secrets and variables → Actions
+#   - Secret  CRON_SECRET = the same value as CRON_SECRET in Vercel
+#   - Variable APP_URL    = your production URL (optional; defaults below)
+# Scheduled workflows only run from the repository's DEFAULT branch.
+name: Autopilot
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: autopilot
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Trigger autopilot cycle
+        env:
+          APP_URL: ${{ vars.APP_URL || 'https://ai-os-hq.vercel.app' }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          if [ -z "$CRON_SECRET" ]; then
+            echo "::warning::CRON_SECRET secret is not set; autopilot skipped. Add it under Settings → Secrets → Actions."
+            exit 0
+          fi
+          # Only the HTTP status is printed: this repository is public, so job logs are public too.
+          code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 330 \
+            -H "Authorization: Bearer $CRON_SECRET" "$APP_URL/api/cron/autopilot")
+          echo "autopilot responded with HTTP $code"
+          if [ "$code" != "200" ]; then
+            echo "::error::autopilot returned HTTP $code (401 = secret mismatch, 503 = Supabase service key missing in Vercel)"
+            exit 1
+          fi

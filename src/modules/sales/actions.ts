@@ -56,7 +56,8 @@ export async function discoverTargetAction(form: FormData) {
     const t = must(await ctx.db.from("prospect_targets").select("*").eq("id", id).single<Target>());
     try {
       const r = await discoverForTarget(ctx, t);
-      return `Found ${r.found} businesses in ${r.area.split(",")[0]}; added ${r.added} new leads that fit`;
+      const via = r.source === "google_places" ? "Google" : "OpenStreetMap";
+      return `Found ${r.found} businesses in ${r.area.split(",")[0]} via ${via}; added ${r.added} new leads that fit${r.note ? `. ${r.note}` : ""}`;
     } catch (err) {
       throw err instanceof UserFacingError ? err : new UserFacingError((err as Error).message);
     }

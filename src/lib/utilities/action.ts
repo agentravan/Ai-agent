@@ -19,15 +19,17 @@ function publicMessage(err: unknown): string {
 
 /** Runs a form action and redirects back with a flash message. Never leaks internal errors. */
 export async function runAction(path: string, okMessage: string, fn: () => Promise<string | void>): Promise<never> {
+  // `path` may carry its own query (e.g. "/board?id=…"): the flash message is appended to it.
+  const join = path.includes("?") ? "&" : "?";
   let message = okMessage;
   try {
     message = (await fn()) || okMessage;
   } catch (err) {
     unstable_rethrow(err);
-    redirect(`${path}?error=${encodeURIComponent(publicMessage(err))}`);
+    redirect(`${path}${join}error=${encodeURIComponent(publicMessage(err))}`);
   }
-  revalidatePath(path);
-  redirect(`${path}?ok=${encodeURIComponent(message)}`);
+  revalidatePath(path.split("?")[0]!);
+  redirect(`${path}${join}ok=${encodeURIComponent(message)}`);
 }
 
 /** Unwraps a Supabase result, translating RLS/constraint failures into user-facing messages. */

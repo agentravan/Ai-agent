@@ -36,6 +36,7 @@ export const AGENT_PERMISSIONS = {
   "reports.create": "Produce executive reports",
   "leads.qualify": "Score and qualify sales leads",
   "outreach.draft": "Draft outreach pitches (sending always needs Founder approval)",
+  "content.draft": "Draft LinkedIn posts and replies (publishing always needs Founder approval)",
 } as const;
 
 export type AgentPermission = keyof typeof AGENT_PERMISSIONS;

@@ -1,8 +1,20 @@
 import { requestJson, trimSlash } from "../http";
 import type { AiProvider } from "../types";
 
+/**
+ * Per-service settings that stop "thinking" models from spending the whole time budget before answering.
+ * Only sent to services known to accept them (unknown fields can be rejected elsewhere).
+ */
+export function speedHints(host: string): Record<string, unknown> {
+  if (/(^|\.)openrouter\.ai$/i.test(host)) return { reasoning: { effort: "low" } };
+  if (/(^|\.)api\.nvidia\.com$/i.test(host)) return { chat_template_kwargs: { enable_thinking: false } };
+  return {};
+}
+
+const safeHost = (url: string) => { try { return new URL(url).hostname; } catch { return ""; } };
+
 interface ChatResponse {
-  choices?: { message?: { content?: string } }[];
+  choices?: { message?: { content?: string | null }; finish_reason?: string }[];
   usage?: { prompt_tokens?: number; completion_tokens?: number };
 }
 
@@ -10,6 +22,7 @@ interface ChatResponse {
 export function openAiCompatibleProvider(baseUrl: string, model: string, apiKey?: string): AiProvider {
   const base = trimSlash(baseUrl);
   const headers: Record<string, string> = apiKey ? { authorization: `Bearer ${apiKey}` } : {};
+  const extra = speedHints(safeHost(base));
   return {
     id: "openai-compatible",
     label: "OpenAI-compatible",
@@ -23,6 +36,7 @@ export function openAiCompatibleProvider(baseUrl: string, model: string, apiKey?
           model,
           max_tokens: maxTokens,
           temperature: 0.2,
+          ...extra,
           ...(json ? { response_format: { type: "json_object" } } : {}),
           messages: [
             { role: "system", content: system },
@@ -30,8 +44,10 @@ export function openAiCompatibleProvider(baseUrl: string, model: string, apiKey?
           ],
         }),
       });
+      const choice = data.choices?.[0];
       return {
-        text: data.choices?.[0]?.message?.content ?? "",
+        text: choice?.message?.content ?? "",
+        finishReason: choice?.finish_reason,
         inputTokens: data.usage?.prompt_tokens ?? 0,
         outputTokens: data.usage?.completion_tokens ?? 0,
       };

@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { Crown } from "lucide-react";
 import { Autopilot } from "@/components/agents/autopilot";
-import { CommandCard } from "@/components/command/command-card";
+import { approvalRefs, CommandCard } from "@/components/command/command-card";
 import { Badge, Card, Empty, Flash, PageHeader, type SearchParams } from "@/components/ui";
 import { SubmitButton } from "@/components/ui/submit-button";
 import { aiStatus } from "@/lib/ai/registry";
@@ -38,6 +38,11 @@ export default async function CeoPage({ searchParams }: { searchParams: SearchPa
   const name = (id: string | null) => agents.find((a) => a.id === id)?.name ?? "Agent";
   const canOperate = can(ctx.profile.role, "operate");
   const nextInfo = next ? { title: next.title, agent: name(next.assigned_agent_id) } : null;
+  const refs = approvalRefs(commands ?? []);
+  const { data: decided } = refs.length
+    ? await ctx.db.from("approvals").select("id, status").eq("organisation_id", ctx.organisation.id).in("id", refs).returns<{ id: string; status: string }[]>()
+    : { data: [] as { id: string; status: string }[] };
+  const approvalStatus = Object.fromEntries((decided ?? []).map((a) => [a.id, a.status]));
   const [latest, ...older] = commands ?? [];
 
   return (
@@ -66,7 +71,7 @@ export default async function CeoPage({ searchParams }: { searchParams: SearchPa
 
       {/* 2. What Atlas did */}
       <h2 className="mt-8 mb-3 text-sm font-semibold text-zinc-200">2 · What Atlas did</h2>
-      {latest ? <CommandCard execution={latest} agentName={ceo?.name ?? "CEO"} canOperate={canOperate} returnTo="/ceo" /> : <Empty>No instructions yet.</Empty>}
+      {latest ? <CommandCard execution={latest} agentName={ceo?.name ?? "CEO"} canOperate={canOperate} returnTo="/ceo" approvalStatus={approvalStatus} /> : <Empty>No instructions yet.</Empty>}
 
       {/* 3. Team at work */}
       <Card title="3 · Team at work" description="Runs the ready tasks one by one and shows who is doing what" className="mt-8">
@@ -95,7 +100,7 @@ export default async function CeoPage({ searchParams }: { searchParams: SearchPa
       {older.length > 0 && (
         <details className="mt-8">
           <summary className="cursor-pointer text-sm font-medium text-zinc-400 hover:text-zinc-100">Earlier instructions ({older.length})</summary>
-          <div className="mt-3 space-y-4">{older.map((c) => <CommandCard key={c.id} execution={c} agentName={ceo?.name ?? "CEO"} canOperate={canOperate} returnTo="/ceo" />)}</div>
+          <div className="mt-3 space-y-4">{older.map((c) => <CommandCard key={c.id} execution={c} agentName={ceo?.name ?? "CEO"} canOperate={canOperate} returnTo="/ceo" approvalStatus={approvalStatus} />)}</div>
         </details>
       )}
     </>

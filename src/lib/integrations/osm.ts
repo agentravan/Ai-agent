@@ -6,16 +6,16 @@
 import { env } from "@/lib/env";
 
 export const LEAD_CATEGORIES = {
-  salon: { label: "Hair & beauty salons", filters: ['["shop"="hairdresser"]', '["shop"="beauty"]'] },
-  barber: { label: "Barbershops", filters: ['["shop"="hairdresser"]["hairdresser"="barber"]'] },
-  spa: { label: "Spas & massage", filters: ['["leisure"="spa"]', '["shop"="massage"]'] },
-  nails: { label: "Nail salons", filters: ['["shop"="beauty"]["beauty"="nails"]'] },
-  restaurant: { label: "Restaurants & cafés", filters: ['["amenity"="restaurant"]', '["amenity"="cafe"]'] },
-  dentist: { label: "Dental clinics", filters: ['["amenity"="dentist"]'] },
-  clinic: { label: "Clinics & doctors", filters: ['["amenity"="clinic"]', '["amenity"="doctors"]'] },
-  gym: { label: "Gyms & fitness studios", filters: ['["leisure"="fitness_centre"]'] },
-  bakery: { label: "Bakeries", filters: ['["shop"="bakery"]'] },
-  car_repair: { label: "Auto repair shops", filters: ['["shop"="car_repair"]'] },
+  salon: { label: "Hair & beauty salons", search: "beauty salons", filters: ['["shop"="hairdresser"]', '["shop"="beauty"]'] },
+  barber: { label: "Barbershops", search: "barbershops", filters: ['["shop"="hairdresser"]["hairdresser"="barber"]'] },
+  spa: { label: "Spas & massage", search: "spas", filters: ['["leisure"="spa"]', '["shop"="massage"]'] },
+  nails: { label: "Nail salons", search: "nail salons", filters: ['["shop"="beauty"]["beauty"="nails"]'] },
+  restaurant: { label: "Restaurants & cafés", search: "restaurants", filters: ['["amenity"="restaurant"]', '["amenity"="cafe"]'] },
+  dentist: { label: "Dental clinics", search: "dental clinics", filters: ['["amenity"="dentist"]'] },
+  clinic: { label: "Clinics & doctors", search: "clinics", filters: ['["amenity"="clinic"]', '["amenity"="doctors"]'] },
+  gym: { label: "Gyms & fitness studios", search: "gyms", filters: ['["leisure"="fitness_centre"]'] },
+  bakery: { label: "Bakeries", search: "bakeries", filters: ['["shop"="bakery"]'] },
+  car_repair: { label: "Auto repair shops", search: "car repair shops", filters: ['["shop"="car_repair"]'] },
 } as const;
 export type LeadCategory = keyof typeof LEAD_CATEGORIES;
 
