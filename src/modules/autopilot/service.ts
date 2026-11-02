@@ -5,6 +5,7 @@ import { emailConfigured, sendEmail } from "@/lib/integrations/email";
 import { logEvent } from "@/modules/audit/service";
 import type { AppContext } from "@/modules/auth/session";
 import { recoverStaleExecutions } from "@/modules/orchestration/engine";
+import { runDueStandup } from "@/modules/board/service";
 import { checkDueKeywords } from "@/modules/rank/service";
 import { runReadyTasks } from "@/modules/tasks/service";
 import { alertProblems, autoRetryDecision, isEventfulCycle, shouldAlert, type AutopilotSummary } from "./policy";
@@ -106,6 +107,9 @@ export async function runAutopilot(ctx: AppContext, budgetMs: number, now = new 
   const { requeued, exhausted } = await requeueFailedTasks(ctx, now);
 
   const aiConfigured = providerChain().length > 0;
+  // Daily stand-ups first (09:00 IST morning plan, 19:00 IST evening review; once each per day, minutes emailed),
+  // so a long task queue can never crowd them out.
+  if (aiConfigured) await runDueStandup(ctx, now).catch((err: Error) => console.error("[autopilot] stand-up failed", err.message));
   const results = aiConfigured ? await runReadyTasks(ctx, budgetMs - (Date.now() - started)) : [];
   const succeeded = results.filter((r) => r.ok).length;
 

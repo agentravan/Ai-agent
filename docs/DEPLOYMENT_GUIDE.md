@@ -53,6 +53,12 @@ Setup:
 3. The ₹80,000 profit gate is unchanged: no paid tools or upgrades until net profit crosses it.
 4. Board meetings run several AI calls in a row (1–4 min). If the time limit is hit, press **Continue meeting** — nobody speaks twice.
 
+## Meeting room, minutes and daily stand-ups
+- Migration `20261102000200_meeting_room.sql` adds meeting kinds (board, team, morning, evening), minutes (MOM) and the **Scribe** note-taker.
+- `/board` is the lobby; `/board/<id>` is a Meet-style room: tiles per member, the speaker's tile glows with captions, voices are read aloud (browser voices, free), the Founder can type or speak (Chrome/Edge mic).
+- **End & minutes**: Scribe writes the MOM (decisions, action items with owners and due dates, risks, opportunities, follow-ups, next agenda), every participant stores it as memory, and it is emailed to the Founder when the mailbox is connected. Action items become tasks only after the Founder presses **Approve action items** (risky ones go to Approvals).
+- Daily stand-ups run from the autopilot at 09:00 and 19:00 IST (once per day each, enforced in the database). This needs `SUPABASE_SERVICE_ROLE_KEY` and `CRON_SECRET` set.
+
 ## AI reliability (free models)
 - Free "thinking" models can be slow or return empty answers. Empty answers now count as a failed attempt (retried), and a timeout while the answer is streaming is retried too.
 - Add backup free models in Vercel: `OPENAI_COMPATIBLE_FALLBACK_MODELS=model-a:free,model-b:free` (same OpenRouter key). Pick current IDs from openrouter.ai/models (filter: free). They are tried in order if the main model fails.

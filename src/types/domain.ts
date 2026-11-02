@@ -188,9 +188,25 @@ export interface RankKeyword {
 }
 export interface RankCheck { id: string; keyword_id: string; position: number | null; scanned: number; checked_at: string }
 
-/** Board meetings: the Founder sets a topic, each C-suite member speaks, the CEO closes with a plan. */
+/** Meetings: board (C-suite), team (a leader and their reports), daily morning / evening stand-ups. */
+export const MEETING_KINDS = ["board", "team", "morning", "evening"] as const;
+export type MeetingKind = (typeof MEETING_KINDS)[number];
+export interface Mom {
+  summary: string;
+  decisions: string[];
+  action_items: { owner: string; task: string; due: string; needs_approval: boolean }[];
+  risks: string[];
+  opportunities: string[];
+  follow_ups: string[];
+  next_agenda: string[];
+}
 export interface BoardMeeting {
   id: string; organisation_id: string; topic: string; status: "in_progress" | "done" | "failed"; summary: string | null;
   plan_execution_id: string | null; error: string | null; created_at: string;
+  kind: MeetingKind; host_agent_id: string | null; participant_ids: string[]; meeting_date: string | null;
+  mom: Mom | null; mom_execution_id: string | null; mom_emailed_at: string | null; ended_at: string | null;
 }
-export interface BoardMessage { id: string; meeting_id: string; seq: number; agent_id: string | null; speaker: string; body: string; failed: boolean; created_at: string }
+export interface BoardMessage {
+  id: string; meeting_id: string; seq: number; agent_id: string | null; speaker: string; body: string; failed: boolean;
+  role: "member" | "founder" | "scribe" | "system"; created_at: string;
+}

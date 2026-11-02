@@ -6,7 +6,8 @@ insert into auth.users (id, email) values
 
 do $$ begin
   assert (select count(*) from public.organisations) = 2, 'one org per founder';
-  assert (select count(*) from public.agents) = 18, 'nine starter agents each (4 executives + Legal Head + 4 managers)';
+  assert (select count(*) from public.agents) = 20, 'ten starter agents each (4 executives + Legal Head + 4 managers + Scribe)';
+  assert (select count(*) from public.agents where name = 'Scribe') = 2, 'Scribe seeded';
   assert (select count(*) from public.agents where name = 'Themis' and tier = 'executive') = 2, 'Legal Head seeded';
   assert (select bool_and(north_star_usd = 100000000000 and north_star_target_cents = 100000000000 * 95 * 100) from public.organisations), '$100B north star in INR paise';
   assert (select count(*) from public.business_units) = 8, 'four business units each';
@@ -15,7 +16,8 @@ do $$ begin
   perform private.seed_executive_office(id) from public.organisations;
   perform private.seed_sales_engine(id) from public.organisations;
   perform private.seed_board(id) from public.organisations;
-  assert (select count(*) from public.agents) = 18, 'seed is idempotent';
+  perform private.seed_scribe(id) from public.organisations;
+  assert (select count(*) from public.agents) = 20, 'seed is idempotent';
   assert (select count(*) from public.profiles where role = 'founder') = 2, 'founder role';
 end $$;
 
@@ -25,7 +27,7 @@ select set_config('request.jwt.claim.sub', '11111111-1111-1111-1111-111111111111
 do $$
 declare other_agent uuid; t1 uuid; t2 uuid; appr uuid;
 begin
-  assert (select count(*) from public.agents) = 9, 'RLS: sees only own agents';
+  assert (select count(*) from public.agents) = 10, 'RLS: sees only own agents';
   assert (select count(*) from public.kras) = 10, 'RLS: sees only own KRAs';
   assert (select count(*) from public.organisations) = 1, 'RLS: sees only own org';
 
@@ -99,6 +101,13 @@ begin
     insert into public.board_messages (organisation_id, meeting_id, seq, speaker, body) values (private.auth_org_id(), t1, 0, 'Orion', 'dup');
     raise exception 'duplicate board message seq allowed';
   exception when unique_violation then null; end;
+  insert into public.board_messages (organisation_id, meeting_id, seq, speaker, body, role) values (private.auth_org_id(), t1, 500, 'Founder', 'Price kya rakhein?', 'founder');
+  insert into public.board_meetings (organisation_id, topic, kind, meeting_date) values (private.auth_org_id(), 'Morning stand-up', 'morning', '2026-11-02');
+  begin
+    insert into public.board_meetings (organisation_id, topic, kind, meeting_date) values (private.auth_org_id(), 'Morning again', 'morning', '2026-11-02');
+    raise exception 'two morning stand-ups on one day allowed';
+  exception when unique_violation then null; end;
+  insert into public.board_meetings (organisation_id, topic, kind, meeting_date) values (private.auth_org_id(), 'Evening review', 'evening', '2026-11-02');
   update public.organisations set usd_inr_rate = 90 where id = private.auth_org_id();
   assert (select north_star_target_cents from public.organisations) = 100000000000::bigint * 90 * 100, 'north star follows rate';
   update public.organisations set north_star_target_cents = 1 where id = private.auth_org_id();
