@@ -141,6 +141,7 @@ export async function runAgent<T = string>(ctx: AppContext, opts: RunOptions<T>)
   try {
     let totalAttempts = 0;
     let lastError: unknown;
+    let firstError: unknown; // the main provider's failure is the one the Founder needs to see
     // One run never outlives the serverless time limit: each attempt gets min(AI_TIMEOUT_MS, time left).
     const deadline = Date.now() + Math.min(env.AI_RUN_BUDGET_MS, opts.budgetMs ?? Infinity);
     const attemptTimeout = () => {
@@ -175,10 +176,16 @@ export async function runAgent<T = string>(ctx: AppContext, opts: RunOptions<T>)
         break;
       } catch (err) {
         lastError = err;
+        firstError ??= err;
         if (deadline - Date.now() < 15_000) break;
       }
     }
-    if (!done) throw lastError;
+    if (!done) {
+      if (firstError && lastError !== firstError) {
+        throw new Error(`${(firstError as Error).message?.slice(0, 600)} · backups also failed: ${(lastError as Error).message?.slice(0, 300)}`);
+      }
+      throw lastError;
+    }
     const { value, used } = done;
     const final = must(
       await update({

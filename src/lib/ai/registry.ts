@@ -16,7 +16,8 @@ export function backupServices(e: Env = defaultEnv): { baseUrl: string; model: s
     { baseUrl: e.AI_BACKUP_1_BASE_URL, model: e.AI_BACKUP_1_MODEL, apiKey: e.AI_BACKUP_1_API_KEY },
     { baseUrl: e.AI_BACKUP_2_BASE_URL, model: e.AI_BACKUP_2_MODEL, apiKey: e.AI_BACKUP_2_API_KEY },
   ];
-  return slots.flatMap((b) => (b.baseUrl && b.model ? [{ baseUrl: b.baseUrl, model: b.model, apiKey: b.apiKey }] : []));
+  // A hosted backup without its key can only fail (401) and would hide the real error, so it is skipped.
+  return slots.flatMap((b) => (b.baseUrl && b.model && b.apiKey ? [{ baseUrl: b.baseUrl, model: b.model, apiKey: b.apiKey }] : []));
 }
 
 /** All providers that have the configuration they need, in preference order (free first). */

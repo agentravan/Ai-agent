@@ -7,7 +7,7 @@ import type { AppContext } from "@/modules/auth/session";
 import { companySnapshot, listAgents, runAgent } from "@/modules/orchestration/engine";
 import type { AgentWithPermissions, BoardMeeting, BoardMessage, MeetingKind, Mom } from "@/types/domain";
 import {
-  cleanSpeech, routeTurn, spoken, dueStandup, isPass, istDate, momPrompt, momText, momToPlan, openingPrompt, parseMom, pickBoard, pickTeam,
+  cleanSpeech, friendlyFailure, routeTurn, spoken, dueStandup, isPass, istDate, momPrompt, momText, momToPlan, openingPrompt, parseMom, pickBoard, pickTeam,
   replyPrompt, type Seat, type SpokenLine,
 } from "./logic";
 
@@ -139,7 +139,7 @@ export async function memberTurn(ctx: AppContext, meetingId: string, agentId: st
   const r = await speakAs(ctx, seat, input);
   if (r.text && isPass(r.text)) return null;
   if (!r.text && mode === "reply" && addressed === "other") return null; // silent failure is fine for people not asked
-  const [saved] = await saveLines(ctx, meetingId, [{ role: "member", agent_id: agentId, speaker: label, body: r.text ?? `(could not ${mode === "open" ? "join" : "answer"}: ${r.error?.slice(0, 200)})`, failed: !r.text }]);
+  const [saved] = await saveLines(ctx, meetingId, [{ role: "member", agent_id: agentId, speaker: label, body: r.text ?? friendlyFailure(r.error), failed: !r.text }]);
   return saved ?? null;
 }
 
@@ -159,7 +159,7 @@ export async function openMeeting(ctx: AppContext, meetingId: string): Promise<B
   const out: BoardMessage[] = [];
   const say = async (seat: Seat<A>) => {
     const r = await speakAs(ctx, seat, openingPrompt(seat, meeting.topic, lines, context, founderFirstName(ctx), seat === seats[0], roster(seats, agents)));
-    return { role: "member" as const, agent_id: seat.agent.id, speaker: `${seat.agent.name} · ${seat.title}`, body: r.text ?? `(could not join: ${r.error?.slice(0, 200)})`, failed: !r.text };
+    return { role: "member" as const, agent_id: seat.agent.id, speaker: `${seat.agent.name} · ${seat.title}`, body: r.text ?? friendlyFailure(r.error), failed: !r.text };
   };
   const [chair, ...rest] = pending;
   if (chair && chair === seats[0]) {
