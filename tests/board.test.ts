@@ -23,6 +23,12 @@ describe("who sits in the room", () => {
     expect(pickBoard(team).map((s) => `${s.role}:${s.agent.name}`)).toEqual(["ceo:Atlas", "coo:Orion", "cfo:Ledger", "legal:Themis"]);
     expect(pickBoard(team)[0]!.color).toBe("#3b82f6");
   });
+  it("seats the Idea Court's judge with the board when Nyaya is active", () => {
+    const withJudge = [...team, agent("Nyaya", "worker", "Idea Court — Judge & Strategy Reviewer")];
+    expect(pickBoard(withJudge).map((s) => s.role)).toEqual(["ceo", "coo", "cfo", "legal", "judge"]);
+    expect(routeTurn("Nyaya, ye idea sahi hai kya?", pickBoard(withJudge)).answer).toEqual(["Nyaya"]);
+    expect(routeTurn("Is idea ka verdict kya hai?", pickBoard(withJudge)).answer).toEqual(["Nyaya"]);
+  });
   it("skips suspended or missing members", () => {
     const seats = pickBoard(team.map((a) => (a.name === "Themis" ? { ...a, status: "suspended" } : a)).filter((a) => a.name !== "Orion"));
     expect(seats.map((s) => s.role)).toEqual(["ceo", "cfo"]);

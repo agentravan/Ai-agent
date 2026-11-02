@@ -4,13 +4,13 @@ import { AiError } from "@/lib/ai/types";
 import type { Plan, PlanStep } from "@/modules/orchestration/plan";
 import type { AgentTier, MeetingKind, Mom } from "@/types/domain";
 
-export type BoardRole = "ceo" | "coo" | "cfo" | "legal" | "member";
+export type BoardRole = "ceo" | "coo" | "cfo" | "legal" | "judge" | "member";
 export interface Seat<A> { role: BoardRole; agent: A; title: string; color: string; voice: number }
 type AgentLike = { id: string; name: string; tier: AgentTier; designation: string; status: string; manager_id?: string | null };
 
-export const ROLE_TITLE: Record<Exclude<BoardRole, "member">, string> = { ceo: "CEO", coo: "COO", cfo: "CFO", legal: "Legal Head" };
+export const ROLE_TITLE: Record<Exclude<BoardRole, "member">, string> = { ceo: "CEO", coo: "COO", cfo: "CFO", legal: "Legal Head", judge: "Idea Judge" };
 /** Tile colours (match the board-room look): CEO blue, COO orange, CFO green, Legal purple; Scribe is white. */
-const ROLE_COLOR: Record<Exclude<BoardRole, "member">, string> = { ceo: "#3b82f6", coo: "#f97316", cfo: "#22c55e", legal: "#a855f7" };
+const ROLE_COLOR: Record<Exclude<BoardRole, "member">, string> = { ceo: "#3b82f6", coo: "#f97316", cfo: "#22c55e", legal: "#a855f7", judge: "#f59e0b" };
 const MEMBER_COLORS = ["#14b8a6", "#ec4899", "#eab308", "#06b6d4", "#f43f5e", "#84cc16", "#8b5cf6", "#f59e0b"];
 export const SCRIBE_COLOR = "#e5e7eb";
 
@@ -20,6 +20,7 @@ const PERSONALITY: Record<BoardRole, string> = {
   coo: "practical and fast: you think in owners, deadlines and next steps; you push back on vague plans",
   cfo: "careful with money and blunt about it: cash first, no spending before the profit gate; you question numbers that have no basis",
   legal: "precise and calm: you flag only real legal risks, say plainly what is allowed and on what conditions, and suggest the lawful way to do it",
+  judge: "the Idea Court's judge sitting with the board: you weigh every proposal fairly — the strongest case for it, the strongest case against — and give a short verdict (build / fix / kill) with the one test that would prove it",
   member: "a hands-on team lead: you speak about your own work — what is done, what is blocked, what you need",
 };
 
@@ -29,6 +30,7 @@ const ROLE_LENS: Record<BoardRole, string> = {
   coo: "execution — who does what this week with the AI team and system features, and the Founder's daily 15–30 minutes",
   cfo: "money — price, cash up front, costs (₹0 until the profit gate), profit per client; use only figures given, else say what data is needed",
   legal: "law and risk — India (Contract Act, GST, IT Act, DPDP 2023) and the client's country (anti-spam, consent, opt-outs): allowed / allowed with conditions / not allowed",
+  judge: "fairness and evidence — is the idea proven or a guess, what would kill it, the cheapest 7-day test, and a verdict: build, fix or kill",
   member: "your own function — what you can deliver, what blocks you, what you need",
 };
 
@@ -41,6 +43,8 @@ export function pickBoard<A extends AgentLike>(agents: readonly A[]): Seat<A>[] 
     ["coo", active.find((a) => a.tier === "coo")],
     ["cfo", exec(/financ|\bcfo\b/i)],
     ["legal", exec(/legal|compliance/i)],
+    // The Idea Court sits with the board like a co-founder who tests every idea.
+    ["judge", active.find((a) => a.name === "Nyaya" || /idea court|judge/i.test(a.designation))],
   ];
   return seats.flatMap(([role, agent], i) => (agent ? [{ role, agent, title: ROLE_TITLE[role], color: ROLE_COLOR[role], voice: i }] : []));
 }
@@ -114,6 +118,7 @@ const TOPIC: Partial<Record<BoardRole, RegExp>> = {
   cfo: /\b(price|pricing|paisa|paise|rupe|₹|cost|kharch|budget|profit|margin|revenue|invoice|payment|cash|fee|rate|kitna)/i,
   legal: /\b(legal|law|kanoon|contract|agreement|gst|tax|privacy|data|spam|compliance|license|licence|terms|policy)/i,
   coo: /\b(kaise karen|kaise karein|process|execute|execution|team|kab tak|deadline|timeline|kaam|task|setup|deliver|tools?|automation)/i,
+  judge: /\b(court|judge|nyaya|verdict|faisla|sahi hai kya|theek hai kya|kaisa idea|idea kaisa|test kare|validate|prove|kill|build or)/i,
 };
 
 /** Small talk and meeting mechanics: only the chair replies, like a real chairperson would. */
