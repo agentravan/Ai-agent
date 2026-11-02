@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { readEnv } from "@/lib/env";
 import { backupServices, fallbackModels, providerChain } from "@/lib/ai/registry";
+import { maxAttemptsFor } from "@/modules/orchestration/policy";
 import { speedHints } from "@/lib/ai/providers/openai-compatible";
 
 const base = { AI_PROVIDER: "openai-compatible", OPENAI_COMPATIBLE_BASE_URL: "https://openrouter.ai/api/v1", OPENAI_COMPATIBLE_MODEL: "main:free" };
@@ -41,5 +42,13 @@ describe("backup services on other endpoints", () => {
     expect(speedHints("integrate.api.nvidia.com")).toEqual({ chat_template_kwargs: { enable_thinking: false } });
     expect(speedHints("openrouter.ai")).toEqual({ reasoning: { effort: "low" } });
     expect(speedHints("generativelanguage.googleapis.com")).toEqual({});
+  });
+});
+
+describe("attempt bookkeeping", () => {
+  it("allows one attempt per backup on top of the main retries, never above the DB limit", () => {
+    expect(maxAttemptsFor(1, 1)).toBe(1);
+    expect(maxAttemptsFor(6, 1)).toBe(6); // main + 3 same-service backups + 2 other services
+    expect(maxAttemptsFor(20, 3)).toBe(10);
   });
 });

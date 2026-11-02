@@ -7,7 +7,7 @@ import { UserFacingError, must } from "@/lib/utilities/action";
 import { logEvent } from "@/modules/audit/service";
 import type { AppContext } from "@/modules/auth/session";
 import type { AgentWithPermissions, Execution } from "@/types/domain";
-import { checkAgentCanRun, checkCostLimit, monthStartIso, STALE_EXECUTION_MS } from "./policy";
+import { checkAgentCanRun, checkCostLimit, maxAttemptsFor, monthStartIso, STALE_EXECUTION_MS } from "./policy";
 import { growthStage, upgradeUnlocked } from "@/modules/cockpit/metrics";
 import { formatInr } from "@/lib/utilities/format";
 import { MISSION, northStarLabel } from "./mission";
@@ -123,7 +123,8 @@ export async function runAgent<T = string>(ctx: AppContext, opts: RunOptions<T>)
         kind: opts.kind,
         status: "running",
         input: opts.input,
-        max_attempts: env.AI_MAX_ATTEMPTS,
+        // Every provider in the chain may use attempts (main: AI_MAX_ATTEMPTS, each backup: 1). The DB requires attempts <= max_attempts.
+        max_attempts: maxAttemptsFor(chain.length, env.AI_MAX_ATTEMPTS),
         provider: provider.id,
         model: provider.model,
         triggered_by: ctx.userId,
@@ -170,7 +171,7 @@ export async function runAgent<T = string>(ctx: AppContext, opts: RunOptions<T>)
             const parsed = opts.parse ? opts.parse(out.text) : (out.text as unknown as T);
             return { out, parsed };
           },
-          { attempts: p === provider ? env.AI_MAX_ATTEMPTS : 1, onAttempt: async () => void (await update({ attempts: ++totalAttempts })) },
+          { attempts: p === provider ? env.AI_MAX_ATTEMPTS : 1, onAttempt: async () => void (await update({ attempts: Math.min(++totalAttempts, 10) })) },
         );
         done = { value, used: p };
         break;
@@ -190,7 +191,7 @@ export async function runAgent<T = string>(ctx: AppContext, opts: RunOptions<T>)
     const final = must(
       await update({
         status: "succeeded",
-        attempts: totalAttempts,
+        attempts: Math.min(totalAttempts, 10),
         provider: used.id,
         model: used.model,
         output: value.out.text,

@@ -86,3 +86,8 @@ export function resolveKra(step: Pick<PlanStep, "kra">, assignee: Pick<Agent, "b
     null
   );
 }
+
+/** Total attempts a run can make across the provider chain (main: its retries, each backup: one), bounded by the DB limit of 10. */
+export function maxAttemptsFor(chainLength: number, mainAttempts: number): number {
+  return Math.min(10, Math.max(1, mainAttempts + Math.max(0, chainLength - 1)));
+}
