@@ -6,7 +6,8 @@ insert into auth.users (id, email) values
 
 do $$ begin
   assert (select count(*) from public.organisations) = 2, 'one org per founder';
-  assert (select count(*) from public.agents) = 20, 'ten starter agents each (4 executives + Legal Head + 4 managers + Scribe)';
+  assert (select count(*) from public.agents) = 22, 'eleven starter agents each (4 executives + Legal Head + 4 managers + Scribe + Nyaya)';
+  assert (select count(*) from public.agents where name = 'Nyaya') = 2, 'Idea Court seeded';
   assert (select count(*) from public.agents where name = 'Scribe') = 2, 'Scribe seeded';
   assert (select count(*) from public.agents where name = 'Themis' and tier = 'executive') = 2, 'Legal Head seeded';
   assert (select bool_and(north_star_usd = 100000000000 and north_star_target_cents = 100000000000 * 95 * 100) from public.organisations), '$100B north star in INR paise';
@@ -17,7 +18,8 @@ do $$ begin
   perform private.seed_sales_engine(id) from public.organisations;
   perform private.seed_board(id) from public.organisations;
   perform private.seed_scribe(id) from public.organisations;
-  assert (select count(*) from public.agents) = 20, 'seed is idempotent';
+  perform private.seed_court(id) from public.organisations;
+  assert (select count(*) from public.agents) = 22, 'seed is idempotent';
   assert (select count(*) from public.profiles where role = 'founder') = 2, 'founder role';
 end $$;
 
@@ -27,7 +29,7 @@ select set_config('request.jwt.claim.sub', '11111111-1111-1111-1111-111111111111
 do $$
 declare other_agent uuid; t1 uuid; t2 uuid; appr uuid;
 begin
-  assert (select count(*) from public.agents) = 10, 'RLS: sees only own agents';
+  assert (select count(*) from public.agents) = 11, 'RLS: sees only own agents';
   assert (select count(*) from public.kras) = 10, 'RLS: sees only own KRAs';
   assert (select count(*) from public.organisations) = 1, 'RLS: sees only own org';
 
@@ -112,6 +114,14 @@ begin
   assert (select north_star_target_cents from public.organisations) = 100000000000::bigint * 90 * 100, 'north star follows rate';
   update public.organisations set north_star_target_cents = 1 where id = private.auth_org_id();
   assert (select north_star_target_cents from public.organisations) = 100000000000::bigint * 90 * 100, 'north star cannot drift from USD target';
+  -- Idea Court: only a decided trial can be adopted as team vision.
+  insert into public.idea_trials (organisation_id, idea, proposed_by) values (private.auth_org_id(), 'Websites for US salons', 'Atlas') returning id into t1;
+  begin
+    update public.idea_trials set adopted_at = now() where id = t1;
+    raise exception 'undecided trial adopted';
+  exception when check_violation then null; end;
+  update public.idea_trials set stage = 'decided', verdict = 'fix' where id = t1;
+  update public.idea_trials set adopted_at = now() where id = t1;
   insert into public.tasks (organisation_id, title, owner, external_ref) values (private.auth_org_id(), 'Place order BOT1', 'founder', 'buyontime:BOT1');
   begin
     insert into public.tasks (organisation_id, title, owner, external_ref) values (private.auth_org_id(), 'dup', 'founder', 'buyontime:BOT1');
@@ -161,6 +171,11 @@ do $$ declare l uuid; begin
   begin
     update public.linkedin_drafts set status = 'approved' where id = l;
     raise exception 'member approved LinkedIn content';
+  exception when insufficient_privilege then null; end;
+  insert into public.idea_trials (organisation_id, idea, stage, verdict) values (private.auth_org_id(), 'Member idea', 'decided', 'build') returning id into l;
+  begin
+    update public.idea_trials set adopted_at = now() where id = l;
+    raise exception 'member adopted a verdict';
   exception when insufficient_privilege then null; end;
 end $$;
 

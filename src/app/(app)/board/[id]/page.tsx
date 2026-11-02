@@ -71,7 +71,16 @@ export default async function MeetingPage({ params, searchParams }: { params: Pr
           action={meeting.mom_emailed_at ? <Badge tone="info">emailed to you</Badge> : undefined}>
           <p className="text-[15px] leading-relaxed text-zinc-100">{mom.summary}</p>
           <div className="mt-5 grid gap-5 md:grid-cols-2">
-            <List title="Decisions" items={mom.decisions} />
+            <div>
+              <List title="Decisions" items={mom.decisions} />
+              {mom.decisions.length > 0 && (
+                <ul className="mt-2 flex flex-wrap gap-2">
+                  {mom.decisions.slice(0, 4).map((d, i) => (
+                    <li key={i}><Link href={`/court?idea=${encodeURIComponent(d)}&meeting=${meeting.id}`} className="btn-ghost px-2.5 py-1 text-xs">⚖ Put decision {i + 1} on trial</Link></li>
+                  ))}
+                </ul>
+              )}
+            </div>
             <div>
               {mom.action_items.length > 0 && <p className="text-xs font-semibold tracking-wide text-zinc-400 uppercase">Action items</p>}
               <ul className="mt-1.5 space-y-1.5 text-sm">

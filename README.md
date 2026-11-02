@@ -14,6 +14,7 @@ An AI CEO, COO and executive workforce plan, delegate and execute work. Every ag
 - **Approval center:** pending requests with action details, approve/reject (exactly once), history.
 - **Audit system:** database-trigger audit of all business tables plus semantic agent/user events, with filters.
 - **Board Room (Meet-style):** live meetings with the CEO, COO, CFO and Legal Head — glowing tiles, voices, captions; the Founder asks by text or mic and members answer, debate risk and profit, or pass. Scribe writes minutes (MOM), emails them, and action items become tasks on approval. Team meetings (a leader with their reports) and daily 09:00 / 19:00 IST stand-ups.
+- **Idea Court:** any idea goes on trial — prosecutor, defence, 12 AI jurors (BUILD / FIX / KILL) and a judge's verdict with the fix, a 7-day ₹0 test and a one-line team vision the Founder can adopt.
 - **Project Apex directive:** every agent run carries the mission ($100B North Star in USD, profit tracked in INR at a Founder-set rate, ₹80,000 gate before paid upgrades, legal-only growth).
 - **Agent Library:** 280+ ready-made AI employees (sales, marketing, SEO, developers, designers…) from [Agency Agents](https://github.com/msitarzewski/agency-agents) (MIT), hired in one click under full governance.
 - **Google Maps leads (optional):** with `GOOGLE_PLACES_API_KEY`, the Sales Engine finds businesses with phone numbers via Google Places; OpenStreetMap remains the ₹0 default and fallback.

@@ -59,6 +59,12 @@ Setup:
 - **End & minutes**: Scribe writes the MOM (decisions, action items with owners and due dates, risks, opportunities, follow-ups, next agenda), every participant stores it as memory, and it is emailed to the Founder when the mailbox is connected. Action items become tasks only after the Founder presses **Approve action items** (risky ones go to Approvals).
 - Daily stand-ups run from the autopilot at 09:00 and 19:00 IST (once per day each, enforced in the database). This needs `SUPABASE_SERVICE_ROLE_KEY` and `CRON_SECRET` set.
 
+## Idea Court
+- Migration `20261102000300_idea_court.sql` adds `idea_trials` and the **Nyaya** agent.
+- `/court`: file any idea (or a decision from meeting minutes). The trial runs in stages — prosecution (3 hardest questions), defence (answers + closing), 12 jurors vote BUILD / FIX / KILL, the judge gives the fix, a 7-day ₹0 test and a one-line vision. The verdict is the jury majority (ties go to the more careful option).
+- **Adopt verdict as team vision** (Founder/admin only, enforced in the database): every active agent remembers it, and the 7-day test becomes a task for the proposer (or the CEO).
+- Voices: free browser voices; Microsoft Edge has the most natural Indian voices.
+
 ## AI reliability (free models)
 - Free "thinking" models can be slow or return empty answers. Empty answers now count as a failed attempt (retried), and a timeout while the answer is streaming is retried too.
 - Add backup free models in Vercel: `OPENAI_COMPATIBLE_FALLBACK_MODELS=model-a:free,model-b:free` (same OpenRouter key). Pick current IDs from openrouter.ai/models (filter: free). They are tried in order if the main model fails.

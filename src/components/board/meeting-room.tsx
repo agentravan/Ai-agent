@@ -5,36 +5,9 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
 import { FileText, Mic, MicOff, MessageSquare, PhoneOff, Play, Send, Volume2, VolumeX } from "lucide-react";
 import { endMeetingAction, memberTurnAction, sayAction } from "@/modules/board/actions";
 import type { BoardMessage } from "@/types/domain";
+import { hasNaturalVoice, pickVoice } from "./voices";
 
 export interface RoomSeat { agentId: string; name: string; title: string; color: string; voice: number; gender: "male" | "female" }
-
-/**
- * Human-sounding voices: browsers ship neural voices for free (Edge: "Microsoft … Online (Natural)",
- * Chrome: "Google …"). Pitch tricks make voices sound robotic, so we keep natural pitch/pace and give each
- * person a different real voice instead — men and women where the browser has both.
- */
-export type VoiceGender = "male" | "female";
-const FEMALE = /neerja|swara|aria|jenny|sonia|libby|natasha|heera|kalpana|zira|samantha|karen|moira|tessa|veena|female|woman|google uk english female|google हिन्दी/i;
-const MALE = /prabhat|madhur|ravi|hemant|guy|ryan|thomas|william|davis|daniel|rishi|male|man\b|google uk english male/i;
-
-function rankVoice(v: SpeechSynthesisVoice): number {
-  let score = 0;
-  if (/natural|neural|online|premium|enhanced/i.test(v.name)) score += 100; // neural voices sound human
-  else if (/^google/i.test(v.name)) score += 60;
-  if (v.lang === "en-IN") score += 30;
-  else if (v.lang.startsWith("hi")) score += 25;
-  else if (v.lang.startsWith("en")) score += 10;
-  else score -= 100;
-  return score;
-}
-
-/** Best available voice for a speaker: their gender if possible, a different voice per person (by slot). */
-export function pickVoice(voices: SpeechSynthesisVoice[], gender: VoiceGender, slot: number): SpeechSynthesisVoice | undefined {
-  const usable = voices.filter((v) => rankVoice(v) > 0).sort((a, b) => rankVoice(b) - rankVoice(a));
-  const matching = usable.filter((v) => (gender === "female" ? FEMALE.test(v.name) : MALE.test(v.name) && !FEMALE.test(v.name)));
-  const pool = matching.length ? matching : usable;
-  return pool.length ? pool[slot % pool.length] : undefined;
-}
 
 const plain = (t: string) => t.replace(/[*#_`>]/g, "").replace(/\s+/g, " ").trim();
 
@@ -138,6 +111,16 @@ export function MeetingRoom({ meetingId, topic, seats, founder, scribeName, init
   }, [queue, current]);
 
   // …and speak it: highlight the speaker's tile and show captions until they finish.
+  // Suggest Edge when this browser has no human-like Indian voice.
+  const [voiceTip, setVoiceTip] = useState(false);
+  useEffect(() => {
+    if (!("speechSynthesis" in window)) return;
+    const check = () => setVoiceTip(!hasNaturalVoice());
+    check();
+    window.speechSynthesis.addEventListener?.("voiceschanged", check);
+    return () => window.speechSynthesis.removeEventListener?.("voiceschanged", check);
+  }, []);
+
   const mutedRef = useRef(muted);
   mutedRef.current = muted;
   useEffect(() => {
@@ -290,6 +273,7 @@ export function MeetingRoom({ meetingId, topic, seats, founder, scribeName, init
         )}
       </div>
 
+      {voiceTip && <p className="border-t border-white/5 px-4 py-1.5 text-[11px] text-zinc-500">Tip: open this page in Microsoft Edge for natural Indian voices (Neerja, Prabhat, Swara, Madhur) — free.</p>}
       {error && <p className="border-t border-rose-500/20 bg-rose-500/10 px-4 py-2 text-xs text-rose-200">{error}</p>}
 
       <div className="flex flex-wrap items-center gap-2 border-t border-white/5 px-3 py-3">
