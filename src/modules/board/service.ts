@@ -44,6 +44,8 @@ export async function runMeeting(ctx: AppContext, meetingId: string, budgetMs: n
     if (left() < CLOSING_RESERVE_MS) break;
     const { execution, result } = await runAgent(ctx, {
       agent, kind: "chat", maxTokens: 600,
+      // One speaker may not eat the whole meeting: leave time for the others and the closing plan.
+      budgetMs: Math.max(30_000, Math.min(90_000, left() - CLOSING_RESERVE_MS)),
       input: speakerPrompt(role, meeting.topic, lines()),
       parse: (t) => { const s = cleanSpeech(t); if (s.length < 2) throw new AiError("Empty reply", true); return s; },
     });
@@ -68,6 +70,7 @@ export async function runMeeting(ctx: AppContext, meetingId: string, budgetMs: n
   const roster = agents.filter((a) => a.status === "active").map((a) => `${a.name} (${a.designation})`).join(", ");
   const { execution, result } = await runAgent(ctx, {
     agent: ceo, kind: "command", json: true, maxTokens: 2500,
+    budgetMs: Math.max(30_000, left() - 5_000),
     input: closingPrompt(meeting.topic, lines(), roster, kras.map((k) => k.name).join(", ")),
     parse: parsePlan,
   });

@@ -43,7 +43,12 @@ export default async function BoardPage({ searchParams }: { searchParams: Search
   const plan = planSchema.safeParse(planExec?.plan);
   const lines = (messages ?? []).filter((m) => m.seq !== CLOSING_SEQ);
   const closing = (messages ?? []).find((m) => m.seq === CLOSING_SEQ);
-  const fullText = (messages ?? []).filter((m) => !m.failed).map((m) => `${m.speaker.split(" · ")[0]}: ${m.body}`).join("\n\n");
+  // Each member keeps the same voice everywhere: CEO 0, COO 1, CFO 2, Legal Head 3 (the closing is the CEO's).
+  const roleVoice = (m: BoardMessage) => {
+    const seat = board.find((s) => s.agent.id === m.agent_id);
+    return seat ? (["ceo", "coo", "cfo", "legal"] as const).indexOf(seat.role) : 0;
+  };
+  const fullParts = (messages ?? []).filter((m) => !m.failed).map((m) => ({ text: `${m.speaker.split(" · ")[0]}. ${m.body}`, voice: roleVoice(m) }));
 
   return (
     <>
@@ -74,14 +79,14 @@ export default async function BoardPage({ searchParams }: { searchParams: Search
       {meeting ? (
         <Card className="mt-6" title={meeting.topic.length > 120 ? `${meeting.topic.slice(0, 117)}…` : meeting.topic}
           description={`${formatDateTime(meeting.created_at)} · ${meeting.status === "done" ? "decided" : meeting.status === "failed" ? "stopped" : "in progress"}`}
-          action={fullText && <ListenButton text={fullText} label="Play meeting" />}>
+          action={fullParts.length > 0 && <ListenButton parts={fullParts} label="Play meeting" />}>
           {lines.length ? (
             <ol className="space-y-4">
               {lines.map((m) => (
                 <li key={m.id} className="rounded-lg border border-line bg-panel-2/30 p-4">
                   <div className="flex items-center justify-between gap-2">
                     <span className="text-sm font-medium text-zinc-100">{m.speaker}</span>
-                    {!m.failed && <ListenButton text={m.body} />}
+                    {!m.failed && <ListenButton parts={[{ text: m.body, voice: roleVoice(m) }]} />}
                   </div>
                   <p className={`mt-2 whitespace-pre-wrap text-sm ${m.failed ? "text-amber-300" : "text-zinc-300"}`}>{m.body}</p>
                 </li>
@@ -99,7 +104,7 @@ export default async function BoardPage({ searchParams }: { searchParams: Search
             <div className="mt-6 rounded-lg border border-gold/30 bg-gold/[0.05] p-4">
               <div className="flex items-center justify-between gap-2">
                 <span className="flex items-center gap-2 text-sm font-semibold text-gold"><Gavel className="h-4 w-4" />{closing.speaker}</span>
-                <ListenButton text={closing.body} />
+                <ListenButton parts={[{ text: closing.body, voice: 0 }]} />
               </div>
               <p className="mt-2 whitespace-pre-wrap text-sm text-zinc-200">{closing.body}</p>
               {plan.success && (
@@ -143,7 +148,7 @@ export default async function BoardPage({ searchParams }: { searchParams: Search
           </ul>
         </Card>
       )}
-      <p className="mt-6 text-xs text-zinc-500">Listen uses your browser&apos;s built-in voice (free). Natural ElevenLabs voices can be added after the ₹80,000 profit gate.</p>
+      <p className="mt-6 text-xs text-zinc-500">Each board member has their own voice (your browser&apos;s built-in voices — free). Natural ElevenLabs voices can be added after the ₹80,000 profit gate.</p>
     </>
   );
 }

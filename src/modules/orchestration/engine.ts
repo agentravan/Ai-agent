@@ -61,6 +61,8 @@ export interface RunOptions<T> {
   taskId?: string | null;
   json?: boolean;
   maxTokens?: number;
+  /** Optional tighter time limit for this run (e.g. one speaker in a multi-step board meeting). */
+  budgetMs?: number;
   /** Validates/parses output; throw a retryable AiError to make the model try again. */
   parse?: (text: string) => T;
 }
@@ -140,7 +142,7 @@ export async function runAgent<T = string>(ctx: AppContext, opts: RunOptions<T>)
     let totalAttempts = 0;
     let lastError: unknown;
     // One run never outlives the serverless time limit: each attempt gets min(AI_TIMEOUT_MS, time left).
-    const deadline = Date.now() + env.AI_RUN_BUDGET_MS;
+    const deadline = Date.now() + Math.min(env.AI_RUN_BUDGET_MS, opts.budgetMs ?? Infinity);
     const attemptTimeout = () => {
       const left = deadline - Date.now();
       if (left < 15_000) throw new AiError("AI took too long — out of time for this run; it will retry later", false);
