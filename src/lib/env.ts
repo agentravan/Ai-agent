@@ -19,6 +19,13 @@ const schema = z.object({
   OPENAI_COMPATIBLE_MODEL: optional,
   // Comma-separated backup models on the same endpoint, tried in order when the main model fails or times out (max 3).
   OPENAI_COMPATIBLE_FALLBACK_MODELS: optional,
+  // Backup AI services on other OpenAI-compatible endpoints (e.g. NVIDIA, OpenRouter), tried after the main one.
+  AI_BACKUP_1_BASE_URL: z.url().optional().catch(undefined),
+  AI_BACKUP_1_API_KEY: optional,
+  AI_BACKUP_1_MODEL: optional,
+  AI_BACKUP_2_BASE_URL: z.url().optional().catch(undefined),
+  AI_BACKUP_2_API_KEY: optional,
+  AI_BACKUP_2_MODEL: optional,
   AI_COST_INPUT_CENTS_PER_MTOK: z.coerce.number().min(0).catch(0),
   AI_COST_OUTPUT_CENTS_PER_MTOK: z.coerce.number().min(0).catch(0),
   AI_TIMEOUT_MS: intIn(1_000, 280_000, 60_000),

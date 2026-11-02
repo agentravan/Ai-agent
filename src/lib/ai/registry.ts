@@ -10,6 +10,15 @@ export function fallbackModels(e: Env = defaultEnv): string[] {
   return [...new Set(list)].filter((m) => m !== e.OPENAI_COMPATIBLE_MODEL).slice(0, 3);
 }
 
+/** Backup OpenAI-compatible services on other endpoints (AI_BACKUP_1_*, AI_BACKUP_2_*), in order. */
+export function backupServices(e: Env = defaultEnv): { baseUrl: string; model: string; apiKey?: string }[] {
+  const slots = [
+    { baseUrl: e.AI_BACKUP_1_BASE_URL, model: e.AI_BACKUP_1_MODEL, apiKey: e.AI_BACKUP_1_API_KEY },
+    { baseUrl: e.AI_BACKUP_2_BASE_URL, model: e.AI_BACKUP_2_MODEL, apiKey: e.AI_BACKUP_2_API_KEY },
+  ];
+  return slots.filter((b): b is { baseUrl: string; model: string; apiKey?: string } => !!b.baseUrl && !!b.model);
+}
+
 /** All providers that have the configuration they need, in preference order (free first). */
 export function configuredProviders(e: Env = defaultEnv): AiProvider[] {
   const list: AiProvider[] = [];
@@ -18,6 +27,7 @@ export function configuredProviders(e: Env = defaultEnv): AiProvider[] {
     list.push(openAiCompatibleProvider(e.OPENAI_COMPATIBLE_BASE_URL, e.OPENAI_COMPATIBLE_MODEL, e.OPENAI_COMPATIBLE_API_KEY));
   if (e.OPENAI_COMPATIBLE_BASE_URL)
     for (const model of fallbackModels(e)) list.push(openAiCompatibleProvider(e.OPENAI_COMPATIBLE_BASE_URL, model, e.OPENAI_COMPATIBLE_API_KEY));
+  for (const b of backupServices(e)) list.push(openAiCompatibleProvider(b.baseUrl, b.model, b.apiKey));
   if (e.ANTHROPIC_API_KEY) list.push(anthropicProvider(e.ANTHROPIC_API_KEY, e.ANTHROPIC_MODEL));
   return list;
 }
@@ -34,11 +44,12 @@ export function activeProvider(e: Env = defaultEnv): AiProvider | null {
  * providers allowed by AI_FALLBACK. Anthropic (paid) is only a fallback when AI_FALLBACK="all".
  */
 export function providerChain(e: Env = defaultEnv): AiProvider[] {
-  const primary = activeProvider(e);
+  const list = configuredProviders(e);
+  // Same selection rule as activeProvider, on this one list so backups can be compared by identity.
+  const primary = e.AI_PROVIDER ? list.find((p) => p.id === e.AI_PROVIDER) : list[0];
   if (!primary) return [];
   if (e.AI_FALLBACK === "off") return [primary];
-  // Same-endpoint backup models share the primary's id, so compare by model as well as provider.
-  const backups = configuredProviders(e).filter((p) => !(p.id === primary.id && p.model === primary.model) && (e.AI_FALLBACK === "all" || p.id !== "anthropic"));
+  const backups = list.filter((p) => p !== primary && (e.AI_FALLBACK === "all" || p.id !== "anthropic"));
   return [primary, ...backups];
 }
 
