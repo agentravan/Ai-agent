@@ -62,6 +62,13 @@ const schema = z.object({
   GOOGLE_PLACES_API_KEY: optional,
   // Max Google Places result pages (20 each) per lead search. Phone/website fields are billed per request.
   GOOGLE_PLACES_MAX_PAGES: intIn(1, 3, 2),
+  // WhatsApp Desk via a self-hosted WAHA gateway (WhatsApp Web, QR login; no Meta setup). Server-only.
+  // WAHA_URL must be HTTPS (or a private http URL you trust); WAHA_API_KEY is sent as X-Api-Key.
+  WAHA_URL: z.url().optional().catch(undefined),
+  WAHA_API_KEY: optional,
+  WAHA_SESSION: z.string().trim().regex(/^[a-zA-Z0-9_-]{1,40}$/).catch("default"),
+  // Max NEW people the team may message first per day (protects the number from being flagged).
+  WHATSAPP_DAILY_NEW_LIMIT: intIn(1, 30, 10),
 });
 
 export type Env = z.infer<typeof schema>;
