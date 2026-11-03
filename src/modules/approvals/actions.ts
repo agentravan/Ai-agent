@@ -7,6 +7,7 @@ import { logEvent } from "@/modules/audit/service";
 import { executeApprovedPayload } from "@/modules/orchestration/apply";
 import { listAgents } from "@/modules/orchestration/engine";
 import type { Approval } from "@/types/domain";
+import { lessonFromDecision } from "@/modules/learning/logic";
 
 export async function decideApprovalAction(form: FormData) {
   const back = form.get("return_to") === "/dashboard" ? "/dashboard" : "/approvals";
@@ -39,6 +40,12 @@ export async function decideApprovalAction(form: FormData) {
         await logEvent(ctx, { action: "approval.execution_failed", entity: "approvals", entityId: id, metadata: { error: (err as Error).message } });
         throw new UserFacingError(`Approved, but executing the action failed: ${(err as Error).message}`);
       }
+    }
+    // Self-learning: the agent that asked remembers what the Founder decided, so it proposes better next time.
+    const lesson = approval.requested_by_agent_id ? lessonFromDecision({ title: approval.title, action_type: approval.action_type, status, modified, note: note || null }) : null;
+    if (lesson) {
+      const { error: memErr } = await ctx.db.from("agent_memories").insert({ organisation_id: ctx.organisation.id, agent_id: approval.requested_by_agent_id, kind: "decision", ...lesson });
+      if (memErr) console.warn("[learning] lesson not saved", memErr.message);
     }
     await logEvent(ctx, { action: `approval.${status}`, entity: "approvals", entityId: id, metadata: { action_type: approval.action_type, executed_ref: ref, modified, overrides } });
     if (status === "rejected") return "Rejected";

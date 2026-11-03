@@ -6,7 +6,7 @@ import { FileText, Mic, MicOff, MessageSquare, PhoneOff, Play, Scale, Send, Volu
 import { CourtRoom } from "@/components/court/court-room";
 import { trialFromMeetingAction } from "@/modules/court/actions";
 import type { Trial } from "@/modules/court/service";
-import { endMeetingAction, memberTurnAction, sayAction } from "@/modules/board/actions";
+import { endMeetingAction, sayAction } from "@/modules/board/actions";
 import type { BoardMessage } from "@/types/domain";
 import { hasNaturalVoice, pickVoice } from "./voices";
 
@@ -56,6 +56,17 @@ function Tile({ name, title, color, speaking, children, badge }: { name: string;
 
 type Recognition = { lang: string; interimResults: boolean; continuous: boolean; start(): void; stop(): void; onresult: ((e: { results: ArrayLike<ArrayLike<{ transcript: string }>> }) => void) | null; onend: (() => void) | null; onerror: (() => void) | null };
 
+type TurnResult = { ok: true; message: BoardMessage | null } | { ok: false; error: string };
+/** One member's turn via fetch: unlike server actions, these run truly in parallel. */
+async function takeTurn(meetingId: string, agentId: string, mode: "open" | "reply"): Promise<TurnResult> {
+  try {
+    const res = await fetch("/api/board/turn", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ meetingId, agentId, mode }) });
+    return (await res.json()) as TurnResult;
+  } catch {
+    return { ok: false, error: "Network problem — check your internet and ask again." };
+  }
+}
+
 export function MeetingRoom({ meetingId, topic, seats, founder, scribeName, initial, live, canSpeak }: {
   meetingId: string; topic: string; seats: RoomSeat[]; founder: string; scribeName: string | null; initial: BoardMessage[]; live: boolean; canSpeak: boolean;
 }) {
@@ -93,7 +104,7 @@ export function MeetingRoom({ meetingId, topic, seats, founder, scribeName, init
     setThinking(new Set(ids));
     let silent = 0;
     await Promise.all(ids.map(async (id) => {
-      const r = await memberTurnAction(meetingId, id, mode);
+      const r = await takeTurn(meetingId, id, mode);
       setThinking((t) => { const n = new Set(t); n.delete(id); return n; });
       if (!r.ok) { setError(r.error); return; }
       if (r.message) receive([r.message]); else silent++;

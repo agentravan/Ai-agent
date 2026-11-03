@@ -7,7 +7,10 @@ import { UserFacingError, must } from "@/lib/utilities/action";
 import { logEvent } from "@/modules/audit/service";
 import type { AppContext } from "@/modules/auth/session";
 import type { AgentWithPermissions, Execution } from "@/types/domain";
-import { checkAgentCanRun, checkCostLimit, maxAttemptsFor, monthStartIso, STALE_EXECUTION_MS } from "./policy";
+import { checkAgentCanRun, checkCostLimit, COOL_MS, healthyFirst, maxAttemptsFor, monthStartIso, nextAttemptMs, providerKey, shouldCool, STALE_EXECUTION_MS } from "./policy";
+import { pickRecall, recallBlock, type MemoryRow } from "@/modules/learning/logic";
+import { domainsFor, pickPassages, playbookBlock } from "@/modules/knowledge/logic";
+import { PLAYBOOKS } from "@/modules/knowledge/catalog";
 import { growthStage, upgradeUnlocked } from "@/modules/cockpit/metrics";
 import { formatInr } from "@/lib/utilities/format";
 import { MISSION, northStarLabel } from "./mission";
@@ -63,6 +66,8 @@ export interface RunOptions<T> {
   maxTokens?: number;
   /** Optional tighter time limit for this run (e.g. one speaker in a multi-step board meeting). */
   budgetMs?: number;
+  /** Cap for ONE provider attempt, so a hung provider fails over to the backup inside the budget (live meetings). */
+  attemptMs?: number;
   /** Validates/parses output; throw a retryable AiError to make the model try again. */
   parse?: (text: string) => T;
 }
@@ -80,18 +85,21 @@ async function monthlySpendCents(ctx: AppContext, agentId: string): Promise<numb
   return (data ?? []).reduce((sum, r) => sum + Number(r.cost_cents), 0);
 }
 
-async function memoryContext(ctx: AppContext, agentId: string): Promise<string> {
+/** Open Duet-style recall: the notes that share words with this task (plus every standing rule), no AI call. */
+async function memoryContext(ctx: AppContext, agentId: string, input: string): Promise<string> {
   const { data } = await ctx.db
     .from("agent_memories")
-    .select("kind, content")
+    .select("kind, content, importance, created_at")
     .eq("agent_id", agentId)
     .eq("organisation_id", ctx.organisation.id)
-    .order("importance", { ascending: false })
     .order("created_at", { ascending: false })
-    .limit(5)
-    .returns<{ kind: string; content: string }[]>();
-  return data?.length ? `\nRelevant memory:\n${data.map((m) => `- [${m.kind}] ${m.content.slice(0, 500)}`).join("\n")}` : "";
+    .limit(150)
+    .returns<MemoryRow[]>();
+  return recallBlock(pickRecall(data ?? [], input));
 }
+
+/** Per server instance: providers that just hung or hit a limit are tried last for a minute. */
+const coolUntil = new Map<string, number>();
 
 /**
  * Executes one agent run with governance: status + permission + cost checks, a persisted
@@ -105,7 +113,7 @@ export async function runAgent<T = string>(ctx: AppContext, opts: RunOptions<T>)
 
   // Main provider first, then configured backups (AI_FALLBACK). Backups get one attempt each so a
   // failover still fits the serverless time limit.
-  const chain = providerChain();
+  const chain = healthyFirst(providerChain(), coolUntil, Date.now());
   const provider = chain[0];
   if (!provider) throw new AiUnavailableError();
 
@@ -134,8 +142,10 @@ export async function runAgent<T = string>(ctx: AppContext, opts: RunOptions<T>)
       .single<Execution>(),
   );
 
-  const [memory, company] = await Promise.all([memoryContext(ctx, agent.id), companySnapshot(ctx)]);
-  const system = `${GOVERNANCE}\n${goalBriefing(company)}\nYour identity: ${agent.name}, ${agent.designation} (${agent.tier}).\n${agent.instructions}${memory}`;
+  const [memory, company] = await Promise.all([memoryContext(ctx, agent.id, opts.input), companySnapshot(ctx)]);
+  // Executive Playbooks: the passages from this agent's own field that match the task (no AI call).
+  const playbook = playbookBlock(pickPassages(PLAYBOOKS.playbooks, opts.input, domainsFor(agent)));
+  const system = `${GOVERNANCE}\n${goalBriefing(company)}\nYour identity: ${agent.name}, ${agent.designation} (${agent.tier}).\n${agent.instructions}${memory}${playbook}`;
   const update = (patch: Record<string, unknown>) =>
     ctx.db.from("agent_executions").update(patch).eq("id", execution.id).eq("organisation_id", ctx.organisation.id).select("*").single<Execution>();
 
@@ -146,9 +156,9 @@ export async function runAgent<T = string>(ctx: AppContext, opts: RunOptions<T>)
     // One run never outlives the serverless time limit: each attempt gets min(AI_TIMEOUT_MS, time left).
     const deadline = Date.now() + Math.min(env.AI_RUN_BUDGET_MS, opts.budgetMs ?? Infinity);
     const attemptTimeout = () => {
-      const left = deadline - Date.now();
-      if (left < 15_000) throw new AiError("AI took too long — out of time for this run; it will retry later", false);
-      return Math.min(env.AI_TIMEOUT_MS, left);
+      const ms = nextAttemptMs(deadline - Date.now(), env.AI_TIMEOUT_MS, opts.attemptMs);
+      if (ms === null) throw new AiError("AI took too long — out of time for this run; it will retry later", false);
+      return ms;
     };
     let done: { value: { out: GenerateResult; parsed: T }; used: AiProvider } | null = null;
     for (const p of chain) {
@@ -178,7 +188,8 @@ export async function runAgent<T = string>(ctx: AppContext, opts: RunOptions<T>)
       } catch (err) {
         lastError = err;
         firstError ??= err;
-        if (deadline - Date.now() < 15_000) break;
+        if (shouldCool(err)) coolUntil.set(providerKey(p), Date.now() + COOL_MS);
+        if (nextAttemptMs(deadline - Date.now(), env.AI_TIMEOUT_MS, opts.attemptMs) === null) break;
       }
     }
     if (!done) {

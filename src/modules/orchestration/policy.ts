@@ -91,3 +91,31 @@ export function resolveKra(step: Pick<PlanStep, "kra">, assignee: Pick<Agent, "b
 export function maxAttemptsFor(chainLength: number, mainAttempts: number): number {
   return Math.min(10, Math.max(1, mainAttempts + Math.max(0, chainLength - 1)));
 }
+
+/* ───────────── Fast failover (a hung provider must never eat the whole turn) ───────────── */
+
+export const providerKey = (p: { id: string; model: string }) => `${p.id}:${p.model}`;
+
+/** Providers that failed recently go to the back of the line for a minute; order is otherwise kept. */
+export function healthyFirst<P extends { id: string; model: string }>(chain: readonly P[], coolUntil: ReadonlyMap<string, number>, now: number): P[] {
+  const cool = (p: P) => (coolUntil.get(providerKey(p)) ?? 0) > now;
+  return [...chain.filter((p) => !cool(p)), ...chain.filter(cool)];
+}
+
+/** Hangs, rate limits and server errors mean "try someone else first next time"; bad input does not. */
+export function shouldCool(err: unknown): boolean {
+  const m = `${(err as Error)?.name ?? ""} ${(err as Error)?.message ?? ""}`.toLowerCase();
+  return /time|abort|429|rate.?limit|quota|50\d|overload|unavailable|empty answer|fetch failed|network/.test(m);
+}
+
+export const COOL_MS = 60_000;
+
+/**
+ * Time for the next attempt: never more than AI_TIMEOUT_MS, the caller's per-attempt cap, or the time left.
+ * Null = too little time left to be worth trying (then the run stops and says so).
+ */
+export function nextAttemptMs(leftMs: number, envTimeoutMs: number, attemptMs?: number): number | null {
+  const minUseful = attemptMs ? Math.min(15_000, Math.ceil(attemptMs / 2)) : 15_000;
+  if (leftMs < minUseful) return null;
+  return Math.min(envTimeoutMs, attemptMs ?? Infinity, leftMs);
+}

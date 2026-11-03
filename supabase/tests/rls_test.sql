@@ -6,7 +6,8 @@ insert into auth.users (id, email) values
 
 do $$ begin
   assert (select count(*) from public.organisations) = 2, 'one org per founder';
-  assert (select count(*) from public.agents) = 22, 'eleven starter agents each (4 executives + Legal Head + 4 managers + Scribe + Nyaya)';
+  assert (select count(*) from public.agents) = 26, 'thirteen starter agents each (4 executives + Legal Head + Strategy + Product + 4 managers + Scribe + Nyaya)';
+  assert (select count(*) from public.agents where name in ('Chanakya', 'Pragati') and tier = 'executive') = 4, 'Strategy and Product heads seeded';
   assert (select count(*) from public.agents where name = 'Nyaya') = 2, 'Idea Court seeded';
   assert (select count(*) from public.agents where name = 'Scribe') = 2, 'Scribe seeded';
   assert (select count(*) from public.agents where name = 'Themis' and tier = 'executive') = 2, 'Legal Head seeded';
@@ -19,7 +20,8 @@ do $$ begin
   perform private.seed_board(id) from public.organisations;
   perform private.seed_scribe(id) from public.organisations;
   perform private.seed_court(id) from public.organisations;
-  assert (select count(*) from public.agents) = 22, 'seed is idempotent';
+  perform private.seed_strategy_product(id) from public.organisations;
+  assert (select count(*) from public.agents) = 26, 'seed is idempotent';
   assert (select count(*) from public.profiles where role = 'founder') = 2, 'founder role';
 end $$;
 
@@ -29,7 +31,7 @@ select set_config('request.jwt.claim.sub', '11111111-1111-1111-1111-111111111111
 do $$
 declare other_agent uuid; t1 uuid; t2 uuid; appr uuid;
 begin
-  assert (select count(*) from public.agents) = 11, 'RLS: sees only own agents';
+  assert (select count(*) from public.agents) = 13, 'RLS: sees only own agents';
   assert (select count(*) from public.kras) = 10, 'RLS: sees only own KRAs';
   assert (select count(*) from public.organisations) = 1, 'RLS: sees only own org';
 
