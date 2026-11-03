@@ -53,11 +53,15 @@ function textOf(msg) {
   return { text: String(text).slice(0, 4000), hasMedia };
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const withTimeout = (p, ms, what) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(`${what} timed out`)), ms))]);
 
 // ── WhatsApp link ───────────────────────────────────────────────────────────────
 let sock = null;
 let connected = false;
 let pollTimer = null;
+// One pairing code per run: asking again and again makes WhatsApp block linking for a while.
+let codeShownAt = 0;
+const CODE_VALID_MS = 3 * 60_000;
 
 async function pollOnce() {
   if (!connected || !sock) return;
@@ -78,25 +82,28 @@ async function pollOnce() {
 
 async function start() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-  const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: undefined }));
+  const { version } = await withTimeout(fetchLatestBaileysVersion(), 10_000, "version check").catch(() => ({ version: undefined }));
   sock = makeWASocket({
-    version, auth: state, printQRInTerminal: false, browser: Browsers.macOS("Chrome"),
+    version, auth: state, printQRInTerminal: false, browser: Browsers.ubuntu("Chrome"),
     logger: pino({ level: "silent" }), markOnlineOnConnect: false, syncFullHistory: false,
   });
   sock.ev.on("creds.update", saveCreds);
   await status("connecting");
 
-  if (!sock.authState.creds.registered) {
-    await sleep(3000);
-    try {
-      const code = await sock.requestPairingCode(PHONE);
-      const pretty = code.length === 8 ? `${code.slice(0, 4)}-${code.slice(4)}` : code;
-      log(`PAIRING CODE: ${pretty}  → WhatsApp → Linked devices → Link a device → Link with phone number instead`);
-      await status("pairing", { pairing_code: pretty.toUpperCase() });
-    } catch (e) { log("pairing code failed:", e.message); }
-  }
-
-  sock.ev.on("connection.update", async ({ connection, lastDisconnect }) => {
+  sock.ev.on("connection.update", async ({ connection, lastDisconnect, qr }) => {
+    // WhatsApp is ready to link (it offers a QR) → ask for a pairing code instead — once, and only when the last one expired.
+    if (qr && !sock.authState.creds.registered && Date.now() - codeShownAt > CODE_VALID_MS) {
+      codeShownAt = Date.now();
+      try {
+        const code = await withTimeout(sock.requestPairingCode(PHONE), 30_000, "pairing code");
+        const pretty = code.length === 8 ? `${code.slice(0, 4)}-${code.slice(4)}` : code;
+        log("");
+        log(`PAIRING CODE:  ${pretty.split("").join(" ")}`);
+        log("→ WhatsApp Business → ⋮ → Linked devices → Link a device → Link with phone number instead");
+        log("  (valid ~3 min — enter it now; letters are capital, P≠9, O≠0, I≠1)");
+        await status("pairing", { pairing_code: pretty.toUpperCase() });
+      } catch (e) { codeShownAt = 0; log("pairing code failed:", e.message, "— retrying soon"); }
+    }
     if (connection === "open") {
       connected = true;
       log("✅ WhatsApp connected");
@@ -108,12 +115,20 @@ async function start() {
       connected = false;
       clearInterval(pollTimer);
       const code = lastDisconnect?.error?.output?.statusCode;
-      if (code === DisconnectReason.loggedOut) {
+      const wasLinked = !!sock?.authState?.creds?.registered;
+      if (code === DisconnectReason.loggedOut && wasLinked) {
         log("WhatsApp unlinked this device — starting a fresh link.");
         await status("logged_out");
         rmSync(AUTH_DIR, { recursive: true, force: true });
+        codeShownAt = 0;
+      } else if (!wasLinked && code === DisconnectReason.loggedOut) {
+        log("That code didn't work (wrong or expired) — getting a fresh one…");
+        rmSync(AUTH_DIR, { recursive: true, force: true });
+        codeShownAt = 0;
+      } else if (!wasLinked) {
+        log("waiting for you to enter the code…");
       } else log("connection closed, reconnecting…", code ?? "");
-      await sleep(5000);
+      await sleep(wasLinked ? 5000 : 3000);
       start().catch((e) => { log("restart failed:", e.message); setTimeout(() => process.exit(1), 2000); });
     }
   });
