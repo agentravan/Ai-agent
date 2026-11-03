@@ -1,1 +1,3 @@
-gateway/
+# Only the phone gateway folder at the repo root (it runs in Termux, not on Vercel).
+# Leading slash matters: without it, src/app/api/whatsapp/gateway was dropped from the deploy (404).
+/gateway/
