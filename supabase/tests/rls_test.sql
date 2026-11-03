@@ -98,6 +98,18 @@ begin
     insert into public.rank_checks (organisation_id, keyword_id, position) values (private.auth_org_id(), t1, 61);
     raise exception 'rank position out of range allowed';
   exception when check_violation then null; end;
+  -- WhatsApp Desk: the Founder records sends; opt-outs are permanent.
+  insert into public.whatsapp_contacts (organisation_id, chat_id) values (private.auth_org_id(), '919876543210@c.us') returning id into t1;
+  insert into public.whatsapp_sends (organisation_id, chat_id, body, kind, sent_by) values (private.auth_org_id(), '919876543210@c.us', 'Namaste!', 'first_contact', auth.uid());
+  update public.whatsapp_contacts set opted_out = true, opted_out_at = now() where id = t1;
+  begin
+    update public.whatsapp_contacts set opted_out = false, opted_out_at = null where id = t1;
+    raise exception 'whatsapp opt-out reversed';
+  exception when check_violation then null; end;
+  begin
+    insert into public.whatsapp_contacts (organisation_id, chat_id) values (private.auth_org_id(), 'not-a-number');
+    raise exception 'bad chat id allowed';
+  exception when check_violation then null; end;
   -- Board meetings; the INR North Star follows the Founder's USD target and rate.
   insert into public.board_meetings (organisation_id, topic, created_by) values (private.auth_org_id(), 'Phase 0 revenue', auth.uid()) returning id into t1;
   insert into public.board_messages (organisation_id, meeting_id, seq, speaker, body) values (private.auth_org_id(), t1, 0, 'Atlas', 'Start with websites');
@@ -178,6 +190,10 @@ do $$ declare l uuid; begin
   begin
     update public.idea_trials set adopted_at = now() where id = l;
     raise exception 'member adopted a verdict';
+  exception when insufficient_privilege then null; end;
+  begin
+    insert into public.whatsapp_sends (organisation_id, chat_id, body, kind, sent_by) values (private.auth_org_id(), '919876543211@c.us', 'Hi', 'reply', auth.uid());
+    raise exception 'member sent a WhatsApp message';
   exception when insufficient_privilege then null; end;
 end $$;
 

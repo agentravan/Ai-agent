@@ -210,3 +210,13 @@ export interface BoardMessage {
   id: string; meeting_id: string; seq: number; agent_id: string | null; speaker: string; body: string; failed: boolean;
   role: "member" | "founder" | "scribe" | "system"; created_at: string;
 }
+
+/** WhatsApp Desk (self-hosted WAHA gateway): opt-outs, first contacts and an audit of sends. Messages stay in WhatsApp. */
+export interface WhatsappContact {
+  id: string; organisation_id: string; chat_id: string; lead_id: string | null; opted_out: boolean; opted_out_at: string | null;
+  first_contact_at: string | null; created_at: string; updated_at: string;
+}
+export interface WhatsappSend {
+  id: string; organisation_id: string; chat_id: string; body: string; kind: "reply" | "first_contact";
+  drafted_by: string | null; sent_by: string | null; wa_message_id: string | null; created_at: string;
+}
