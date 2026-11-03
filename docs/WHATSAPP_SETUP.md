@@ -1,6 +1,19 @@
 # WhatsApp Desk — setup (free, no Meta)
 
-## Fastest path: one command on an Oracle Always Free server
+## No card, no laptop: free Hugging Face Space (≈10 min, phone or laptop browser)
+1. Sign up at huggingface.co (email only, free).
+2. **New → Space** → name `ai-empire-whatsapp` → SDK **Docker** → **Blank** → hardware **CPU basic (free)** → Create.
+3. **Files → Add file → Create new file**: copy `deploy/whatsapp-hf-space/Dockerfile` and `deploy/whatsapp-hf-space/README.md`
+   from this repo (replace the generated README).
+4. **Settings → Variables and secrets → New secret**: `WAHA_API_KEY` and `WHATSAPP_HOOK_HMAC_KEY` (long random strings).
+5. Wait for "Running". Your gateway URL is `https://<username>-ai-empire-whatsapp.hf.space`.
+6. Vercel (Production): `WAHA_URL` = that URL, `WAHA_API_KEY` (same), `WHATSAPP_WEBHOOK_SECRET` (= WHATSAPP_HOOK_HMAC_KEY),
+   `WHATSAPP_AUTO_REPLY=safe` → Redeploy → WhatsApp Desk → scan the QR.
+
+Free-tier limits: the Space sleeps after 48 h without requests (the app's daily jobs ping it), and a restart may log
+WhatsApp out — the desk then shows a new QR to scan. For no restarts, use the Oracle path below.
+
+## Fastest path with a card: one command on an Oracle Always Free server
 1. Create the server (from a phone browser is fine): cloud.oracle.com → Compute → Instances → Create → Ubuntu, shape
    **VM.Standard.A1.Flex** (Always Free). Networking → your VCN → Security Lists → Default → **Add Ingress Rules**:
    source `0.0.0.0/0`, TCP, ports `80,443`.
