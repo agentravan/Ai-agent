@@ -5,9 +5,18 @@ import type { AppContext } from "@/modules/auth/session";
 import { companySnapshot, listAgents, runAgent } from "@/modules/orchestration/engine";
 import type { Mom } from "@/types/domain";
 import {
-  defencePrompt, deliberationPrompt, majority, parseDefence, parseProsecution, parseRuling, prosecutionPrompt,
+  defencePrompt, deliberationPrompt, hearingPrompt, majority, ownedUpgrades, parseDefence, parseHearing, parseRuling, rulingText,
   type Defence, type Prosecution, type Ruling, type Vote,
 } from "./logic";
+
+/** Live court: one provider gets a short slice, so a hung model fails over to the backup inside the budget. */
+const HEARING = { budgetMs: 45_000, attemptMs: 14_000, maxTokens: 1400 };
+const VERDICT = { budgetMs: 70_000, attemptMs: 22_000, maxTokens: 1900 };
+
+/** The executives the defence speaks for: active C-suite, as "Name (Title)". */
+const teamOf = (agents: Awaited<ReturnType<typeof listAgents>>) =>
+  agents.filter((a) => a.status === "active" && (a.tier === "ceo" || a.tier === "coo" || a.tier === "executive")).map((a) => `${a.name} (${a.designation})`).slice(0, 8);
+
 
 export interface Trial {
   id: string; organisation_id: string; idea: string; proposed_by: string | null; meeting_id: string | null;
@@ -45,7 +54,7 @@ async function judge(ctx: AppContext) {
 export async function advanceTrial(ctx: AppContext, id: string): Promise<Trial> {
   const trial = await load(ctx, id);
   if (trial.stage === "decided") return trial;
-  const [court, context] = await Promise.all([judge(ctx), caseContext(ctx)]);
+  const [court, context, agents] = await Promise.all([judge(ctx), caseContext(ctx), listAgents(ctx)]);
   const update = async (patch: Partial<Trial>) => {
     const { data } = await ctx.db.from("idea_trials").update({ ...patch, error: null }).eq("id", id).eq("organisation_id", ctx.organisation.id).select("*").single<Trial>();
     return data ?? trial;
@@ -55,17 +64,18 @@ export async function advanceTrial(ctx: AppContext, id: string): Promise<Trial> 
     throw new Error(`The court could not continue: ${(error ?? "AI unavailable").slice(0, 200)}`);
   };
 
+  // One call for the whole hearing (prosecution + defence) — the court used to take three slow rounds.
   if (!trial.prosecution) {
-    const { execution, result } = await runAgent(ctx, { agent: court, kind: "chat", json: true, maxTokens: 700, budgetMs: 60_000, input: prosecutionPrompt(trial.idea, trial.proposed_by, context), parse: parseProsecution });
-    return result ? update({ prosecution: result, stage: "prosecuted" }) : fail(execution.error);
+    const { execution, result } = await runAgent(ctx, { agent: court, kind: "chat", json: true, ...HEARING, input: hearingPrompt(trial.idea, trial.proposed_by, context, teamOf(agents)), parse: parseHearing });
+    return result ? update({ prosecution: result.prosecution, defence: result.defence, stage: "defended" }) : fail(execution.error);
   }
-  if (!trial.defence) {
-    const { execution, result } = await runAgent(ctx, { agent: court, kind: "chat", json: true, maxTokens: 800, budgetMs: 60_000, input: defencePrompt(trial.idea, trial.prosecution.questions, context), parse: parseDefence });
+  if (!trial.defence) { // cases filed before the combined hearing
+    const { execution, result } = await runAgent(ctx, { agent: court, kind: "chat", json: true, ...HEARING, maxTokens: 800, input: defencePrompt(trial.idea, trial.prosecution.questions, context), parse: parseDefence });
     return result ? update({ defence: result, stage: "defended" }) : fail(execution.error);
   }
   const { execution, result } = await runAgent(ctx, {
-    agent: court, kind: "chat", json: true, maxTokens: 1600, budgetMs: 90_000,
-    input: deliberationPrompt(trial.idea, trial.prosecution.questions, trial.defence.answers, context), parse: parseRuling,
+    agent: court, kind: "chat", json: true, ...VERDICT,
+    input: deliberationPrompt(trial.idea, trial.prosecution.questions, trial.defence.answers, context, trial.prosecution.weaknesses ?? [], trial.defence.team ?? []), parse: parseRuling,
   });
   if (!result) return fail(execution.error);
   const { votes, verdict: _judgeSays, ...ruling } = result;
@@ -77,9 +87,17 @@ export async function advanceTrial(ctx: AppContext, id: string): Promise<Trial> 
       const { data: lastSeq } = await ctx.db.from("board_messages").select("seq").eq("meeting_id", decided.meeting_id).order("seq", { ascending: false }).limit(1).maybeSingle<{ seq: number }>();
       await ctx.db.from("board_messages").insert({
         organisation_id: ctx.organisation.id, meeting_id: decided.meeting_id, seq: (lastSeq?.seq ?? -1) + 1, role: "system", speaker: "Idea Court",
-        body: `Verdict on "${decided.idea.slice(0, 200)}": ${decided.verdict.toUpperCase()} (${votes.filter((v) => v.vote === "build").length} build, ${votes.filter((v) => v.vote === "fix").length} fix, ${votes.filter((v) => v.vote === "kill").length} kill). ${ruling.summary} Fix: ${ruling.fix} Next test: ${ruling.next_test} Vision: ${ruling.vision}`.slice(0, 6000),
+        body: rulingText(decided),
       });
     }
+  }
+  // The judge's update reaches every team member at once (advisory until the Founder adopts it).
+  const team = agents.filter((a) => a.status === "active");
+  if (team.length) {
+    await ctx.db.from("agent_memories").insert(team.map((a) => ({
+      organisation_id: ctx.organisation.id, agent_id: a.id, kind: "note", importance: 4,
+      content: `(Advisory — awaiting the Founder's adoption) ${rulingText(decided)}`.slice(0, 2400),
+    })));
   }
   await logEvent(ctx, { action: "court.verdict", entity: "idea_trials", entityId: id, actorType: "agent", metadata: { verdict: decided.verdict } });
   return decided;
@@ -96,16 +114,41 @@ export async function adoptVerdict(ctx: AppContext, id: string): Promise<string>
   const { error } = await ctx.db.from("idea_trials").update({ adopted_at: new Date().toISOString() }).eq("id", id).eq("organisation_id", ctx.organisation.id).is("adopted_at", null);
   if (error) throw new Error(error.code === "42501" ? "Only the Founder or an admin can adopt a verdict" : error.message);
   const agents = (await listAgents(ctx)).filter((a) => a.status === "active");
-  const memory = `Team vision (Idea Court, ${trial.verdict.toUpperCase()}): ${trial.ruling.vision} Idea: ${trial.idea.slice(0, 300)}. Fix: ${trial.ruling.fix}. Next test: ${trial.ruling.next_test}`.slice(0, 2000);
-  await ctx.db.from("agent_memories").insert(agents.map((a) => ({ organisation_id: ctx.organisation.id, agent_id: a.id, kind: "decision", importance: 5, content: memory })));
+  const ruling = rulingText(trial);
+  // Everyone follows the adopted ruling; each executive also keeps the part the defence spoke for them.
+  await ctx.db.from("agent_memories").insert(agents.map((a) => {
+    const mine = (trial.defence?.team ?? []).find((t) => t.who.toLowerCase().startsWith(a.name.toLowerCase()));
+    return {
+      organisation_id: ctx.organisation.id, agent_id: a.id, kind: "decision", importance: 5,
+      content: `ADOPTED by the Founder — follow this. ${mine ? `Your part: do ${mine.do}${mine.dont ? `; don't ${mine.dont}` : ""}. ` : ""}${ruling}`.slice(0, 2600),
+    };
+  }));
   const owner = agents.find((a) => trial.proposed_by && a.name.toLowerCase() === trial.proposed_by.toLowerCase()) ?? agents.find((a) => a.tier === "ceo");
-  if (trial.verdict !== "kill" && owner) {
-    await ctx.db.from("tasks").insert({
-      organisation_id: ctx.organisation.id, title: `7-day test: ${trial.idea.slice(0, 150)}`.slice(0, 200),
-      description: `${trial.ruling.next_test}\n\nFix first: ${trial.ruling.fix}\nVision: ${trial.ruling.vision}`, priority: "high",
-      assigned_agent_id: owner.id, created_by: ctx.userId,
-    });
+  let upgradeTasks = 0;
+  if (trial.verdict !== "kill") {
+    const rows = [];
+    if (owner) {
+      rows.push({
+        organisation_id: ctx.organisation.id, title: `7-day test: ${trial.idea.slice(0, 150)}`.slice(0, 200),
+        description: `${trial.ruling.next_test}\n\nFix first: ${trial.ruling.fix}${trial.ruling.stop_if ? `\nStop if: ${trial.ruling.stop_if}` : ""}\nVision: ${trial.ruling.vision}`,
+        priority: "high", assigned_agent_id: owner.id, created_by: ctx.userId,
+      });
+    }
+    // Every upgrade with a real owner becomes that agent's task (normal task governance applies).
+    for (const u of ownedUpgrades(trial.ruling.upgrades ?? [], agents)) {
+      rows.push({
+        organisation_id: ctx.organisation.id, title: `Upgrade: ${u.weakness}`.slice(0, 200),
+        description: `${u.upgrade}\n\nFrom the Idea Court ruling on: ${trial.idea.slice(0, 300)}`, priority: "medium",
+        assigned_agent_id: u.agent.id, created_by: ctx.userId,
+      });
+    }
+    if (rows.length) {
+      const { error: taskErr } = await ctx.db.from("tasks").insert(rows);
+      if (taskErr) console.warn("[court] tasks not created", taskErr.message);
+      else upgradeTasks = rows.length - (owner ? 1 : 0);
+    }
   }
   await logEvent(ctx, { action: "court.verdict_adopted", entity: "idea_trials", entityId: id, metadata: { verdict: trial.verdict } });
-  return trial.verdict === "kill" ? "Adopted — the team will drop this idea and remembers why" : `Adopted — the whole team now shares this vision; ${owner?.name ?? "the CEO"} owns the 7-day test`;
+  return trial.verdict === "kill" ? "Adopted — the team will drop this idea and remembers why"
+    : `Adopted — the whole team follows this ruling; ${owner?.name ?? "the CEO"} owns the 7-day test${upgradeTasks ? `, ${upgradeTasks} upgrade task${upgradeTasks === 1 ? "" : "s"} assigned` : ""}`;
 }
