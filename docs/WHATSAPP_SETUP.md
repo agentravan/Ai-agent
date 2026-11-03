@@ -1,5 +1,26 @@
 # WhatsApp Desk — setup (free, no Meta)
 
+## Fastest path: one command on an Oracle Always Free server
+1. Create the server (from a phone browser is fine): cloud.oracle.com → Compute → Instances → Create → Ubuntu, shape
+   **VM.Standard.A1.Flex** (Always Free). Networking → your VCN → Security Lists → Default → **Add Ingress Rules**:
+   source `0.0.0.0/0`, TCP, ports `80,443`.
+2. Open **Cloud Shell** (top bar), `ssh ubuntu@PUBLIC_IP`, then run:
+   ```bash
+   curl -fsSLo setup.sh https://raw.githubusercontent.com/agentravan/Ai-agent/feat/ai-empire-os-foundation/scripts/whatsapp-gateway-setup.sh
+   sudo WAHA_KEY='…' HOOK_SECRET='…' bash setup.sh
+   ```
+   It installs Docker, starts WAHA behind HTTPS (`https://<ip>.sslip.io`) and points WAHA's **signed** webhook at the app.
+3. Vercel (Production): `WAHA_URL` (printed), `WAHA_API_KEY` (= WAHA_KEY), `WHATSAPP_WEBHOOK_SECRET` (= HOOK_SECRET),
+   `WHATSAPP_AUTO_REPLY=safe`. Redeploy → WhatsApp Desk → scan the QR (WhatsApp → Linked devices).
+
+## Automation (Founder's policy, 3 Nov 2026: `WHATSAPP_AUTO_REPLY=safe`)
+- A client writes → WAHA calls `/api/whatsapp/waha` (HMAC-SHA512, rejected without a valid signature) → Iris drafts.
+- **Simple answers** (timings, services, next step) are sent automatically.
+- Anything about **price, payment, legal/tax, dates/promises**, photos/files, or more than 4 auto-replies in a chat within
+  an hour → **Approval Center** with the client's message and Iris's reply; **Approve** sends it.
+- "STOP" / "message mat karo" → blocked forever. Every message is handled once; every send is audited.
+- `WHATSAPP_AUTO_REPLY=off` → every reply waits for approval.
+
 The team chats with clients on **your own WhatsApp number**. A small free program, **WAHA**
 (github.com/devlikeapro/waha), logs in to your number by QR — like WhatsApp Web — and AI Empire talks to it.
 

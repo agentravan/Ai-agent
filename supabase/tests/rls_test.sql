@@ -110,6 +110,10 @@ begin
     insert into public.whatsapp_contacts (organisation_id, chat_id) values (private.auth_org_id(), 'not-a-number');
     raise exception 'bad chat id allowed';
   exception when check_violation then null; end;
+  begin
+    insert into public.whatsapp_inbound (organisation_id, wa_message_id, chat_id) values (private.auth_org_id(), 'x', '919876543210@c.us');
+    raise exception 'users can forge incoming WhatsApp messages';
+  exception when insufficient_privilege then null; end;
   -- Board meetings; the INR North Star follows the Founder's USD target and rate.
   insert into public.board_meetings (organisation_id, topic, created_by) values (private.auth_org_id(), 'Phase 0 revenue', auth.uid()) returning id into t1;
   insert into public.board_messages (organisation_id, meeting_id, seq, speaker, body) values (private.auth_org_id(), t1, 0, 'Atlas', 'Start with websites');

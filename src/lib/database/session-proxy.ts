@@ -2,8 +2,9 @@ import { createServerClient } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
 import { supabaseConfig } from "@/lib/env";
 
-// /api/cron authenticates with CRON_SECRET inside the route (no user session).
-export const PUBLIC_PATHS = ["/", "/login", "/auth", "/api/health", "/api/cron"];
+// /api/cron authenticates with CRON_SECRET inside the route (no user session);
+// /api/whatsapp/waha accepts only requests signed with WHATSAPP_WEBHOOK_SECRET (HMAC) — checked inside the route.
+export const PUBLIC_PATHS = ["/", "/login", "/auth", "/api/health", "/api/cron", "/api/whatsapp/waha"];
 
 export function isPublicPath(pathname: string): boolean {
   return PUBLIC_PATHS.some((p) => pathname === p || (p !== "/" && pathname.startsWith(`${p}/`)));
