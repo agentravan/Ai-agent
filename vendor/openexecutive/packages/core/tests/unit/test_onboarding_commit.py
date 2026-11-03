@@ -1,0 +1,821 @@
+"""Persisting a reviewed onboarding draft: people + the ADDITIVE department reconcile.
+
+The department half is the reason this file exists. ``cli/fixture_loader``
+seeds departments by DELETing every row first — correct for swapping in a demo
+company, and destructive here: a re-run of setup would drop the departments a
+workspace already has, with their goals and specialist wiring. These tests pin
+the additive behaviour so nobody "simplifies" it into the fixture seeder later.
+
+``dept_db`` holds the full catalogue (a workspace from before installs started
+empty); ``empty_dept_db`` is a new install, where setup's draft decides which
+departments exist.
+"""
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+
+import pytest
+
+from openexecutive.departments import store as dept_store
+from openexecutive.onboarding.commit import (
+    OwnerEmailError,
+    adopt_owner_row,
+    check_owner_email,
+    derive_org_structure,
+    link_owner_email,
+    reconcile_onboarding_departments,
+    save_onboarding_goals,
+    save_onboarding_people,
+)
+from openexecutive.onboarding.interview import (
+    CompanyDraft,
+    DepartmentDraft,
+    GoalDraft,
+    PersonDraft,
+)
+from openexecutive.people import store as people_store
+
+
+@pytest.fixture()
+def dept_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    path = tmp_path / "departments.db"
+    monkeypatch.setattr(dept_store, "DB_PATH", path)
+    dept_store.initialize_db(path)
+    dept_store.seed_default_departments(path)
+    monkeypatch.setattr("openexecutive.departments.registry.invalidate", lambda: None)
+    return path
+
+
+@pytest.fixture()
+def empty_dept_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    path = tmp_path / "departments.db"
+    monkeypatch.setattr(dept_store, "DB_PATH", path)
+    dept_store.initialize_db(path)
+    monkeypatch.setattr("openexecutive.departments.registry.invalidate", lambda: None)
+    return path
+
+
+@pytest.fixture()
+def people_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    path = tmp_path / "people.db"
+    monkeypatch.setattr(people_store, "DB_PATH", path)
+    people_store.initialize_db(path)
+    return path
+
+
+# ── people ───────────────────────────────────────────────────────────────────
+
+
+def test_saves_roster_and_grants_wildcard_to_the_principal_only(
+    people_db: Path,
+) -> None:
+    ids = save_onboarding_people(
+        [
+            PersonDraft(full_name="Dana Reyes", role="CEO", is_principal=True),
+            PersonDraft(full_name="Sam Okafor", role="Head of Ops"),
+        ]
+    )
+    assert set(ids) == {"Dana Reyes", "Sam Okafor"}
+
+    principal = people_store.find_principal_person(db_path=people_db)
+    assert principal is not None
+    assert principal.full_name == "Dana Reyes"
+    # Contacts are never auto-imported.
+    assert principal.email is None
+    assert principal.slack_user_id is None
+
+    assert [s.value for s in principal.authority_scope] == ["wildcard"]
+    # Everyone else gets nothing — onboarding grants authority to the user only.
+    sam = people_store.get_person(ids["Sam Okafor"], db_path=people_db)
+    assert sam is not None
+    assert sam.authority_scope == []
+
+
+def test_blank_names_are_skipped(people_db: Path) -> None:
+    assert save_onboarding_people([PersonDraft(full_name="   ")]) == {}
+
+
+def test_people_failure_is_swallowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A people error must never cost the user the profile they just saved."""
+    monkeypatch.setattr(
+        "openexecutive.people.store.initialize_db",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("disk on fire")),
+    )
+    assert save_onboarding_people([PersonDraft(full_name="Dana", is_principal=True)]) == {}
+
+
+# ── departments ──────────────────────────────────────────────────────────────
+
+
+def test_matching_department_is_updated_not_recreated(dept_db: Path) -> None:
+    before = {d.config.slug: d.config for d in dept_store.list_departments(dept_db)}
+    assert "finance" in before, "expected the seeded defaults"
+    original_specialist = before["finance"].specialist_key
+
+    counts = reconcile_onboarding_departments(
+        [DepartmentDraft(title="Finance", mission="Own the model and the runway.")],
+        {},
+    )
+    assert counts == {"updated": 1, "created": 0}
+
+    after = {d.config.slug: d.config for d in dept_store.list_departments(dept_db)}
+    assert len(after) == len(before), "reconcile must not add or remove rows here"
+    assert after["finance"].charter.mission == "Own the model and the runway."
+    # The specialist wiring survives — create_department could never restore it.
+    assert after["finance"].specialist_key == original_specialist
+
+
+def test_unmatched_department_is_created(dept_db: Path) -> None:
+    before = len(dept_store.list_departments(dept_db))
+    counts = reconcile_onboarding_departments(
+        [DepartmentDraft(title="Customer Success", mission="Keep accounts alive.")], {}
+    )
+    assert counts == {"updated": 0, "created": 1}
+
+    after = {d.config.slug: d.config for d in dept_store.list_departments(dept_db)}
+    assert len(after) == before + 1
+    assert after["customer-success"].charter.mission == "Keep accounts alive."
+
+
+def test_unmentioned_departments_are_never_deleted(dept_db: Path) -> None:
+    before = {d.config.slug for d in dept_store.list_departments(dept_db)}
+    reconcile_onboarding_departments([DepartmentDraft(title="Finance")], {})
+    after = {d.config.slug for d in dept_store.list_departments(dept_db)}
+    assert before <= after
+
+
+def test_title_match_is_case_insensitive(dept_db: Path) -> None:
+    counts = reconcile_onboarding_departments(
+        [DepartmentDraft(title="fInAnCe", mission="Lowercase heresy.")], {}
+    )
+    assert counts["created"] == 0
+    assert counts["updated"] == 1
+
+
+def test_head_person_is_attached_when_known(dept_db: Path) -> None:
+    reconcile_onboarding_departments(
+        [DepartmentDraft(title="Finance", head_person_name="Dana Reyes")],
+        {"Dana Reyes": 42},
+    )
+    finance = dept_store.get_department("finance", dept_db)
+    assert finance is not None
+    assert finance.config.head_person_id == 42
+
+
+def test_draft_without_a_head_leaves_an_existing_head_alone(dept_db: Path) -> None:
+    """An empty head_person_name means "unknown", not "clear it"."""
+    dept_store.update_department("finance", head_person_id=7, db_path=dept_db)
+    reconcile_onboarding_departments([DepartmentDraft(title="Finance")], {})
+    finance = dept_store.get_department("finance", dept_db)
+    assert finance is not None
+    assert finance.config.head_person_id == 7
+
+
+def test_empty_mission_preserves_the_existing_charter(dept_db: Path) -> None:
+    before = dept_store.get_department("finance", dept_db)
+    assert before is not None
+    reconcile_onboarding_departments([DepartmentDraft(title="Finance")], {})
+    after = dept_store.get_department("finance", dept_db)
+    assert after is not None
+    assert after.config.charter.mission == before.config.charter.mission
+    assert after.config.charter.scope == before.config.charter.scope
+
+
+def test_authority_level_is_applied(dept_db: Path) -> None:
+    reconcile_onboarding_departments(
+        [DepartmentDraft(title="Finance", authority_level="auto_execute")], {}
+    )
+    finance = dept_store.get_department("finance", dept_db)
+    assert finance is not None
+    assert finance.config.authority_level.value == "auto_execute"
+
+
+def test_blank_titles_are_skipped(dept_db: Path) -> None:
+    assert reconcile_onboarding_departments([DepartmentDraft(title="  ")], {}) == {
+        "updated": 0,
+        "created": 0,
+    }
+
+
+def test_department_failure_is_swallowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "openexecutive.departments.store.initialize_db",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("disk on fire")),
+    )
+    assert reconcile_onboarding_departments([DepartmentDraft(title="Finance")], {}) == {
+        "updated": 0,
+        "created": 0,
+    }
+
+
+# ── derived org structure ────────────────────────────────────────────────────
+
+
+def _draft() -> CompanyDraft:
+    return CompanyDraft.model_validate(
+        {
+            "profile": {"name": "Northwind Tools"},
+            "people": [
+                {"full_name": "Dana Reyes", "role": "CEO", "is_principal": True},
+                {"full_name": "Sam Okafor", "role": "Head of Ops"},
+            ],
+            "departments": [{"title": "Operations"}, {"title": "Finance"}],
+        }
+    )
+
+
+def test_org_structure_is_derived_from_people_and_departments() -> None:
+    d = _draft()
+    out = derive_org_structure(d.profile, d.people, d.departments)
+    assert out.org_structure.departments == ["Operations", "Finance"]
+    assert out.org_structure.leadership_team == [
+        "Dana Reyes, CEO",
+        "Sam Okafor, Head of Ops",
+    ]
+    # Everything else is untouched.
+    assert out.name == "Northwind Tools"
+
+
+def test_person_without_a_role_renders_as_a_bare_name() -> None:
+    d = _draft()
+    d.people[1].role = ""
+    out = derive_org_structure(d.profile, d.people, d.departments)
+    assert out.org_structure.leadership_team == ["Dana Reyes, CEO", "Sam Okafor"]
+
+
+def test_degenerate_title_matches_the_slug_the_store_assigns(dept_db: Path) -> None:
+    """A title that slugifies to nothing must not create a new row every run.
+
+    departments.store falls back to "department" for such a title. Onboarding
+    has to predict the SAME slug to find the row again — before slugify was
+    unified these disagreed ("" vs "department"), so a second pass created
+    `department-2` instead of updating.
+    """
+    first = reconcile_onboarding_departments(
+        [DepartmentDraft(title="###", mission="Odd but non-empty.")], {}
+    )
+    assert first == {"updated": 0, "created": 1}
+
+    second = reconcile_onboarding_departments(
+        [DepartmentDraft(title="###", mission="Odd but non-empty.")], {}
+    )
+    assert second == {"updated": 1, "created": 0}, "second pass must update, not re-create"
+
+    slugs = [d.config.slug for d in dept_store.list_departments(dept_db)]
+    assert slugs.count("department") == 1
+    assert "department-2" not in slugs
+
+
+# ── re-running setup (regressions from adversarial review) ───────────────────
+
+
+def test_rerun_updates_people_instead_of_duplicating(people_db: Path) -> None:
+    """save_onboarding_people must be a real upsert.
+
+    upsert_person only UPDATEs when given a person_id; without name matching a
+    second run inserted a whole second roster, including a second
+    is_principal row.
+    """
+    first = save_onboarding_people(
+        [
+            PersonDraft(full_name="Dana Reyes", role="CEO", is_principal=True),
+            PersonDraft(full_name="Sam Okafor", role="Head of Ops"),
+        ]
+    )
+    second = save_onboarding_people(
+        [
+            PersonDraft(full_name="Dana Reyes", role="Founder & CEO", is_principal=True),
+            PersonDraft(full_name="Sam Okafor", role="COO"),
+        ]
+    )
+    assert first == second, "the same names must resolve to the same rows"
+
+    everyone = people_store.list_people(db_path=people_db)
+    assert len(everyone) == 2, f"expected no duplicates, got {[p.full_name for p in everyone]}"
+    assert {p.role for p in everyone} == {"Founder & CEO", "COO"}
+
+
+def test_rerun_with_a_new_principal_demotes_the_old_one(people_db: Path) -> None:
+    """find_principal_person tie-breaks on oldest id, so a stale principal wins.
+
+    The old founder must lose both the flag and WILDCARD, or they keep blanket
+    approval authority and keep receiving the principal's routing.
+    """
+    save_onboarding_people([PersonDraft(full_name="Dana Reyes", is_principal=True)])
+    save_onboarding_people([PersonDraft(full_name="Bo Nakamura", is_principal=True)])
+
+    principal = people_store.find_principal_person(db_path=people_db)
+    assert principal is not None
+    assert principal.full_name == "Bo Nakamura"
+
+    flagged = [p for p in people_store.list_people(db_path=people_db) if p.is_principal]
+    assert [p.full_name for p in flagged] == ["Bo Nakamura"]
+
+    dana = next(
+        p for p in people_store.list_people(db_path=people_db) if p.full_name == "Dana Reyes"
+    )
+    assert dana.authority_scope == [], "the old principal must lose WILDCARD"
+
+
+def test_rerun_preserves_contact_details(people_db: Path) -> None:
+    """upsert_person's UPDATE writes every column — contacts must be carried."""
+    ids = save_onboarding_people([PersonDraft(full_name="Dana Reyes", is_principal=True)])
+    people_store.update_person(
+        ids["Dana Reyes"],
+        email="dana@example.com",
+        slack_user_id="U123",
+        db_path=people_db,
+    )
+
+    save_onboarding_people(
+        [PersonDraft(full_name="Dana Reyes", role="CEO", is_principal=True)]
+    )
+    dana = people_store.get_person(ids["Dana Reyes"], db_path=people_db)
+    assert dana is not None
+    assert dana.email == "dana@example.com", "re-running setup must not wipe contacts"
+    assert dana.slack_user_id == "U123"
+    assert dana.role == "CEO"
+
+
+def test_demotion_keeps_non_wildcard_scopes(people_db: Path) -> None:
+    from openexecutive.people.models import AuthorityScope
+
+    ids = save_onboarding_people([PersonDraft(full_name="Dana Reyes", is_principal=True)])
+    people_store.set_authority_scope(
+        ids["Dana Reyes"],
+        [AuthorityScope.WILDCARD, AuthorityScope.LEGAL_SIGN],
+        db_path=people_db,
+    )
+    save_onboarding_people([PersonDraft(full_name="Bo Nakamura", is_principal=True)])
+
+    dana = people_store.get_person(ids["Dana Reyes"], db_path=people_db)
+    assert dana is not None
+    assert [s.value for s in dana.authority_scope] == ["legal_sign"]
+
+
+def test_two_drafts_colliding_on_one_slug_create_one_department(dept_db: Path) -> None:
+    """The lookup maps used to be built once, so the second draft made `-2`."""
+    before = len(dept_store.list_departments(dept_db))
+    counts = reconcile_onboarding_departments(
+        [
+            DepartmentDraft(title="Growth", mission="A"),
+            DepartmentDraft(title="growth", mission="B"),
+        ],
+        {},
+    )
+    assert counts == {"updated": 0, "created": 1}
+    after = dept_store.list_departments(dept_db)
+    assert len(after) == before + 1
+    assert "growth-2" not in {d.config.slug for d in after}
+
+
+def test_two_drafts_matching_one_existing_department_apply_once(dept_db: Path) -> None:
+    counts = reconcile_onboarding_departments(
+        [
+            DepartmentDraft(title="Finance", mission="First"),
+            DepartmentDraft(title="finance", mission="Second"),
+        ],
+        {},
+    )
+    assert counts == {"updated": 1, "created": 0}, "counts must not claim two updates"
+    finance = dept_store.get_department("finance", dept_db)
+    assert finance is not None
+    assert finance.config.charter.mission == "First"
+
+
+def test_rerun_preserves_every_column_upsert_writes(people_db: Path) -> None:
+    """Guards the whole carry-across, not just the two contacts above.
+
+    ``upsert_person``'s UPDATE branch writes every column unconditionally, so
+    any field ``save_onboarding_people`` forgets to pass is silently NULLed on
+    a re-run. If someone adds a column there, this fails instead of quietly
+    wiping user data.
+    """
+    from datetime import date
+
+    ids = save_onboarding_people([PersonDraft(full_name="Dana Reyes", is_principal=True)])
+    pid = ids["Dana Reyes"]
+    people_store.update_person(
+        pid,
+        email="dana@example.com",
+        slack_user_id="U1",
+        telegram_chat_id="T1",
+        discord_user_id="D1",
+        preferred_channel="slack",
+        response_sla_hours=4,
+        on_leave_until=date(2030, 1, 1),
+        department_slugs=["finance"],
+        db_path=people_db,
+    )
+    before = people_store.get_person(pid, db_path=people_db)
+    assert before is not None
+
+    save_onboarding_people(
+        [PersonDraft(full_name="Dana Reyes", role="CEO", is_principal=True)]
+    )
+    after = people_store.get_person(pid, db_path=people_db)
+    assert after is not None
+
+    # role is the one field the draft is allowed to change.
+    for field in (
+        "email",
+        "slack_user_id",
+        "telegram_chat_id",
+        "discord_user_id",
+        "preferred_channel",
+        "response_sla_hours",
+        "on_leave_until",
+        "department_slugs",
+    ):
+        assert getattr(after, field) == getattr(before, field), f"{field} was not preserved"
+    assert after.role == "CEO"
+
+
+def test_drafts_resolving_to_one_row_by_title_apply_once(dept_db: Path) -> None:
+    """The shipped `hr` department is titled "People & Talent", so slug !=
+    slugify(title). Keying the dedupe on the drafted slug missed that: both
+    drafts resolved to the same row and the second silently clobbered the
+    first, while counts claimed two updates."""
+    hr = dept_store.get_department("hr", dept_db)
+    assert hr is not None and hr.config.title != "HR", "fixture assumption"
+
+    before = len(dept_store.list_departments(dept_db))
+    counts = reconcile_onboarding_departments(
+        [
+            DepartmentDraft(title="HR", mission="Recruiting and payroll"),
+            DepartmentDraft(title=hr.config.title, mission="Culture and L&D"),
+        ],
+        {},
+    )
+    assert counts == {"updated": 1, "created": 0}, "must not claim two updates"
+    assert len(dept_store.list_departments(dept_db)) == before
+
+    after = dept_store.get_department("hr", dept_db)
+    assert after is not None
+    assert after.config.charter.mission == "Recruiting and payroll", (
+        "the first draft must win, not be silently overwritten"
+    )
+
+
+def test_demoted_roster_member_loses_wildcard(people_db: Path) -> None:
+    """Someone who stays on the roster but is no longer principal falls through
+    _demote_stale_principals (they ARE in keep_ids) — they must lose WILDCARD
+    in the main loop or they keep blanket approval authority."""
+    from openexecutive.people.models import AuthorityScope
+
+    ids = save_onboarding_people([PersonDraft(full_name="Alice", is_principal=True)])
+    people_store.set_authority_scope(
+        ids["Alice"],
+        [AuthorityScope.WILDCARD, AuthorityScope.LEGAL_SIGN],
+        db_path=people_db,
+    )
+
+    save_onboarding_people(
+        [
+            PersonDraft(full_name="Alice", role="Founder", is_principal=False),
+            PersonDraft(full_name="Bob", role="CEO", is_principal=True),
+        ]
+    )
+
+    alice = people_store.get_person(ids["Alice"], db_path=people_db)
+    assert alice is not None
+    assert alice.is_principal is False
+    assert [s.value for s in alice.authority_scope] == ["legal_sign"]
+
+    principal = people_store.find_principal_person(db_path=people_db)
+    assert principal is not None and principal.full_name == "Bob"
+
+
+def test_case_variant_names_collapse_onto_one_row_not_two(people_db: Path) -> None:
+    """The upsert key is case-folded, so two spellings are one person. The
+    snapshot is refreshed in the loop so the second never inserts a duplicate."""
+    ids = save_onboarding_people(
+        [
+            PersonDraft(full_name="JANE DOE", role="CEO", is_principal=True),
+            PersonDraft(full_name="Jane Doe", role="Advisor"),
+        ]
+    )
+    assert len(set(ids.values())) == 1
+    everyone = people_store.list_people(db_path=people_db)
+    assert len(everyone) == 1, f"duplicate rows: {[p.full_name for p in everyone]}"
+
+
+# ── the owner's sign-in email ────────────────────────────────────────────────
+# Setup collects no contact details, so without this step the signed-in owner
+# matched no Person: their chat list stayed empty until they found the People
+# page on their own.
+
+
+def test_blank_owner_email_means_none(people_db: Path) -> None:
+    assert check_owner_email(None, "Dana Reyes") is None
+    assert check_owner_email("   ", "Dana Reyes") is None
+
+
+def test_owner_email_is_trimmed_and_lowercased(people_db: Path) -> None:
+    assert check_owner_email("  Dana@Example.COM ", "Dana Reyes") == "dana@example.com"
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "dana",
+        "dana@",
+        "@example.com",
+        "dana@example",
+        "dana @example.com",
+        "dana@exa mple.com",
+        "dana@example.com, sam@example.com",
+        "a@b@example.com",
+        f"{'d' * 250}@example.com",
+    ],
+)
+def test_malformed_owner_email_is_rejected_without_echoing_it(
+    people_db: Path, bad: str
+) -> None:
+    with pytest.raises(OwnerEmailError) as err:
+        check_owner_email(bad, "Dana Reyes")
+    assert bad.strip().lower() not in str(err.value)
+
+
+def test_owner_email_held_by_someone_else_is_rejected(people_db: Path) -> None:
+    """Two rows with one email would make sign-in resolve to the older one."""
+    people_store.upsert_person(full_name="Sam Okafor", email="sam@example.com")
+    with pytest.raises(OwnerEmailError) as err:
+        check_owner_email("SAM@example.com", "Dana Reyes")
+    assert "sam@example.com" not in str(err.value)
+
+
+def test_owner_email_already_on_the_principals_own_row_is_fine(people_db: Path) -> None:
+    """Re-running setup: the drafted principal maps onto their existing row by
+    case-insensitive name, so their own email is not a conflict."""
+    people_store.upsert_person(full_name="Dana Reyes", email="dana@example.com", is_principal=True)
+    assert check_owner_email("dana@example.com", "  dana reyes ") == "dana@example.com"
+
+
+def test_an_archived_holder_does_not_block_the_owner_email(people_db: Path) -> None:
+    pid = people_store.upsert_person(full_name="Former CEO", email="dana@example.com")
+    people_store.archive_person(pid)
+    assert check_owner_email("dana@example.com", "Dana Reyes") == "dana@example.com"
+
+
+def test_an_unreadable_roster_rejects_rather_than_risking_a_duplicate(
+    people_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _locked(email: str, *_a: object, **_kw: object) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    # The owner-email check matches aliases too (find_person_by_address).
+    monkeypatch.setattr(people_store, "find_person_by_address", _locked)
+    with pytest.raises(OwnerEmailError):
+        check_owner_email("dana@example.com", "Dana Reyes")
+
+
+def test_linking_makes_the_owner_resolvable_by_their_sign_in(people_db: Path) -> None:
+    ids = save_onboarding_people(
+        [PersonDraft(full_name="Dana Reyes", role="CEO", is_principal=True)]
+    )
+    assert link_owner_email(ids["Dana Reyes"], "dana@example.com") is True
+
+    found = people_store.find_person_by_email("Dana@Example.com", db_path=people_db)
+    assert found is not None and found.id == ids["Dana Reyes"]
+    assert found.is_principal
+
+
+def test_link_failure_is_swallowed(people_db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    pid = people_store.upsert_person(full_name="Dana Reyes", is_principal=True)
+
+    def _boom(*a: object, **k: object) -> bool:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(people_store, "update_person", _boom)
+    assert link_owner_email(pid, "dana@example.com") is False
+
+
+def test_setup_never_replaces_the_principals_existing_email(people_db: Path) -> None:
+    """Re-run by someone else who kept their own login in the field: replacing
+    Dana's address would sign her out, since sign-in and caller resolution
+    both key on it, and hand her seat to the re-runner."""
+    people_store.upsert_person(full_name="Dana Reyes", email="dana@example.com", is_principal=True)
+    with pytest.raises(OwnerEmailError) as err:
+        check_owner_email("ops@example.com", "Dana Reyes")
+    assert "People page" in str(err.value)
+    assert "ops@example.com" not in str(err.value)
+
+
+def test_a_renamed_owner_is_told_it_is_their_own_entry(people_db: Path) -> None:
+    """The upsert keys on the name, so a renamed principal is a new row and
+    their old one still holds the email. The message must not call that
+    "someone else"."""
+    people_store.upsert_person(full_name="Dana Reyes", email="dana@example.com", is_principal=True)
+    with pytest.raises(OwnerEmailError) as err:
+        check_owner_email("dana@example.com", "Dana Reyes-Kim")
+    assert "current owner" in str(err.value)
+    assert "someone else" not in str(err.value)
+
+
+def test_two_entries_sharing_the_owners_name_cannot_split_the_email(people_db: Path) -> None:
+    """The name-keyed upsert updates the LAST row with that name. If that is
+    not the row holding the email, linking would give two people one email
+    and resolve the owner's sign-in to the row being demoted."""
+    people_store.upsert_person(full_name="Ann Lee", email="ann@example.com", is_principal=True)
+    people_store.upsert_person(full_name="Ann Lee")
+    with pytest.raises(OwnerEmailError) as err:
+        check_owner_email("ann@example.com", "Ann Lee")
+    assert "current owner" in str(err.value)
+
+
+def test_link_refuses_an_email_another_entry_holds(people_db: Path) -> None:
+    people_store.upsert_person(full_name="Sam Okafor", email="sam@example.com")
+    pid = people_store.upsert_person(full_name="Dana Reyes", is_principal=True)
+    assert link_owner_email(pid, "sam@example.com") is False
+    person = people_store.get_person(pid, db_path=people_db)
+    assert person is not None and person.email is None
+
+
+def test_link_never_replaces_a_different_email(people_db: Path) -> None:
+    pid = people_store.upsert_person(
+        full_name="Dana Reyes", email="dana@example.com", is_principal=True
+    )
+    assert link_owner_email(pid, "ops@example.com") is False
+    person = people_store.get_person(pid, db_path=people_db)
+    assert person is not None and person.email == "dana@example.com"
+
+
+def test_someone_elses_alias_is_not_the_owners_email(people_db: Path) -> None:
+    pid = people_store.upsert_person(full_name="Ben Teammate", email="ben@example.com")
+    people_store.set_person_emails(pid, ["dana@example.com"])
+    with pytest.raises(OwnerEmailError):
+        check_owner_email("dana@example.com", "Dana Reyes")
+
+
+# ── a new install: setup decides which departments exist ───────────────────
+
+
+def test_new_install_with_no_drafted_departments_has_none(empty_dept_db: Path) -> None:
+    assert reconcile_onboarding_departments([], {}) == {"updated": 0, "created": 0}
+    assert dept_store.list_departments(db_path=empty_dept_db) == []
+
+
+def test_new_install_creates_only_the_drafted_departments(empty_dept_db: Path) -> None:
+    counts = reconcile_onboarding_departments(
+        [DepartmentDraft(title="Finance"), DepartmentDraft(title="Growth")], {}
+    )
+    assert counts == {"updated": 0, "created": 2}
+    by_slug = {
+        d.config.slug: d.config for d in dept_store.list_departments(db_path=empty_dept_db)
+    }
+    assert set(by_slug) == {"finance", "growth"}
+    # Named after a specialist's area: wired to it and given its charter.
+    assert by_slug["finance"].specialist_key == "cfo"
+    assert by_slug["finance"].charter.scope  # the catalogue's Finance scope
+    # Anything else stays informational.
+    assert by_slug["growth"].specialist_key is None
+
+
+def test_a_specialist_is_wired_to_only_one_new_department(empty_dept_db: Path) -> None:
+    # "HR" and "People & Talent" slug differently but are both the chro area.
+    reconcile_onboarding_departments(
+        [DepartmentDraft(title="HR"), DepartmentDraft(title="People & Talent")], {}
+    )
+    keys = [d.config.specialist_key for d in dept_store.list_departments(db_path=empty_dept_db)]
+    assert keys.count("chro") == 1
+
+
+# ── the owner's seeded entry: matched by the sign-in email ───────────────────
+
+
+def test_the_signed_in_owner_may_name_their_own_seeded_entry(people_db: Path) -> None:
+    """A hosted sign-up seeds the owner's entry from the address ("ada"), and
+    setup drafts the real name. Signed in as that address, the save goes
+    through instead of asking for "the name on the People page"."""
+    people_store.upsert_person(full_name="ada", email="ada@example.com", is_principal=True)
+    assert (
+        check_owner_email("ada@example.com", "Ada Lovelace", caller_email="ada@example.com")
+        == "ada@example.com"
+    )
+
+
+def test_someone_else_signed_in_still_gets_the_rename_error(people_db: Path) -> None:
+    people_store.upsert_person(full_name="ada", email="ada@example.com", is_principal=True)
+    with pytest.raises(OwnerEmailError) as err:
+        check_owner_email("ada@example.com", "Ada Lovelace", caller_email="sam@example.com")
+    assert "current owner" in str(err.value)
+    with pytest.raises(OwnerEmailError):
+        check_owner_email("ada@example.com", "Ada Lovelace")
+
+
+def test_adopt_renames_the_owners_entry_so_the_upsert_updates_it(people_db: Path) -> None:
+    people_store.upsert_person(full_name="ada", email="ada@example.com", is_principal=True)
+    assert adopt_owner_row("ada@example.com", "Ada Lovelace", "ada@example.com") is True
+    rows = people_store.list_people()
+    assert [p.full_name for p in rows] == ["Ada Lovelace"]
+    assert rows[0].is_principal and rows[0].email == "ada@example.com"
+
+    ids = save_onboarding_people(
+        [PersonDraft(full_name="Ada Lovelace", role="Owner", is_principal=True)]
+    )
+    assert len(people_store.list_people()) == 1
+    assert ids["Ada Lovelace"] == rows[0].id
+
+
+@pytest.mark.parametrize(
+    ("email", "caller"),
+    [
+        ("ada@example.com", "sam@example.com"),  # not the signed-in person
+        ("ada@example.com", None),  # no signed-in person
+        ("other@example.com", "other@example.com"),  # not the owner's address
+        ("", "ada@example.com"),  # nothing to match on
+    ],
+)
+def test_adopt_leaves_other_cases_alone(people_db: Path, email: str, caller: str | None) -> None:
+    people_store.upsert_person(full_name="ada", email="ada@example.com", is_principal=True)
+    assert adopt_owner_row(email, "Ada Lovelace", caller) is False
+    assert [p.full_name for p in people_store.list_people()] == ["ada"]
+
+
+def test_adopt_never_renames_onto_an_existing_name(people_db: Path) -> None:
+    people_store.upsert_person(full_name="ada", email="ada@example.com", is_principal=True)
+    people_store.upsert_person(full_name="Ada Lovelace")
+    assert adopt_owner_row("ada@example.com", "Ada Lovelace", "ada@example.com") is False
+
+
+def test_adopt_is_a_no_op_when_the_name_already_matches(people_db: Path) -> None:
+    people_store.upsert_person(full_name="Ada Lovelace", email="ada@example.com", is_principal=True)
+    assert adopt_owner_row("ada@example.com", "ada lovelace", "ada@example.com") is False
+
+
+# ── goals ────────────────────────────────────────────────────────────────────
+
+
+def test_goals_are_saved_with_owners_and_no_department(empty_dept_db: Path) -> None:
+    created = save_onboarding_goals(
+        [
+            GoalDraft(title="Launch the hosted version", target="Live by June"),
+            GoalDraft(title="Ship the mobile apps", owner_name="dan lee"),
+            GoalDraft(title="  "),
+        ],
+        {"Rufus Ames": 1, "Dan Lee": 2},
+        principal_id=1,
+    )
+    assert created == 2
+    goals = {g.key_result: g for g in dept_store.list_all_goals()}
+    assert set(goals) == {"Launch the hosted version", "Ship the mobile apps"}
+    launch = goals["Launch the hosted version"]
+    assert launch.department_slug is None
+    assert launch.owner_person_id == 1
+    assert launch.target == "Live by June"
+    assert launch.period_type == "year"
+    assert goals["Ship the mobile apps"].owner_person_id == 2
+    # No department was drafted, so none exists.
+    assert dept_store.list_departments() == []
+
+
+def test_a_goal_lands_in_the_drafted_department(empty_dept_db: Path) -> None:
+    reconcile_onboarding_departments([DepartmentDraft(title="Engineering")], {})
+    save_onboarding_goals(
+        [GoalDraft(title="Ship v2", department_title="engineering")], {}, principal_id=7
+    )
+    (goal,) = dept_store.list_all_goals()
+    assert goal.department_slug == "engineering"
+    # The principal, not the department's head: the review showed "you".
+    assert goal.owner_person_id == 7
+
+
+def test_rerunning_setup_does_not_duplicate_goals(empty_dept_db: Path) -> None:
+    drafts = [GoalDraft(title="Launch the hosted version")]
+    assert save_onboarding_goals(drafts, {}, principal_id=1) == 1
+    again = [GoalDraft(title="launch the hosted version "), GoalDraft(title="Win customers")]
+    assert save_onboarding_goals(again, {}, principal_id=1) == 1
+    assert sorted(g.key_result for g in dept_store.list_all_goals()) == [
+        "Launch the hosted version",
+        "Win customers",
+    ]
+
+
+def test_last_years_goal_does_not_block_this_years(empty_dept_db: Path) -> None:
+    dept_store.insert_goal(
+        None, period_type="year", period_value="2001", key_result="Launch", target=""
+    )
+    assert save_onboarding_goals([GoalDraft(title="launch")], {}, principal_id=1) == 1
+    assert sorted(g.period_value for g in dept_store.list_all_goals())[0] == "2001"
+    assert len(dept_store.list_all_goals()) == 2
+
+
+def test_goal_failure_is_swallowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*a: object, **k: object) -> None:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(dept_store, "initialize_db", boom)
+    assert save_onboarding_goals([GoalDraft(title="Launch")], {}, principal_id=1) == 0
+
+
+def test_goals_become_this_years_priorities() -> None:
+    d = _draft()
+    goals = [GoalDraft(title="Launch"), GoalDraft(title=" Win customers ")]
+    out = derive_org_structure(d.profile, d.people, d.departments, goals)
+    assert out.strategic_priorities.current_year == ["Launch", "Win customers"]
+    # No goals leaves the drafted priorities as they were.
+    d.profile.strategic_priorities.current_year = ["Grow"]
+    kept = derive_org_structure(d.profile, d.people, d.departments)
+    assert kept.strategic_priorities.current_year == ["Grow"]

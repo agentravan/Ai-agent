@@ -1,0 +1,1471 @@
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+import re
+import time
+from collections import OrderedDict
+from typing import Any
+
+from openexecutive.audit.redaction import ERROR_DETAIL_LEN
+from openexecutive.orchestrator.people_tools import audit_rows_on_senders_turn
+
+logger = logging.getLogger(__name__)
+
+# Cached at startup via client.auth_test(). Used to:
+#  1. Detect when the bot is the author of a message in a thread (so we
+#     can recognize "the bot has already engaged" without separately
+#     tracking session state).
+#  2. Suppress double-firing on the generic `message` event when the
+#     message is actually an @-mention (which `app_mention` handles).
+# Stays None while auth_test fails — the handler falls back to the
+# mention/DM-only behavior so the bot still responds, just without thread
+# auto-continuation — and `_resolve_bot_user_id` tries again on later
+# channel messages, so a failure at boot doesn't last until a restart.
+_bot_user_id: str | None = None
+
+# At most one auth_test retry per interval while the id is unresolved: the
+# retry runs on the generic `message` listener, which sees every message in
+# every channel the bot is in.
+_BOT_ID_RETRY_INTERVAL_S = 60.0
+_bot_id_last_attempt: float | None = None
+
+# Preserves the concurrency ceiling the sync adapter had. That ceiling was
+# Bolt's own listener_executor — ThreadPoolExecutor(max_workers=5)
+# (slack_bolt/app/app.py) — which ran the handler bodies. The socket client's
+# `concurrency=10` pool only did dispatch+ack, which returns immediately, so
+# 5 (not 10) was the real cap on concurrent executive.chat() calls.
+_MAX_CONCURRENT_HANDLERS = 5
+
+# Serializes turns within one conversation. The semaphore above caps how many
+# Slack messages are in flight across the workspace; it does nothing to stop
+# two messages in the SAME conversation from being processed concurrently,
+# which makes both turns read history before either writes it — interleaved
+# turns and a confused reply. Mirrors the per-chat lock in telegram_bot.py and
+# the per-session lock in discord_bot.py. Unbounded growth matches both of
+# those; a conversation's lock is a few dozen bytes.
+_session_locks: dict[str, asyncio.Lock] = {}
+
+# Event ids already taken. Slack sends an event again when it thinks the first
+# delivery wasn't acknowledged in time (and Socket Mode can redeliver on a
+# reconnect); without this the Executive would answer the same message twice.
+_SEEN_EVENTS_MAX = 2000
+_seen_event_ids: OrderedDict[str, None] = OrderedDict()
+
+
+def _first_delivery(event_id: str) -> bool:
+    """Record ``event_id``; False when it was already taken."""
+    if not event_id:
+        return True
+    if event_id in _seen_event_ids:
+        _seen_event_ids.move_to_end(event_id)
+        return False
+    _seen_event_ids[event_id] = None
+    while len(_seen_event_ids) > _SEEN_EVENTS_MAX:
+        _seen_event_ids.popitem(last=False)
+    return True
+
+
+def _delivered_to(body: dict) -> set[str]:
+    """The workspace ids an Events API payload says it was delivered for."""
+    teams = {str(body.get("team_id") or "")}
+    for authorization in body.get("authorizations") or []:
+        if isinstance(authorization, dict):
+            teams.add(str(authorization.get("team_id") or ""))
+    teams.discard("")
+    return teams
+
+
+def bot_user_id() -> str | None:
+    """The bot's own Slack user id, or None while it is unresolved."""
+    return _bot_user_id
+
+
+async def _resolve_bot_user_id(client: Any) -> str | None:
+    """Resolve and cache the bot's user id with ``auth_test``.
+
+    Returns the cached id when there is one. While there isn't, tries at most
+    once per ``_BOT_ID_RETRY_INTERVAL_S``, so a Slack outage at boot costs
+    thread auto-continuation for a minute rather than until a restart.
+    """
+    global _bot_user_id, _bot_id_last_attempt
+    if _bot_user_id:
+        return _bot_user_id
+    now = time.monotonic()
+    if (
+        _bot_id_last_attempt is not None
+        and now - _bot_id_last_attempt < _BOT_ID_RETRY_INTERVAL_S
+    ):
+        return None
+    _bot_id_last_attempt = now
+    try:
+        auth = await asyncio.wait_for(client.auth_test(), timeout=5)
+        _bot_user_id = str(auth.get("user_id") or "") or None
+    except Exception:
+        logger.warning(
+            "Slack: auth_test() failed — thread auto-continuation is off until "
+            "it succeeds",
+            exc_info=True,
+        )
+        return None
+    if _bot_user_id:
+        logger.info("Slack bot_user_id resolved to %s", _bot_user_id)
+    return _bot_user_id
+
+
+# The reaction a thread message gets when the response gate passes it over.
+_SKIPPED_REACTION = "eyes"
+
+
+async def _react_skipped(client: Any, event: dict) -> None:
+    """React to a message the response gate skipped. Never raises."""
+    ts = event.get("ts")
+    if client is None or not ts:
+        return
+    try:
+        await asyncio.wait_for(
+            client.reactions_add(
+                channel=event.get("channel", ""),
+                timestamp=str(ts),
+                name=_SKIPPED_REACTION,
+            ),
+            timeout=5,
+        )
+    except Exception:
+        # Most often missing_scope: the app was installed without
+        # reactions:write. The skip is still audited.
+        logger.info(
+            "Slack: couldn't react to a skipped message (ts=%s)", ts, exc_info=True
+        )
+
+
+def _session_lock(session_id: str) -> asyncio.Lock:
+    lock = _session_locks.get(session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _session_locks[session_id] = lock
+    return lock
+
+
+def _slack_session_id(
+    *,
+    mode: str,
+    channel: str,
+    user_id: str,
+    thread_ts: str,
+    is_threaded_reply: bool,
+) -> str:
+    """Deterministic session id keyed to the conversation surface.
+
+    The previous scheme was ``slack:{channel}:{thread_ts}`` with ``thread_ts``
+    falling back to the message's own ``ts``. In a DM there is no ``thread_ts``,
+    so every single message minted a fresh id — which, once history was
+    persisted against it, would still have left every Slack turn starting from
+    zero. That is the root cause of #136: the bot asked "should I send it to
+    Slack?", the user said yes, and the next turn had no record of the question.
+
+    - DM → ``slack:dm:{user_id}`` — one long-lived conversation per person,
+      matching ``discord:dm:{user_id}``.
+    - Reply inside an existing thread → ``slack:thread:{channel}:{thread_ts}``.
+    - Mention that starts a thread → ``slack:channel:{channel}:{user_id}``, a
+      rolling per-(channel, person) session. The reply also roots a Slack
+      thread at this message's ``ts``, so the turn is double-written to
+      ``slack:thread:{channel}:{ts}`` (see `_persist_turn`) — otherwise the
+      first continuation inside that thread would start cold.
+    """
+    if mode == "dm":
+        return f"slack:dm:{user_id}"
+    if is_threaded_reply:
+        return f"slack:thread:{channel}:{thread_ts}"
+    return f"slack:channel:{channel}:{user_id}"
+
+
+def _format_user_content(text: str, speaker: str | None) -> str:
+    """Prefix a persisted user turn with its speaker in multi-human threads.
+
+    Replayed history is otherwise unattributed: in a thread with three people
+    the model cannot tell who said what. Mirrors discord_bot's
+    `_format_user_content`; DMs stay unprefixed (1:1, no ambiguity).
+    """
+    if not speaker:
+        return text
+    return f"[{speaker}]: {text}"
+
+
+def _session_title(person: object, mode: str) -> str:
+    """Human-readable title for the /sessions sidebar."""
+    name = (
+        getattr(person, "display_name", None)
+        or getattr(person, "full_name", None)
+        or "Slack"
+    )
+    surface = {"dm": "DM", "mention": "channel", "thread_continuation": "thread"}
+    return f"Slack {surface.get(mode, mode)} — {name}"
+
+
+def _persist_turn(
+    *,
+    session_id: str,
+    title: str,
+    created_at: str,
+    owner_person_id: int | None,
+    user_text: str,
+    assistant_text: str,
+    also_session_id: str | None = None,
+    sender_person_id: int | None = None,
+) -> None:
+    """Write one Q+A to the session store, best-effort.
+
+    Sync (SQLite) — call it via ``asyncio.to_thread``. Never raises: the user
+    already has their reply, so a persistence failure must not turn a
+    successful turn into the generic error path. ``also_session_id`` is the
+    double-write target for a mention that roots a new Slack thread.
+    """
+    from openexecutive.memory.session_store import (
+        create_session,
+        save_message,
+        update_session_timestamp,
+    )
+
+    for sid in (session_id, also_session_id):
+        if not sid:
+            continue
+        try:
+            create_session(sid, title, created_at, caller_person_id=owner_person_id)
+            save_message(sid, "user", user_text, sender_person_id=sender_person_id)
+            save_message(sid, "assistant", assistant_text)
+            update_session_timestamp(sid)
+        except Exception:
+            logger.exception("Slack: failed to persist turn for session %s", sid)
+
+
+def _find_slack_sender(slack_user_id: str) -> object:
+    from openexecutive.people.store import find_person_by_slack_id
+
+    return find_person_by_slack_id(slack_user_id)
+
+
+# The event fields a held message keeps for its replay.
+_HELD_EVENT_KEYS = (
+    "type", "text", "user", "channel", "channel_type", "ts", "thread_ts",
+    "files", "subtype",
+)
+
+
+async def _hold_unknown_sender(
+    event: dict, say: Any, client: Any, mode: str, slack_user_id: str, text: str
+) -> None:
+    """Hold a DM or mention from a Slack user off the roster for the
+    principal to confirm, and tell the sender — privately — that it arrived.
+    One of the principal's contacts gets nothing: contacts have no chat
+    access, and their messages are dropped as before."""
+    from openexecutive.integrations import roster_intake
+    from openexecutive.people.store import find_person_by_slack_id
+
+    if await asyncio.to_thread(find_person_by_slack_id, slack_user_id, include_contacts=True):
+        return
+    display_name, profile_email = "", None
+    if client is not None:
+        try:
+            info = await asyncio.wait_for(client.users_info(user=slack_user_id), timeout=5)
+            user = (info.get("user") or {}) if hasattr(info, "get") else {}
+            profile = user.get("profile") or {}
+            display_name = str(
+                profile.get("real_name") or profile.get("display_name") or user.get("real_name") or ""
+            )
+            profile_email = str(profile.get("email") or "") or None
+        except Exception:
+            logger.debug("Slack: users_info failed for an unknown sender", exc_info=True)
+    thread_ts = event.get("thread_ts") or event.get("ts")
+
+    async def _ack(ack_text: str) -> None:
+        if mode == "dm":
+            await say(text=ack_text, thread_ts=thread_ts if event.get("thread_ts") else None)
+        else:
+            # Only the sender sees it: a reply in the channel would tell
+            # everyone there who is and is not on the roster.
+            await client.chat_postEphemeral(
+                channel=event.get("channel", ""), user=slack_user_id, text=ack_text,
+                thread_ts=event.get("thread_ts"),
+            )
+
+    await roster_intake.intake(
+        "slack", slack_user_id,
+        external_id=str(event.get("ts") or ""),
+        payload={"event": {k: event[k] for k in _HELD_EVENT_KEYS if k in event}, "mode": mode},
+        preview=text,
+        display_name=display_name,
+        profile_email=profile_email,
+        send_ack=_ack if (mode == "dm" or client is not None) else None,
+    )
+
+
+def _thread_root_author(thread_replies: list[dict] | None) -> str:
+    """The user_id who posted the message a thread hangs off, if known."""
+    if not thread_replies:
+        return ""
+    return str(thread_replies[0].get("user") or "")
+
+
+def _session_id_aliases(
+    *,
+    mode: str,
+    channel: str,
+    user_id: str,
+    session_id: str,
+    is_threaded_reply: bool,
+    thread_replies: list[dict] | None,
+) -> list[str]:
+    """Every session id this inbound message legitimately belongs to.
+
+    Normally just its own. The exception is a reply inside a thread THIS
+    person rooted: the bot answers an @mention in a channel by replying in a
+    thread hung off that mention, so the conversation also lives under the
+    rolling `slack:channel:{channel}:{user}` session — the same pair
+    `_persist_turn` double-writes history to. Without the parent id, a gate
+    raised on the mention can never be answered in the thread it was asked in.
+
+    The root-author check is what keeps that from being a hole. Widening on
+    "threaded and not a DM" alone would offer Alice's channel session inside
+    ANY thread in that channel — including one rooted by Bob's mention — so a
+    remark Alice made to Bob could resolve her open gate, post the run's title
+    into Bob's thread, and do it having skipped the multi-human response gate
+    (the resolver runs before it). Scoped to threads this person started, the
+    alias only ever names a conversation that is genuinely theirs.
+
+    A thread whose replies could not be fetched degrades to no alias: the
+    gate stays unanswered, which is recoverable, rather than over-matching.
+    """
+    aliases = [session_id]
+    if (
+        mode != "dm"
+        and is_threaded_reply
+        and channel
+        and user_id
+        and _thread_root_author(thread_replies) == user_id
+    ):
+        aliases.append(f"slack:channel:{channel}:{user_id}")
+    return aliases
+
+
+def _replies_contain_bot_message(messages: list[dict], bot_user_id: str | None) -> bool:
+    """True iff any message in the thread was posted by this bot.
+
+    `bot_user_id` is the cached slack user_id from auth_test(). If we
+    couldn't resolve it at startup, return False — that disables thread
+    auto-continuation but keeps the rest of the integration working.
+    """
+    if not bot_user_id:
+        return False
+    return any(str(m.get("user") or "") == bot_user_id for m in messages)
+
+
+def _count_distinct_humans(
+    messages: list[dict],
+    current_user_id: str | None,
+    bot_user_id: str | None,
+) -> int:
+    """Count distinct non-bot human user_ids across the thread history.
+
+    Used for the gate's single-human bypass: if only one human has ever
+    spoken in this thread, every message is implicitly addressed to the
+    bot and running the gate just risks false negatives.
+    """
+    humans: set[str] = set()
+    for m in messages:
+        uid = str(m.get("user") or "")
+        if not uid or uid == (bot_user_id or ""):
+            continue
+        humans.add(uid)
+    if current_user_id:
+        humans.add(str(current_user_id))
+    return len(humans)
+
+
+def _replies_to_gate_history(
+    messages: list[dict], bot_user_id: str | None
+) -> list[dict]:
+    """Convert raw Slack ``conversations_replies`` messages into the
+    ``[{'role': 'user'|'assistant', 'content': str}]`` shape the shared
+    response gate expects.
+
+    Each human turn is prefixed with ``[user_id]: `` so the gate model can
+    tell speakers apart even when we don't have a clean display name in
+    the payload. The bot's own messages become ``assistant`` turns.
+    Subtype messages (channel joins, edits, etc.) and messages with no
+    text are dropped — the gate doesn't need them.
+    """
+    out: list[dict] = []
+    for m in messages:
+        if m.get("subtype"):
+            continue
+        text = m.get("text") or ""
+        if not text.strip():
+            continue
+        uid = str(m.get("user") or "")
+        if bot_user_id and uid == bot_user_id:
+            out.append({"role": "assistant", "content": text})
+        elif uid:
+            out.append({"role": "user", "content": f"[{uid}]: {text}"})
+    return out
+
+
+# Files shared in a message are fetched from here only: the download carries
+# the bot token, which must never go to a URL outside Slack's file host.
+_SLACK_FILE_HOST = "https://files.slack.com/"
+# Per message, like the web upload route's cap.
+_MAX_SHARED_FILES = 5
+
+
+def _shared_files(event: dict) -> list[dict]:
+    """The files a Slack message carries (a ``file_share`` message, or a
+    mention posted with files), capped per message."""
+    files = event.get("files")
+    if not isinstance(files, list):
+        return []
+    return [f for f in files if isinstance(f, dict)][:_MAX_SHARED_FILES]
+
+
+def _file_name(file: dict) -> str:
+    return str(file.get("name") or file.get("title") or "file")
+
+
+async def _read_shared_files(
+    files: list[dict], heard: list[str] | None = None
+) -> tuple[str, list[dict]]:
+    """Download and read the files a rostered sender shared — documents to
+    text (a scanned PDF converted), images to vision blocks — through the
+    same ``process_attachments`` path Discord uses. Needs the bot's
+    ``files:read`` scope; without it Slack answers with an error page that
+    reads as an unreadable file."""
+    from openexecutive.config import get_settings
+    from openexecutive.integrations.attachments import (
+        AttachmentItem,
+        process_attachments,
+    )
+
+    token = get_settings().slack_bot_token
+    items: list[AttachmentItem] = []
+    notes: list[str] = []
+    for f in files:
+        url = str(f.get("url_private_download") or f.get("url_private") or "")
+        if not token or not url.startswith(_SLACK_FILE_HOST):
+            notes.append(f"(Could not download {_file_name(f)})")
+            continue
+        size = f.get("size")
+        items.append(
+            AttachmentItem(
+                url=url,
+                filename=_file_name(f),
+                content_type=str(f.get("mimetype") or ""),
+                size=size if isinstance(size, int) else 0,
+                headers={"Authorization": f"Bearer {token}"},
+                # A clip recorded in Slack; an uploaded audio file is not.
+                voice_note=f.get("subtype") == "slack_audio",
+            )
+        )
+    text = ""
+    blocks: list[dict] = []
+    if items:
+        try:
+            text, blocks = await process_attachments(items, heard=heard)
+        except Exception:
+            logger.exception("Slack: attachment processing failed")
+            notes.append("(Could not process the attached files)")
+    return "\n\n".join(p for p in (*notes, text) if p), blocks
+
+
+# A card's buttons (integrations.channel_cards): one action id each, the
+# card's id and choice in the button's value.
+_CARD_ACTION_APPROVE = "oe_card_approve"
+_CARD_ACTION_SKIP = "oe_card_skip"
+_CARD_ACTION_RE = re.compile(rf"^({_CARD_ACTION_APPROVE}|{_CARD_ACTION_SKIP})$")
+_MAX_CARD_TEXT = 2900
+
+
+def _card_blocks(
+    text: str, decision_id: int | None = None, labels: tuple[str, str] = ("Approve", "Skip"),
+) -> list[dict[str, Any]]:
+    """A card as Slack blocks: its text as plain text (it may quote what
+    someone else wrote, so never mrkdwn), with the two buttons while it waits."""
+    from openexecutive.integrations import channel_cards
+
+    blocks: list[dict[str, Any]] = [
+        {"type": "section", "text": {"type": "plain_text", "text": text[:_MAX_CARD_TEXT], "emoji": False}},
+    ]
+    if decision_id is not None:
+        blocks.append({"type": "actions", "elements": [
+            {"type": "button", "action_id": _CARD_ACTION_APPROVE, "style": "primary",
+             "text": {"type": "plain_text", "text": labels[0]},
+             "value": channel_cards.callback_data(decision_id, channel_cards.APPROVE)},
+            {"type": "button", "action_id": _CARD_ACTION_SKIP,
+             "text": {"type": "plain_text", "text": labels[1]},
+             "value": channel_cards.callback_data(decision_id, channel_cards.SKIP)},
+        ]})
+    return blocks
+
+
+async def _send_cards(client: Any, channel: str, cards: list[int]) -> None:
+    """Post each card a DM reply left, with Approve and Skip buttons."""
+    from openexecutive.integrations import channel_cards
+
+    if not channel:
+        return
+    for decision_id in cards[: channel_cards.MAX_CARDS]:
+        try:
+            text = await asyncio.to_thread(channel_cards.card_text, decision_id)
+            if text:
+                labels = await asyncio.to_thread(channel_cards.card_buttons, decision_id)
+                await client.chat_postMessage(
+                    channel=channel, text=text[:_MAX_CARD_TEXT], blocks=_card_blocks(text, decision_id, labels),
+                    unfurl_links=False, unfurl_media=False,
+                )
+        except Exception:
+            logger.exception("Slack: couldn't send card %d", decision_id)
+
+
+async def send_dm_card(slack_user_id: str, decision_id: int, text: str, labels: tuple[str, str]) -> None:
+    """Post a card waiting outside any chat to ``slack_user_id``'s DM with the
+    bot (``channel_cards.push_waiting``). Raises when it couldn't."""
+    from slack_sdk.web.async_client import AsyncWebClient
+
+    from openexecutive.config import get_settings
+
+    token = get_settings().slack_bot_token
+    if not token or not slack_user_id:
+        raise RuntimeError("slack is not configured")
+    client = AsyncWebClient(token=token)
+    opened: Any = await client.conversations_open(users=slack_user_id)
+    channel = str(((opened or {}).get("channel") or {}).get("id") or "")
+    if not channel:
+        raise RuntimeError("slack did not open a DM")
+    await client.chat_postMessage(
+        channel=channel, text=text[:_MAX_CARD_TEXT], blocks=_card_blocks(text, decision_id, labels),
+        unfurl_links=False, unfurl_media=False,
+    )
+
+
+_MENTION_RE = re.compile(r"<@([A-Z0-9]+)(?:\|[^>]*)?>")
+
+
+async def note_chat_ask(event: dict[str, Any], client: Any) -> None:
+    """A message in a channel the bot is in: keep it when it mentions the
+    principal, and mark the asks it answers when the principal wrote it
+    (``integrations.chat_asks``). Never raises."""
+    from openexecutive.integrations import chat_asks
+    from openexecutive.people.store import find_person_by_slack_id, find_principal_person
+
+    try:
+        user = str(event.get("user") or "")
+        channel = str(event.get("channel") or "")
+        ts = str(event.get("ts") or "")
+        if not user or not channel or not ts:
+            return
+        thread = str(event.get("thread_ts") or ts)
+        principal = await asyncio.to_thread(find_principal_person)
+        own_id = str(getattr(principal, "slack_user_id", "") or "") if principal is not None else ""
+        if principal is None or principal.id is None or not own_id:
+            return
+        if user == own_id:
+            await asyncio.to_thread(
+                chat_asks.note_spoke, "slack", place=channel, thread=thread, top_level=thread == ts,
+                person_id=principal.id,
+            )
+            return
+        text = str(event.get("text") or "")
+        if own_id not in _MENTION_RE.findall(text):
+            return
+        author = await asyncio.to_thread(find_person_by_slack_id, user)
+        from_name = str(getattr(author, "full_name", "") or "")
+        if not from_name:
+            try:
+                info = await client.users_info(user=user)
+                profile = ((info or {}).get("user") or {})
+                from_name = str(profile.get("real_name") or profile.get("name") or "")
+            except Exception:
+                from_name = ""
+        place_name = ""
+        link = ""
+        try:
+            info = await client.conversations_info(channel=channel)
+            name = str(((info or {}).get("channel") or {}).get("name") or "")
+            place_name = f"#{name}" if name else ""
+        except Exception:
+            logger.info("Slack: couldn't name channel %s for an ask", channel, exc_info=True)
+        try:
+            found = await client.chat_getPermalink(channel=channel, message_ts=ts)
+            link = str((found or {}).get("permalink") or "")
+        except Exception:
+            logger.info("Slack: couldn't link an ask in %s", channel, exc_info=True)
+        first = (principal.full_name or "").split(" ")[0] or "you"
+        shown = _MENTION_RE.sub(lambda m: f"@{first}" if m.group(1) == own_id else "@someone", text)
+        await asyncio.to_thread(
+            chat_asks.note_ask, "slack", place=channel, thread=thread, message_ref=f"{channel}:{ts}",
+            person_id=principal.id, from_name=from_name or "Someone", text=shown, link=link,
+            place_name=place_name,
+        )
+    except Exception:
+        logger.warning("Slack: couldn't note a chat ask", exc_info=True)
+
+
+async def _is_own_dm(client: Any, user_id: str, channel_id: str) -> bool:
+    """Whether ``channel_id`` is the bot's DM with ``user_id``: Slack's own
+    answer, not the payload's."""
+    if not user_id or not channel_id.startswith("D"):
+        return False
+    try:
+        opened = await client.conversations_open(users=user_id)
+    except Exception:
+        logger.warning("Slack: couldn't check the DM for a card tap", exc_info=True)
+        return False
+    return str(((opened or {}).get("channel") or {}).get("id") or "") == channel_id
+
+
+async def handle_card_tap(body: dict[str, Any], client: Any) -> None:
+    """A tap on a card's Approve or Skip button (``channel_cards``). Slack
+    signed it; it counts only in the tapper's own DM with the bot, from
+    someone on the roster, and ``decisions.resolve_in_chat`` decides whether
+    the card is theirs."""
+    from openexecutive.audit import log_event as audit_log
+    from openexecutive.integrations import channel_cards
+    from openexecutive.people.store import find_person_by_slack_id
+
+    user_id = str((body.get("user") or {}).get("id") or "")
+    channel_id = str((body.get("channel") or {}).get("id") or "")
+    message = body.get("message") or {}
+    ts = str((body.get("container") or {}).get("message_ts") or message.get("ts") or "")
+    actions = body.get("actions") or []
+    parsed = channel_cards.parse_callback(actions[0].get("value") if actions else None)
+    person = await asyncio.to_thread(find_person_by_slack_id, user_id) if user_id else None
+    if parsed is None or person is None or not await _is_own_dm(client, user_id, channel_id):
+        logger.warning("Slack: ignored a card tap that isn't from its own DM")
+        if user_id and channel_id:
+            try:
+                await client.chat_postEphemeral(channel=channel_id, user=user_id,
+                                                text="This card is no longer there.")
+            except Exception:
+                logger.warning("Slack: couldn't answer an ignored card tap", exc_info=True)
+        return
+    decision_id, approve = parsed
+    line = await channel_cards.resolve(decision_id, person, approve=approve)
+    choice = "approve" if approve else "skip"
+    await asyncio.to_thread(
+        audit_log,
+        "integration_inbound",
+        f"Slack card {decision_id}: tapped {choice.capitalize()}: {line[:120]}",
+        actor="slack",
+        details={"channel": "slack", "slack_user": user_id, "decision_id": decision_id,
+                 "choice": choice, "outcome": channel_cards.outcome_of(line), "person_id": person.id},
+    )
+    if line == channel_cards.BUSY or not ts:
+        return
+    # The card keeps what it said, with the outcome under it and no buttons.
+    shown = ""
+    for block in message.get("blocks") or []:
+        if block.get("type") == "section":
+            shown = str((block.get("text") or {}).get("text") or "")
+            break
+    text = f"{shown}\n\n{line}" if shown else line
+    try:
+        await client.chat_update(channel=channel_id, ts=ts, text=text[:_MAX_CARD_TEXT], blocks=_card_blocks(text))
+    except Exception:
+        logger.exception("Slack: couldn't update card %d after the tap", decision_id)
+
+
+async def create_slack_app():
+    """Build the async Bolt app and how it hears Slack: a Socket Mode handler
+    with ``SLACK_APP_TOKEN``, else an ``slack_events.HttpEventsListener`` that
+    takes Slack's events at ``POST /webhook/slack`` (``SLACK_SIGNING_SECRET``).
+
+    Async Bolt (not the sync ``App``) so every handler awaits on the caller's
+    event loop. That matters because the app is started from the FastAPI
+    lifespan: the MCP gateway's anyio task group and stdio subprocess, the
+    shared ``AsyncAnthropic`` client and the SSE subscriber queues are all
+    bound to the uvicorn loop, and driving them from a throwaway
+    ``asyncio.run`` loop on a Bolt worker thread would corrupt or hang them.
+    Every other inbound adapter (discord, telegram, google_chat) already
+    awaits on the request loop; this brings Slack in line.
+
+    Imports stay deferred inside the factory so the module imports cleanly
+    where slack_bolt is absent — the helper unit tests rely on that.
+    """
+    from slack_bolt.async_app import AsyncApp
+
+    from openexecutive.config import get_settings
+
+    settings = get_settings()
+
+    if not settings.slack_bot_token or not (
+        settings.slack_app_token or settings.slack_signing_secret
+    ):
+        raise RuntimeError(
+            "SLACK_BOT_TOKEN and SLACK_APP_TOKEN (Socket Mode) or SLACK_SIGNING_SECRET "
+            "(events over HTTP) must be set to run the Slack bot"
+        )
+    # Socket Mode wins when both are set: it needs no public address.
+    over_http = not settings.slack_app_token
+
+    # In HTTP mode Bolt checks every request's signature with the signing
+    # secret before any middleware or listener below runs.
+    app = AsyncApp(
+        token=settings.slack_bot_token,
+        signing_secret=settings.slack_signing_secret if over_http else None,
+        request_verification_enabled=over_http,
+    )
+    _seen_event_ids.clear()
+
+    @app.middleware
+    async def _once_per_event_from_this_workspace(body: dict, context, ack, next) -> Any:
+        if body.get("type") == "event_callback":
+            own_team = str(getattr(context.authorize_result, "team_id", None) or "")
+            if own_team and own_team not in _delivered_to(body):
+                logger.warning("Slack: dropped an event delivered for another workspace")
+                return await ack()
+            if not _first_delivery(str(body.get("event_id") or "")):
+                logger.info("Slack: dropped a repeat delivery of event %s", body.get("event_id"))
+                return await ack()
+        return await next()
+
+    # Resolve and cache the bot's own user_id at startup. Failure here
+    # disables thread auto-continuation until a later retry succeeds (see
+    # handle_message) but does NOT prevent the rest of the bot from running
+    # — the mention and DM paths don't depend on this value.
+    global _bot_user_id, _bot_id_last_attempt
+    _bot_user_id = None
+    _bot_id_last_attempt = None
+    await _resolve_bot_user_id(app.client)
+
+    # The async client ensure_future()s every inbound envelope with no cap,
+    # so without this a burst of Slack traffic fans out into unbounded
+    # concurrent executive.chat() calls. The sync adapter was bounded (see
+    # _MAX_CONCURRENT_HANDLERS); keep it bounded.
+    # Created here (not at module scope) so it binds to the loop that runs it.
+    inflight = asyncio.Semaphore(_MAX_CONCURRENT_HANDLERS)
+
+    def _clean_message(text: str) -> str:
+        text = re.sub(r"<@\w+>", "", text)
+        return text.strip()
+
+    # The rows this handler writes before the turn binds its session (the
+    # inbound row, the knowledge retrieval, alert triage) are private when
+    # the principal sent the message and they name one of their contacts.
+    @audit_rows_on_senders_turn(
+        "slack",
+        sender_ref=lambda args: str(args["event"].get("user") or ""),
+        find_sender=_find_slack_sender,
+    )
+    async def _handle_message(
+        event: dict, say, client=None, mode: str = "mention"
+    ) -> None:
+        """Process one inbound Slack message.
+
+        ``mode`` is set by the caller:
+          - ``"mention"`` — fired from ``app_mention``. Unconditional reply.
+          - ``"dm"`` — direct message. Unconditional reply.
+          - ``"thread_continuation"`` — non-mention message in a thread
+            the bot has previously replied in. Gated via
+            ``response_gate.should_respond``; skipped if the gate says NO
+            (with an audit row capturing the reason).
+        """
+        text = event.get("text", "")
+        cleaned = _clean_message(text)
+        files = _shared_files(event)
+        if not cleaned and not files:
+            return
+        # What the sender sent, in their own words plus the files' names —
+        # the "(Attached files: …)" note the web upload route uses. A
+        # file-only message has no words, so the note stands in for them.
+        file_note = (
+            f"(Attached files: {', '.join(_file_name(f) for f in files)})" if files else ""
+        )
+        own_words = "\n\n".join(p for p in (cleaned, file_note) if p)
+        if not cleaned:
+            cleaned = file_note
+
+        thread_ts = event.get("thread_ts") or event.get("ts")
+        slack_user_id = event.get("user", "")
+
+        # Whether this message is a reply *inside* an existing thread, as
+        # opposed to a thread starter or a DM. Used for three things: whether
+        # to fetch thread replies, which session id to use, and whether
+        # `thread_ts` is a meaningful reply reference for the inbound resolver.
+        is_threaded_reply = (
+            thread_ts is not None
+            and str(thread_ts) != str(event.get("ts") or "")
+        )
+        # Deterministic per-conversation session id. Every audit row from this
+        # inbound (chat_turn, specialist_consult, tool_invocation) shares it
+        # with the integration_inbound row, and it is the key the stored
+        # conversation history hangs off.
+        session_id = _slack_session_id(
+            mode=mode,
+            channel=str(event.get("channel", "")),
+            user_id=str(slack_user_id),
+            thread_ts=str(thread_ts or ""),
+            is_threaded_reply=is_threaded_reply,
+        )
+        # A DM or a person's mentions in one channel is one endless stream;
+        # it is cut into conversations after a quiet gap or a "new chat"
+        # (memory.conversations). Threads are left as they are.
+        from openexecutive.integrations.conversations import conversation_for
+
+        session_id = await asyncio.to_thread(conversation_for, session_id)
+
+        # Fetch thread replies ONCE up front so we can use the result for
+        # (a) the "has the bot engaged?" check on thread_continuation mode,
+        # (b) the single-human bypass on the response gate, and
+        # (c) the multi-peer co-presence enumeration further down.
+        # Standalone messages and DMs are 1:1 — skip the API call.
+        can_fetch_replies = client is not None and is_threaded_reply
+        thread_replies: list[dict] | None = None
+        # Set when this is a continuation in a thread the bot has answered in
+        # before, but Slack wouldn't hand back the thread — see below.
+        thread_unreadable = False
+        if can_fetch_replies:
+            try:
+                # 5s bound: this call sits on the user-facing TTFB path (it
+                # runs before executive.chat). Enforced with wait_for, not the
+                # `timeout=` kwarg — AsyncWebClient has no such parameter, so
+                # that value was silently forwarded as a query string and the
+                # real ceiling stayed the client default of 30s. A timeout is
+                # caught below and degrades to thread_replies=None. For
+                # mode="thread_continuation" that means the message is not
+                # answered — a slow Slack API should cost one missed
+                # continuation, not a stalled event loop — but the sender is
+                # told when the bot has answered in this thread before (the
+                # bot-presence guard below). Mentions and DMs are unaffected
+                # (they do not depend on thread_replies to decide whether to
+                # reply).
+                replies_resp = await asyncio.wait_for(
+                    client.conversations_replies(
+                        channel=event.get("channel", ""),
+                        ts=str(thread_ts),
+                        limit=200,
+                    ),
+                    timeout=5,
+                )
+                thread_replies = replies_resp.get("messages", []) or []
+            except Exception:
+                logger.warning(
+                    "Slack: conversations_replies failed for thread %s — "
+                    "passing empty co-present list",
+                    thread_ts,
+                    exc_info=True,
+                )
+                thread_replies = None
+
+        # Bot-presence guard for thread_continuation mode. If the bot
+        # hasn't actually replied in this thread, silently drop — never
+        # audit, never trigger alerts, never run the gate. This is what
+        # keeps the new behavior from spamming /audit with every random
+        # thread message in every channel the bot is in.
+        if mode == "thread_continuation":
+            if thread_replies is None:
+                # Slack didn't hand back the thread, so the replies can't say
+                # whether the bot is in it. The thread's stored history can:
+                # every turn the bot answers here is persisted under this
+                # session id (`_persist_turn`). With history, the sender is
+                # told after the roster gate below; without, a thread the bot
+                # never joined stays silent as before.
+                from openexecutive.memory.session_store import load_messages
+
+                # Not while the bot's own id is unresolved: then the mention
+                # filter in handle_message is off too, so an @-mention here is
+                # also being answered by app_mention, and continuations are
+                # off anyway until _resolve_bot_user_id succeeds.
+                if (
+                    not can_fetch_replies
+                    or not _bot_user_id
+                    or not await asyncio.to_thread(load_messages, session_id)
+                ):
+                    return
+                thread_unreadable = True
+            elif not _replies_contain_bot_message(thread_replies, _bot_user_id):
+                return
+
+        # Audit writes go off-loop too: log_event opens SQLite with a 5s
+        # busy timeout, and the scheduler, resumer and email poller all write
+        # the same DB — under contention an inline call would stall the whole
+        # application event loop for that long.
+        from openexecutive.audit import log_event as audit_log
+        await asyncio.to_thread(
+            audit_log,
+            "integration_inbound",
+            f"Inbound slack from user={slack_user_id} channel={event.get('channel', '')}: {cleaned[:160]}",
+            actor="slack",
+            session_id=session_id,
+            details={
+                "channel": "slack",
+                "slack_channel": event.get("channel"),
+                "slack_user": slack_user_id,
+                "ts": event.get("ts"),
+                "thread_ts": thread_ts,
+                "text_len": len(cleaned),
+                "mode": mode,
+            },
+        )
+
+        # Roster gate. Slack has no env allowlist — the People roster is
+        # the only access control. Drop messages from any Slack user
+        # without a matching slack_user_id on a non-archived Person row.
+        from openexecutive.people.store import find_person_by_slack_id
+        sender_person = (
+            await asyncio.to_thread(find_person_by_slack_id, slack_user_id)
+            if slack_user_id
+            else None
+        )
+        if sender_person is None:
+            await asyncio.to_thread(
+                audit_log,
+                "integration_inbound",
+                f"Rejected: slack user={slack_user_id} not in People roster",
+                actor="slack",
+                session_id=session_id,
+                details={
+                    "channel": "slack",
+                    "slack_user": slack_user_id,
+                    "outcome": "rejected_unknown_sender",
+                },
+            )
+            # Someone off the roster writing to the bot directly: hold the
+            # message for the principal to confirm and tell them it arrived
+            # (integrations.roster_intake). Not a thread continuation — the
+            # bot was not addressed there.
+            if mode in ("dm", "mention") and slack_user_id:
+                await _hold_unknown_sender(event, say, client, mode, slack_user_id, cleaned)
+            return
+
+        if thread_unreadable:
+            await asyncio.to_thread(
+                audit_log,
+                "integration_inbound",
+                "Dropped: couldn't read the Slack thread to continue it",
+                actor="slack",
+                session_id=session_id,
+                details={
+                    "channel": "slack",
+                    "slack_user": slack_user_id,
+                    "ts": event.get("ts"),
+                    "thread_ts": thread_ts,
+                    "outcome": "dropped_thread_unreadable",
+                },
+            )
+            # Only the sender sees it. Best-effort: Slack just failed us once
+            # already.
+            try:
+                await asyncio.wait_for(
+                    client.chat_postEphemeral(
+                        channel=event.get("channel", ""),
+                        user=slack_user_id,
+                        thread_ts=thread_ts,
+                        text=(
+                            "I couldn't read this thread just now, so I didn't "
+                            "answer. @-mention me to try again."
+                        ),
+                    ),
+                    timeout=5,
+                )
+            except Exception:
+                logger.warning(
+                    "Slack: couldn't tell the sender a continuation was dropped "
+                    "in session %s",
+                    session_id,
+                    exc_info=True,
+                )
+            return
+
+        # "new chat" (or /new) starts a fresh conversation instead of a turn.
+        from openexecutive.integrations.conversations import (
+            is_new_conversation_command,
+            start_fresh,
+        )
+        from openexecutive.memory.conversation_ids import is_rolling
+
+        if not files and is_rolling(session_id) and is_new_conversation_command(cleaned):
+            reply = await asyncio.to_thread(start_fresh, session_id, sender_person.id)
+            await say(text=reply, thread_ts=thread_ts)
+            return
+
+        # WaitForHuman inbound resolver — check BEFORE alert triage.
+        # If this message answers an awaiting workflow run, skip triage.
+        if sender_person.id is not None:
+            from openexecutive.workflows.inbound_resolver import (
+                resolve_and_acknowledge,
+            )
+
+            async def _say_ack(text: str) -> None:
+                await say(text=text, thread_ts=thread_ts)
+
+            if await resolve_and_acknowledge(
+                channel="slack",
+                channel_ref=slack_user_id,
+                person_id=sender_person.id,
+                text=cleaned,
+                send=_say_ack,
+                message_id=str(event.get("ts") or ""),
+                # Only a reply INSIDE a thread carries a meaningful reply
+                # reference. `thread_ts` falls back to this message's own ts,
+                # and passing that made the resolver treat every Slack message
+                # as an explicit reference to nothing — which short-circuited
+                # tiers 2 and 3 and made Slack approvals impossible (#136).
+                in_reply_to=str(thread_ts) if is_threaded_reply else "",
+                # Both ids this conversation is reachable under. A mention in
+                # a channel raises its gate under the rolling channel session,
+                # but the bot's reply roots a thread — so the answer arrives
+                # under the THREAD id. Offering only one made that gate
+                # permanently unanswerable, which is #136 one surface over.
+                # Mirrors the history double-write in `_persist_turn`.
+                session_ids=_session_id_aliases(
+                    mode=mode,
+                    channel=str(event.get("channel", "")),
+                    user_id=str(slack_user_id),
+                    session_id=session_id,
+                    is_threaded_reply=is_threaded_reply,
+                    thread_replies=thread_replies,
+                ),
+            ):
+                return
+
+        # Response gate — only for thread continuations (mentions/DMs are
+        # unconditional). Single-human threads bypass: every message in a
+        # 1:1 thread is implicitly addressed to the bot.
+        if mode == "thread_continuation" and thread_replies is not None:
+            gate_history = _replies_to_gate_history(thread_replies, _bot_user_id)
+            distinct_humans = _count_distinct_humans(
+                thread_replies, slack_user_id, _bot_user_id
+            )
+            if gate_history and distinct_humans > 1:
+                from openexecutive.integrations.response_gate import should_respond
+
+                speaker_label = (
+                    getattr(sender_person, "display_name", None)
+                    or getattr(sender_person, "full_name", None)
+                    or slack_user_id
+                )
+                decision = await should_respond(
+                    user_text=cleaned,
+                    author_display_name=speaker_label,
+                    history=gate_history,
+                    bot_display_name="Open Executive",
+                    channel="slack",
+                )
+                if not decision.allow:
+                    logger.info(
+                        "Slack: response gate skipped message in session %s "
+                        "(reason=%s)",
+                        session_id,
+                        decision.reason,
+                    )
+                    await asyncio.to_thread(
+                        audit_log,
+                        "integration_inbound",
+                        f"Skipped: response gate (reason={decision.reason})",
+                        actor="slack",
+                        session_id=session_id,
+                        details={
+                            "channel": "slack",
+                            "slack_user": slack_user_id,
+                            "ts": event.get("ts"),
+                            "thread_ts": thread_ts,
+                            "outcome": "skipped_gate",
+                            "skip_reason": decision.reason,
+                        },
+                    )
+                    # A quiet sign the message was read and passed over, so a
+                    # sender the gate misjudged knows to @-mention the bot
+                    # instead of wondering whether it arrived. Best-effort:
+                    # it needs the reactions:write scope.
+                    await _react_skipped(client, event)
+                    return
+
+        # Fork the inbound message into the alerts triage pipeline. Runs in a
+        # background thread/task so the reactive reply path is not delayed.
+        try:
+            from openexecutive.alerts.pipeline import schedule_chat_message_evaluation
+
+            schedule_chat_message_evaluation(
+                source="slack",
+                external_id=str(event.get("ts") or thread_ts or ""),
+                channel=event.get("channel"),
+                body=cleaned,
+                sender=sender_person,
+                fallback_name=slack_user_id,
+            )
+        except Exception:
+            logger.exception("Failed to schedule alert evaluation for Slack message")
+
+        # Read the shared files only now — after the roster gate, and after
+        # the response gate and the approval resolver may have ended the
+        # turn — so no one off the roster can make the bot download anything.
+        att_text = ""
+        att_image_blocks: list[dict] = []
+        heard: list[str] = []
+        if files:
+            att_text, att_image_blocks = await _read_shared_files(files, heard)
+            # A voice note's words are the sender's own words.
+            own_words = "\n\n".join(p for p in (*heard, own_words) if p)
+
+        try:
+            from openexecutive.integrations.channel_context import (
+                attach_briefing_context,
+                build_channel_context_block,
+            )
+            from openexecutive.knowledge.retriever import retrieve
+            from openexecutive.memory.episodic import format_for_prompt
+            from openexecutive.memory.session_store import load_messages
+            from openexecutive.onboarding.profile_builder import load_or_create_profile
+            from openexecutive.orchestrator.executive import Executive
+            from openexecutive.orchestrator.mcp_gateway import get_active_gateway
+            from openexecutive.orchestrator.session import Session
+
+            # Everything from here to the persist below runs under the
+            # conversation's lock: two messages in the same thread must not
+            # both read history before either writes it.
+            async with _session_lock(session_id):
+                profile = await asyncio.to_thread(load_or_create_profile)
+                # Where this conversation is happening, so a workflow that
+                # raises an approval gate mid-turn can record that the
+                # person's next reply HERE answers it (#136).
+                session = Session(
+                    session_id=session_id,
+                    company_profile=profile if not profile.is_empty() else None,
+                    origin_channel="slack",
+                    origin_channel_ref=str(slack_user_id or ""),
+                    caller_person_id=sender_person.id,
+                )
+                # Replay the stored conversation. Slack was the only chat
+                # adapter with no history at all — every turn started cold,
+                # so a multi-turn confirmation could never work (#136).
+                history = await asyncio.to_thread(load_messages, session_id)
+                if history:
+                    session.conversation_history = history
+                slack_user = event.get("user")
+                if slack_user:
+                    session.seen_channel_refs.add(("slack_dm", str(slack_user)))
+
+                # Sender was already resolved at the roster gate above; reuse it
+                # so we don't hit the DB twice in the hot path.
+                person_id = sender_person.id
+
+                # Multi-peer co-presence: enumerate other thread participants
+                # from the already-fetched conversations_replies payload (one
+                # API call total) and resolve each to a Person via
+                # find_person_by_slack_id. Any client/API failure earlier left
+                # thread_replies as None; that degrades to an empty list.
+                co_present_person_ids: list[int] = []
+                if thread_replies is not None:
+                    seen: set[str] = set()
+                    for msg in thread_replies:
+                        uid = str(msg.get("user") or "")
+                        if not uid or uid == str(slack_user) or uid in seen:
+                            continue
+                        if _bot_user_id and uid == _bot_user_id:
+                            continue
+                        seen.add(uid)
+                        other = await asyncio.to_thread(find_person_by_slack_id, uid)
+                        if other and other.id is not None:
+                            co_present_person_ids.append(other.id)
+
+                # Offloaded for the same reason api/routes/chat.py offloads them:
+                # both are blocking (ChromaDB query + embedding, SQLite read) and
+                # the handler now awaits on the application event loop, so running
+                # them inline would stall every other request. `get_store()` hands
+                # over the warm ChromaDB client the lifespan built, instead of
+                # constructing a fresh PersistentClient on every message.
+                from openexecutive.mcp_server.server import get_store
+
+                retrieved_context, episodic_context = await asyncio.gather(
+                    asyncio.to_thread(retrieve, query=cleaned, store=get_store()),
+                    # session_id-scoped, matching discord_bot: an unscoped
+                    # call mixes every other conversation's episodes into
+                    # this turn.
+                    asyncio.to_thread(format_for_prompt, session_id=session_id),
+                )
+
+                # The open-alert digest, so the Executive can actually answer
+                # "what's on my plate?" from Slack and can cite a trustworthy
+                # alert_id. Gated to the principal's DMs: the board is
+                # company-wide, and pulling it into a shared channel would
+                # leak every open item to everyone in that channel. Same gate
+                # shape the outbound-context hydration below uses.
+                briefing_context = await asyncio.to_thread(
+                    attach_briefing_context,
+                    session,
+                    is_dm=(mode == "dm"),
+                    person=sender_person,
+                )
+
+                # On the 1:1 DM path, hydrate with the context of any recent
+                # outbound DM oe sent this user, so a reply oe solicited from
+                # another session arrives with its backstory. One-shot consumed
+                # inside the helper. Gated to DMs: a public-channel reply must not
+                # pull private outbound context into a shared thread.
+                chat_user_message = cleaned
+                if mode == "dm" and slack_user_id:
+                    from openexecutive.integrations.inbound_hydration import (
+                        hydrate_user_message,
+                    )
+
+                    chat_user_message = await asyncio.to_thread(
+                        hydrate_user_message,
+                        channel="slack_dm",
+                        channel_ref=str(slack_user_id),
+                        user_message=cleaned,
+                    )
+
+                if att_text:
+                    # Before the words, as Discord and Telegram inline it.
+                    chat_user_message = f"{att_text}\n\n{chat_user_message}"
+
+                from openexecutive.integrations.channel_cards import shows_cards
+
+                # A DM shows the reply's cards with Approve and Skip buttons
+                # (SLACK_CARD_BUTTONS, integrations.channel_cards).
+                cards_here = mode == "dm" and shows_cards(session)
+                cards: list[int] = []
+
+                executive = Executive(mcp_gateway=get_active_gateway())
+                response = await executive.chat(
+                    user_message=chat_user_message,
+                    session=session,
+                    retrieved_context=retrieved_context,
+                    episodic_context=episodic_context,
+                    briefing_context=briefing_context,
+                    channel_context_block=build_channel_context_block("slack", cards_here=cards_here),
+                    cards=cards if cards_here else None,
+                    person_id=person_id,
+                    co_present_person_ids=co_present_person_ids or None,
+                    attachment_blocks=att_image_blocks or None,
+                    # Peer memory records what the sender wrote and the files'
+                    # names, never a document's text as their words.
+                    memory_text=own_words if files else None,
+                )
+
+                # No unfurls: Slack would fetch a link in the reply on its own,
+                # and a reply can quote mail a sender wrote to carry data out in one.
+                from openexecutive.orchestrator.disclosure import with_chat_line
+
+                await say(
+                    text=with_chat_line(response, f"slack:{session_id}"),
+                    thread_ts=thread_ts, unfurl_links=False, unfurl_media=False,
+                )
+                if cards and client is not None:
+                    await _send_cards(client, str(event.get("channel") or ""), cards)
+
+                # Persist AFTER the reply lands, and never let a persistence
+                # failure trigger the user-facing error path — the user
+                # already has their answer. Discord and Telegram both do the
+                # same. Offloaded because save_message is sync SQLite and
+                # this handler awaits on the application event loop.
+                #
+                # `cleaned`, NOT `chat_user_message`: the latter may carry the
+                # one-shot <outbound_reply_context> block from
+                # hydrate_user_message, and persisting that would replay a
+                # consumed one-shot on every future turn.
+                speaker = (
+                    None
+                    if mode == "dm"
+                    else (
+                        getattr(sender_person, "display_name", None)
+                        or getattr(sender_person, "full_name", None)
+                        or slack_user_id
+                    )
+                )
+                # A mention that starts a thread gets its reply rooted at this
+                # message's ts, so that thread's own session must also carry
+                # the Q+A or its first continuation would start cold.
+                also_session_id = None
+                if mode != "dm" and not is_threaded_reply:
+                    also_session_id = (
+                        f"slack:thread:{event.get('channel', '')}:"
+                        f"{event.get('ts', '')}"
+                    )
+                await asyncio.to_thread(
+                    _persist_turn,
+                    session_id=session_id,
+                    title=_session_title(sender_person, mode),
+                    created_at=session.created_at.isoformat(),
+                    owner_person_id=person_id,
+                    user_text=_format_user_content(own_words, speaker),
+                    assistant_text=response,
+                    also_session_id=also_session_id,
+                    sender_person_id=sender_person.id,
+                )
+                from openexecutive.integrations.conversations import title_after_turn
+
+                title_after_turn(session_id, own_words, response)
+
+        except Exception as exc:
+            # Correlate the traceback with the audit trail. Without the
+            # session_id the /audit page shows an integration_inbound row with
+            # no matching turn and no way to find the log line that explains
+            # it — which is how #136 stayed undiagnosable.
+            logger.exception(
+                "Slack: handler error session=%s user=%s channel=%s "
+                "thread_ts=%s mode=%s",
+                session_id,
+                slack_user_id,
+                event.get("channel"),
+                thread_ts,
+                mode,
+            )
+            # Reuse integration_inbound rather than minting a new event type:
+            # the audit UI already styles and counts it, and `outcome` already
+            # carries a vocabulary (rejected_unknown_sender, skipped_gate).
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(
+                    audit_log,
+                    "integration_inbound",
+                    f"Slack handler error for user={slack_user_id}: "
+                    f"{type(exc).__name__}",
+                    actor="slack",
+                    session_id=session_id,
+                    details={
+                        "channel": "slack",
+                        "slack_user": slack_user_id,
+                        "slack_channel": event.get("channel"),
+                        "ts": event.get("ts"),
+                        "thread_ts": thread_ts,
+                        "mode": mode,
+                        "outcome": "handler_error",
+                        "error": repr(exc)[:ERROR_DETAIL_LEN],
+                    },
+                )
+            # Guard the apology itself. Telegram and Google Chat already do
+            # this; Slack did not, so a failing say() escaped into Bolt.
+            try:
+                await say(
+                    text=(
+                        "I encountered an error processing your request. "
+                        "Please try again."
+                    ),
+                    thread_ts=thread_ts,
+                )
+            except Exception:
+                logger.exception(
+                    "Slack: also failed to send the error reply for session=%s",
+                    session_id,
+                )
+
+    @app.action(_CARD_ACTION_RE)
+    async def card_tap(ack, body: dict, client) -> None:
+        await ack()
+        await handle_card_tap(body, client)
+
+    @app.event("app_mention")
+    async def handle_mention(event: dict, say, client) -> None:
+        # Bolt auto-injects `client` (an AsyncWebClient) when listed in the
+        # signature; we pass it through so the multi-peer thread-member
+        # fetch can call conversations.replies without a separate import.
+        #
+        # Slack fires app_mention for an @-mention inside a DM too, and the
+        # `message` listener has already taken that one as mode="dm". Handling
+        # it twice meant two replies AND two different session ids, forking
+        # the conversation's history — and a gate raised on the mention copy
+        # recorded a session the user's next plain DM would never match.
+        if event.get("channel_type") == "im":
+            return
+        async with inflight:
+            await _handle_message(event, say, client=client, mode="mention")
+
+    @app.event("message")
+    async def handle_message(event: dict, say, client) -> None:
+        # Slack delivers BOTH a generic `message` event AND `app_mention`
+        # when the bot is mentioned in a channel/thread. Filter early so
+        # only one handler fires.
+        # `file_share` is a person's message with files attached — handled
+        # like any other message (see _read_shared_files).
+        if event.get("bot_id") or event.get("subtype") not in (None, "file_share"):
+            return  # bot messages, channel joins, edits, etc.
+
+        channel_type = event.get("channel_type")
+        if channel_type == "im":
+            async with inflight:
+                await _handle_message(event, say, client=client, mode="dm")
+            return
+        await note_chat_ask(event, client)
+
+        # A failed auth_test at startup left the id unset; try again
+        # (rate-limited) so thread auto-continuation comes back on its own.
+        if _bot_user_id is None:
+            await _resolve_bot_user_id(client)
+
+        # If the bot is @-mentioned, `app_mention` will handle it. Skip
+        # here to avoid double-firing. When _bot_user_id is still
+        # unresolved this filter is a no-op, but the bot-presence guard
+        # inside _handle_message (see "Bot-presence guard for
+        # thread_continuation mode") still catches the second invocation
+        # because the bot has not yet engaged in any thread.
+        text = event.get("text", "")
+        if _bot_user_id and f"<@{_bot_user_id}>" in text:
+            return
+
+        # Auto-continuation only fires inside a thread the bot has
+        # previously engaged in. The "has the bot replied here?" check
+        # happens inside _handle_message where conversations_replies
+        # is already being fetched; we only filter the cheap signals here.
+        thread_ts = event.get("thread_ts")
+        if not thread_ts or str(thread_ts) == str(event.get("ts") or ""):
+            return  # not a threaded reply (thread starters go through app_mention)
+
+        async with inflight:
+            await _handle_message(
+                event, say, client=client, mode="thread_continuation"
+            )
+
+    async def _replay_held(message, _request) -> bool:
+        """Replay a message held while its sender was off the roster, now
+        that they are on it (``roster_intake.replay_request``)."""
+        event = dict(message.payload.get("event") or {})
+        mode = str(message.payload.get("mode") or "dm")
+        channel = str(event.get("channel") or "")
+        if not channel or not event.get("user") or mode not in ("dm", "mention"):
+            return False
+
+        async def _say(text: str | None = None, **kwargs: Any) -> Any:
+            return await app.client.chat_postMessage(channel=channel, text=text, **kwargs)
+
+        async with inflight:
+            await _handle_message(event, _say, client=app.client, mode=mode)
+        return True
+
+    from openexecutive.integrations.roster_intake import register_replayer
+
+    register_replayer("slack", _replay_held)
+
+    if over_http:
+        from slack_bolt.adapter.fastapi.async_handler import AsyncSlackRequestHandler
+
+        from openexecutive.integrations.slack_events import HttpEventsListener
+
+        return app, HttpEventsListener(AsyncSlackRequestHandler(app), settings.slack_signing_secret or "")
+
+    from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
+
+    handler = AsyncSocketModeHandler(app, settings.slack_app_token)
+    return app, handler
+
+
+async def _run_slack_bot_async() -> None:
+    _, handler = await create_slack_app()
+    logger.info("Starting Slack bot in socket mode...")
+    # start_async() == connect_async() + sleep(inf): correct for a standalone
+    # process, but never call it from the FastAPI lifespan — it would never
+    # return. The lifespan uses connect_async()/close_async() instead.
+    await handler.start_async()
+
+
+def run_slack_bot() -> None:
+    """Standalone entrypoint: ``python -m openexecutive.integrations.slack_bot``.
+
+    Still supported for running the bot in isolation. Normal operation now
+    starts the listener from the FastAPI lifespan instead (see api/main.py),
+    so ``make dev`` brings Slack up with the rest of the app.
+    """
+    asyncio.run(_run_slack_bot_async())
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    run_slack_bot()

@@ -1,0 +1,1103 @@
+"""SQLite-backed persistence for the People feature.
+
+Lives in the same `episodic_memory.db` as alerts/episodic/departments so
+there is one place to look. All tables are created idempotently via
+`CREATE TABLE IF NOT EXISTS` — no migration tooling needed.
+
+The `_resolve_db_path` pattern lets tests monkeypatch `DB_PATH` and have
+it take effect at call time, mirroring `departments.store`.
+
+Team vs contacts (deny by default): every roster read here — `list_people`,
+each `find_person_by_*`, `find_approvers` — returns team members only unless
+the caller passes ``include_contacts=True``. A roster row grants web sign-in,
+inbound access on Slack / Telegram / Discord, approvals and chasing, so a
+contact must never slip into one of those reads by accident. `get_person`
+(a lookup by id) returns any kind; its callers check ``kind`` themselves.
+"""
+from __future__ import annotations
+
+import contextlib
+import json
+import logging
+import os
+import sqlite3
+from collections.abc import Generator
+from contextlib import contextmanager
+from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
+
+from openexecutive.people.models import (
+    DETAIL_KINDS,
+    PERSON_KINDS,
+    AuthorityScope,
+    AvailabilityWindow,
+    ContactDetail,
+    Person,
+    PersonKind,
+    PreferredChannel,
+)
+
+logger = logging.getLogger(__name__)
+
+DB_PATH = Path(os.environ.get("EPISODIC_DB_PATH", "./episodic_memory.db"))
+
+
+def _resolve_db_path(db_path: Path | None) -> Path:
+    """Return caller-supplied path or the current module-level DB_PATH.
+
+    Dynamic resolution allows tests to monkeypatch DB_PATH and have it
+    take effect at call time rather than at def time.
+    """
+    return db_path if db_path is not None else DB_PATH
+
+
+@contextmanager
+def _get_conn(db_path: Path | None = None) -> Generator[sqlite3.Connection, None, None]:
+    conn = sqlite3.connect(str(_resolve_db_path(db_path)))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+    ).fetchone() is not None
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+# SQL fragment every team-only read appends. A kind this code does not know
+# (a hand-edited row) is not "team", so it is left out — deny by default.
+_TEAM_ONLY = " AND kind = 'team'"
+
+
+def _kind_filter(include_contacts: bool) -> str:
+    return "" if include_contacts else _TEAM_ONLY
+
+
+class PrincipalContactError(ValueError):
+    """Raised when a write would make the principal a contact."""
+
+
+def _check_kind(kind: str, is_principal: bool) -> None:
+    if kind not in PERSON_KINDS:
+        raise ValueError(f"kind must be one of {list(PERSON_KINDS)}, got {kind!r}")
+    if is_principal and kind != "team":
+        raise PrincipalContactError("the principal is always on the team, never a contact")
+
+
+# --------------------------------------------------------------------------- #
+# Schema
+# --------------------------------------------------------------------------- #
+
+def initialize_db(db_path: Path | None = None) -> None:
+    """Create People tables idempotently. Call before departments init."""
+    with _get_conn(db_path) as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS people (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                full_name TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT '',
+                is_principal INTEGER NOT NULL DEFAULT 0,
+                department_slugs_json TEXT NOT NULL DEFAULT '[]',
+                email TEXT,
+                slack_user_id TEXT,
+                telegram_chat_id TEXT,
+                discord_user_id TEXT,
+                preferred_channel TEXT NOT NULL DEFAULT 'any',
+                kind TEXT NOT NULL DEFAULT 'team',
+                response_sla_hours INTEGER NOT NULL DEFAULT 24,
+                on_leave_until TEXT,
+                reports_to_person_id INTEGER,
+                archived INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (reports_to_person_id) REFERENCES people(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_people_principal
+                ON people(is_principal) WHERE is_principal = 1;
+            CREATE INDEX IF NOT EXISTS idx_people_archived
+                ON people(archived);
+
+            CREATE TABLE IF NOT EXISTS person_authority_scope (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                person_id INTEGER NOT NULL,
+                scope_token TEXT NOT NULL,
+                UNIQUE(person_id, scope_token),
+                FOREIGN KEY (person_id) REFERENCES people(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_pas_person
+                ON person_authority_scope(person_id);
+            CREATE INDEX IF NOT EXISTS idx_pas_scope
+                ON person_authority_scope(scope_token);
+
+            CREATE TABLE IF NOT EXISTS person_availability (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                person_id INTEGER NOT NULL,
+                weekdays_json TEXT NOT NULL DEFAULT '[]',
+                start_local TEXT NOT NULL,
+                end_local TEXT NOT NULL,
+                timezone TEXT NOT NULL DEFAULT 'UTC',
+                FOREIGN KEY (person_id) REFERENCES people(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_pa_person
+                ON person_availability(person_id);
+
+            CREATE TABLE IF NOT EXISTS person_emails (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                person_id INTEGER NOT NULL,
+                email TEXT NOT NULL,
+                email_norm TEXT NOT NULL UNIQUE,
+                source TEXT NOT NULL DEFAULT 'manual',
+                roster_request_id INTEGER,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (person_id) REFERENCES people(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_person_emails_person
+                ON person_emails(person_id);
+
+            CREATE TABLE IF NOT EXISTS person_details (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                person_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                value TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'manual',
+                created_at TEXT NOT NULL,
+                UNIQUE(person_id, kind, value),
+                FOREIGN KEY (person_id) REFERENCES people(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_person_details_person
+                ON person_details(person_id);
+        """)
+        # Additive migration: discord_user_id added after initial schema.
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(people)")}
+        if "discord_user_id" not in cols:
+            try:
+                conn.execute("ALTER TABLE people ADD COLUMN discord_user_id TEXT")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
+        # Additive migration: kind (team | contact). Every existing row is a
+        # team member — that is what the roster meant before contacts existed.
+        if "kind" not in cols:
+            try:
+                conn.execute(
+                    "ALTER TABLE people ADD COLUMN kind TEXT NOT NULL DEFAULT 'team'"
+                )
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
+        # Additive migration: the chat app each person last talked in.
+        for column in ("last_channel", "last_channel_at"):
+            if column not in cols:
+                try:
+                    conn.execute(f"ALTER TABLE people ADD COLUMN {column} TEXT")
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" not in str(exc).lower():
+                        raise
+        # The principal is never a contact; repair a hand-edited row so every
+        # team-only read keeps finding them.
+        conn.execute(
+            "UPDATE people SET kind = 'team' WHERE is_principal = 1 AND kind != 'team'"
+        )
+    # The roster-request ledger lives with the roster it grows.
+    from openexecutive.people.roster_requests import initialize_tables
+
+    initialize_tables(db_path)
+
+
+# --------------------------------------------------------------------------- #
+# Row mapping helpers
+# --------------------------------------------------------------------------- #
+
+def _load_scope(person_id: int, conn: sqlite3.Connection) -> list[AuthorityScope]:
+    rows = conn.execute(
+        "SELECT scope_token FROM person_authority_scope WHERE person_id = ?",
+        (person_id,),
+    ).fetchall()
+    scopes: list[AuthorityScope] = []
+    for row in rows:
+        try:
+            scopes.append(AuthorityScope(row["scope_token"]))
+        except ValueError:
+            logger.warning("people: unknown scope_token=%r for person_id=%d", row["scope_token"], person_id)
+    return scopes
+
+
+def _load_availability(
+    person_id: int, conn: sqlite3.Connection
+) -> list[AvailabilityWindow]:
+    rows = conn.execute(
+        "SELECT weekdays_json, start_local, end_local, timezone"
+        " FROM person_availability WHERE person_id = ? ORDER BY id",
+        (person_id,),
+    ).fetchall()
+    windows: list[AvailabilityWindow] = []
+    for row in rows:
+        try:
+            weekdays = json.loads(row["weekdays_json"]) or []
+            windows.append(
+                AvailabilityWindow(
+                    weekdays=list(weekdays),
+                    start_local=row["start_local"],
+                    end_local=row["end_local"],
+                    timezone=row["timezone"],
+                )
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("people: malformed availability row for person_id=%d", person_id)
+    return windows
+
+
+def normalize_email(email: str) -> str:
+    """An address as every lookup compares it: trimmed and lowercased."""
+    return (email or "").strip().lower()
+
+
+def _load_aliases(person_id: int, conn: sqlite3.Connection) -> list[str]:
+    if not _table_exists(conn, "person_emails"):
+        return []
+    rows = conn.execute(
+        "SELECT email FROM person_emails WHERE person_id = ? ORDER BY id", (person_id,)
+    ).fetchall()
+    return [row["email"] for row in rows]
+
+
+def _load_details(person_id: int, conn: sqlite3.Connection) -> list[ContactDetail]:
+    if not _table_exists(conn, "person_details"):
+        return []
+    rows = conn.execute(
+        "SELECT kind, value FROM person_details WHERE person_id = ? ORDER BY id", (person_id,)
+    ).fetchall()
+    return [ContactDetail(kind=row["kind"], value=row["value"]) for row in rows if row["kind"] in DETAIL_KINDS]
+
+
+def _optional(row: sqlite3.Row, column: str) -> str | None:
+    """A column ``initialize_db`` may not have migrated yet reads as None."""
+    try:
+        value = row[column]
+    except (IndexError, KeyError):
+        return None
+    return str(value) if value else None
+
+
+def _row_to_person(row: sqlite3.Row, conn: sqlite3.Connection) -> Person:
+    person_id = int(row["id"])
+    try:
+        dept_slugs: list[str] = json.loads(row["department_slugs_json"]) or []
+    except (ValueError, TypeError):
+        dept_slugs = []
+    on_leave: date | None = None
+    if row["on_leave_until"]:
+        with contextlib.suppress(ValueError):
+            on_leave = date.fromisoformat(row["on_leave_until"])
+    is_principal = bool(row["is_principal"])
+    try:
+        raw_kind = row["kind"]
+    except (IndexError, KeyError):  # a table initialize_db has not migrated yet
+        raw_kind = "team"
+    # An unknown stored kind reads as a contact (least access); the principal
+    # always reads as team (initialize_db repairs such a row on boot).
+    kind: PersonKind = "team" if raw_kind == "team" or is_principal else "contact"
+    return Person(
+        id=person_id,
+        full_name=row["full_name"],
+        role=row["role"],
+        is_principal=is_principal,
+        kind=kind,
+        department_slugs=dept_slugs,
+        email=row["email"],
+        email_aliases=_load_aliases(person_id, conn),
+        slack_user_id=row["slack_user_id"],
+        telegram_chat_id=row["telegram_chat_id"],
+        discord_user_id=row["discord_user_id"],
+        preferred_channel=row["preferred_channel"],
+        last_channel=_optional(row, "last_channel"),
+        last_channel_at=_optional(row, "last_channel_at"),
+        details=_load_details(person_id, conn),
+        response_sla_hours=int(row["response_sla_hours"]),
+        on_leave_until=on_leave,
+        reports_to_person_id=row["reports_to_person_id"],
+        archived=bool(row["archived"]),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        authority_scope=_load_scope(person_id, conn),
+        availability=_load_availability(person_id, conn),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# People CRUD
+# --------------------------------------------------------------------------- #
+
+def upsert_person(
+    *,
+    full_name: str,
+    role: str = "",
+    is_principal: bool = False,
+    department_slugs: list[str] | None = None,
+    email: str | None = None,
+    slack_user_id: str | None = None,
+    telegram_chat_id: str | None = None,
+    discord_user_id: str | None = None,
+    preferred_channel: PreferredChannel = "any",
+    response_sla_hours: int = 24,
+    on_leave_until: date | None = None,
+    reports_to_person_id: int | None = None,
+    kind: PersonKind | None = None,
+    person_id: int | None = None,
+    db_path: Path | None = None,
+) -> int:
+    """Insert or update a Person row. Returns the person_id.
+
+    ``kind`` None means "team" for a new row and "leave it as it is" on an
+    update: every other column is rewritten by the UPDATE, but a caller that
+    does not mention kind must never turn a contact into a team member (that
+    grants sign-in and inbound access) or the reverse. Raises
+    ``PrincipalContactError`` for a principal contact.
+    """
+    now = _now()
+    dept_json = json.dumps(department_slugs or [])
+    leave_str = on_leave_until.isoformat() if on_leave_until else None
+
+    became_contact = False
+    with _get_conn(db_path) as conn:
+        if person_id is not None and person_id > 0:
+            row = conn.execute(
+                "SELECT kind FROM people WHERE id = ?", (person_id,)
+            ).fetchone()
+            # Same reading as _row_to_person: an unknown stored kind is a contact.
+            stored_kind = (
+                (row["kind"] if row["kind"] in PERSON_KINDS else "contact")
+                if row is not None else None
+            )
+            effective_kind: str = kind or stored_kind or "team"
+            _check_kind(effective_kind, is_principal)
+            became_contact = stored_kind == "team" and effective_kind == "contact"
+            conn.execute(
+                """
+                UPDATE people SET
+                    full_name=?, role=?, is_principal=?, department_slugs_json=?,
+                    email=?, slack_user_id=?, telegram_chat_id=?, discord_user_id=?,
+                    preferred_channel=?, kind=?,
+                    response_sla_hours=?, on_leave_until=?, reports_to_person_id=?,
+                    updated_at=?
+                WHERE id=?
+                """,
+                (
+                    full_name, role, int(is_principal), dept_json,
+                    email, slack_user_id, telegram_chat_id, discord_user_id,
+                    preferred_channel, effective_kind,
+                    response_sla_hours, leave_str, reports_to_person_id,
+                    now, person_id,
+                ),
+            )
+        else:
+            new_kind: str = kind or "team"
+            _check_kind(new_kind, is_principal)
+            cursor = conn.execute(
+                """
+                INSERT INTO people
+                    (full_name, role, is_principal, department_slugs_json,
+                     email, slack_user_id, telegram_chat_id, discord_user_id,
+                     preferred_channel, kind,
+                     response_sla_hours, on_leave_until, reports_to_person_id,
+                     created_at, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    full_name, role, int(is_principal), dept_json,
+                    email, slack_user_id, telegram_chat_id, discord_user_id,
+                    preferred_channel, new_kind,
+                    response_sla_hours, leave_str, reports_to_person_id,
+                    now, now,
+                ),
+            )
+            return int(cursor.lastrowid or 0)
+    assert person_id is not None  # the INSERT branch returned above
+    # After the UPDATE has committed: the loop close writes the same file.
+    if became_contact and db_path is None:
+        _left_the_team(person_id)
+    return person_id
+
+
+def note_last_channel(
+    person_id: int,
+    channel: str,
+    *,
+    now: datetime | None = None,
+    db_path: Path | None = None,
+) -> bool:
+    """Record that ``person_id`` just talked in ``channel``. Leaves
+    ``updated_at`` alone (it isn't an edit of the person), and skips the write
+    while the stored channel is the same and under an hour old. True when it
+    wrote."""
+    stamp = (now or datetime.now(UTC)).astimezone(UTC)
+    an_hour_ago = (stamp - timedelta(hours=1)).isoformat()
+    with _get_conn(db_path) as conn:
+        cur = conn.execute(
+            "UPDATE people SET last_channel = ?, last_channel_at = ?"
+            " WHERE id = ? AND (last_channel IS NULL OR last_channel != ?"
+            " OR last_channel_at IS NULL OR last_channel_at < ?)",
+            (channel, stamp.isoformat(), person_id, channel, an_hour_ago),
+        )
+        return cur.rowcount > 0
+
+
+def set_authority_scope(
+    person_id: int,
+    scopes: list[AuthorityScope],
+    db_path: Path | None = None,
+) -> None:
+    """Replace the full authority scope list for a person."""
+    with _get_conn(db_path) as conn:
+        conn.execute(
+            "DELETE FROM person_authority_scope WHERE person_id = ?", (person_id,)
+        )
+        for scope in scopes:
+            conn.execute(
+                "INSERT OR IGNORE INTO person_authority_scope (person_id, scope_token)"
+                " VALUES (?, ?)",
+                (person_id, scope.value),
+            )
+
+
+def set_availability(
+    person_id: int,
+    windows: list[AvailabilityWindow],
+    db_path: Path | None = None,
+) -> None:
+    """Replace the full availability window list for a person."""
+    with _get_conn(db_path) as conn:
+        conn.execute(
+            "DELETE FROM person_availability WHERE person_id = ?", (person_id,)
+        )
+        for win in windows:
+            conn.execute(
+                "INSERT INTO person_availability"
+                " (person_id, weekdays_json, start_local, end_local, timezone)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (
+                    person_id,
+                    json.dumps(win.weekdays),
+                    win.start_local,
+                    win.end_local,
+                    win.timezone,
+                ),
+            )
+
+
+def get_person(person_id: int, db_path: Path | None = None) -> Person | None:
+    if not _resolve_db_path(db_path).exists():
+        return None
+    with _get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM people WHERE id = ?", (person_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return _row_to_person(row, conn)
+
+
+def find_person_by_slack_id(
+    slack_user_id: str,
+    db_path: Path | None = None,
+    *,
+    include_contacts: bool = False,
+) -> Person | None:
+    """Return the first non-archived team member with this Slack user id, or
+    None. ``include_contacts=True`` also matches contacts."""
+    if not slack_user_id or not _resolve_db_path(db_path).exists():
+        return None
+    with _get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM people WHERE slack_user_id = ? AND archived = 0"
+            + _kind_filter(include_contacts) + " LIMIT 1",
+            (slack_user_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return _row_to_person(row, conn)
+
+
+def find_person_by_telegram_chat_id(
+    telegram_chat_id: str,
+    db_path: Path | None = None,
+    *,
+    include_contacts: bool = False,
+) -> Person | None:
+    """Return the first non-archived team member with this Telegram chat id,
+    or None. ``include_contacts=True`` also matches contacts."""
+    if not telegram_chat_id or not _resolve_db_path(db_path).exists():
+        return None
+    with _get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM people WHERE telegram_chat_id = ? AND archived = 0"
+            + _kind_filter(include_contacts) + " LIMIT 1",
+            (telegram_chat_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return _row_to_person(row, conn)
+
+
+def find_person_by_email(
+    email: str,
+    db_path: Path | None = None,
+    *,
+    include_contacts: bool = False,
+) -> Person | None:
+    """Return the first non-archived team member with this email address, or
+    None. ``include_contacts=True`` also matches contacts.
+
+    Case-insensitive match — email `From:` headers come back with the
+    sender's chosen capitalization, which isn't necessarily what was
+    stored on the Person row.
+    """
+    if not email or not _resolve_db_path(db_path).exists():
+        return None
+    with _get_conn(db_path) as conn:
+        # The episodic DB file is shared across subsystems; it may exist before
+        # the people DDL has run. Treat a missing table like a missing file so
+        # email intake (and other callers) degrade to "unknown sender" rather
+        # than crashing.
+        if not _table_exists(conn, "people"):
+            return None
+        # A contact may share an address with a team member (an assistant's
+        # alias, a duplicate entry); the team row wins.
+        row = conn.execute(
+            "SELECT * FROM people WHERE LOWER(email) = LOWER(?) AND archived = 0"
+            + _kind_filter(include_contacts)
+            + " ORDER BY kind = 'team' DESC, id LIMIT 1",
+            (email,),
+        ).fetchone()
+        if row is None:
+            return None
+        return _row_to_person(row, conn)
+
+
+def find_person_by_address(
+    email: str,
+    db_path: Path | None = None,
+    *,
+    include_contacts: bool = False,
+) -> Person | None:
+    """Like ``find_person_by_email``, but an address also matches the person
+    it is an alias of (``person_emails``). Exact, case-insensitive; the team
+    row wins over a contact. This is how mail is matched to its sender —
+    ``people.identity.resolve_email_sender`` adds the company-domain rule on
+    top. Sign-in never uses it: an alias is not a login."""
+    norm = normalize_email(email)
+    if not norm or not _resolve_db_path(db_path).exists():
+        return None
+    with _get_conn(db_path) as conn:
+        if not _table_exists(conn, "people"):
+            return None
+        alias_clause = (
+            " OR id IN (SELECT person_id FROM person_emails WHERE email_norm = ?)"
+            if _table_exists(conn, "person_emails") else ""
+        )
+        params: tuple[str, ...] = (norm, norm) if alias_clause else (norm,)
+        row = conn.execute(
+            "SELECT * FROM people WHERE (LOWER(TRIM(email)) = ?" + alias_clause + ")"
+            " AND archived = 0" + _kind_filter(include_contacts)
+            + " ORDER BY kind = 'team' DESC, id LIMIT 1",
+            params,
+        ).fetchone()
+        if row is None:
+            return None
+        return _row_to_person(row, conn)
+
+
+class AddressInUseError(ValueError):
+    """Raised when an address is already someone else's (primary or alias)."""
+
+
+_MAX_ALIASES = 10
+
+
+def address_holder(
+    email: str, db_path: Path | None = None, *, exclude_person_id: int | None = None
+) -> int | None:
+    """The id of the non-archived person (any kind) holding ``email`` as
+    their address or an alias, other than ``exclude_person_id``; else None."""
+    norm = normalize_email(email)
+    if not norm or not _resolve_db_path(db_path).exists():
+        return None
+    with _get_conn(db_path) as conn:
+        if not _table_exists(conn, "people"):
+            return None
+        rows = conn.execute(
+            "SELECT id FROM people WHERE archived = 0 AND LOWER(TRIM(email)) = ?",
+            (norm,),
+        ).fetchall()
+        ids = [int(r["id"]) for r in rows]
+        if _table_exists(conn, "person_emails"):
+            ids += [
+                int(r["person_id"]) for r in conn.execute(
+                    "SELECT pe.person_id FROM person_emails pe JOIN people p"
+                    " ON p.id = pe.person_id WHERE pe.email_norm = ? AND p.archived = 0",
+                    (norm,),
+                ).fetchall()
+            ]
+    for pid in ids:
+        if pid != exclude_person_id:
+            return pid
+    return None
+
+
+def alias_holder(
+    email: str, db_path: Path | None = None, *, exclude_person_id: int | None = None
+) -> int | None:
+    """The id of the non-archived person holding ``email`` as an alias (not
+    as their primary address), other than ``exclude_person_id``; else None."""
+    norm = normalize_email(email)
+    if not norm or not _resolve_db_path(db_path).exists():
+        return None
+    with _get_conn(db_path) as conn:
+        if not _table_exists(conn, "person_emails"):
+            return None
+        rows = conn.execute(
+            "SELECT pe.person_id FROM person_emails pe JOIN people p ON p.id = pe.person_id"
+            " WHERE pe.email_norm = ? AND p.archived = 0",
+            (norm,),
+        ).fetchall()
+    for row in rows:
+        if int(row["person_id"]) != exclude_person_id:
+            return int(row["person_id"])
+    return None
+
+
+def clean_aliases(emails: list[str], *, primary: str | None = None) -> list[str]:
+    """``emails`` trimmed, deduplicated case-insensitively (first spelling
+    wins), without blanks or the person's own primary address. Raises
+    ``ValueError`` for more than ``_MAX_ALIASES`` or a value that is not an
+    address (the message never quotes it)."""
+    out: list[str] = []
+    seen = {normalize_email(primary)} if primary else set()
+    for raw in emails:
+        addr = (raw or "").strip()
+        norm = normalize_email(addr)
+        if not norm or norm in seen:
+            continue
+        local, sep, domain = addr.rpartition("@")
+        if (
+            not sep or not local or "." not in domain or len(addr) > 254
+            or any(ch.isspace() or ord(ch) < 0x20 for ch in addr)
+            or any(ch in addr for ch in "<>,;\"")
+        ):
+            raise ValueError("an alias is not a valid email address")
+        seen.add(norm)
+        out.append(addr)
+    if len(out) > _MAX_ALIASES:
+        raise ValueError(f"a person holds at most {_MAX_ALIASES} other addresses")
+    return out
+
+
+def set_person_emails(
+    person_id: int,
+    emails: list[str],
+    *,
+    source: str = "manual",
+    db_path: Path | None = None,
+) -> list[str]:
+    """Replace ``person_id``'s aliases with ``emails`` (``clean_aliases``).
+    Raises ``AddressInUseError`` when one is someone else's address or alias,
+    before anything is written. Returns the stored list."""
+    person = get_person(person_id, db_path)
+    if person is None:
+        raise ValueError(f"person {person_id} not found")
+    clean = clean_aliases(emails, primary=person.email)
+    for addr in clean:
+        if address_holder(addr, db_path, exclude_person_id=person_id) is not None:
+            raise AddressInUseError("that address is already on another person")
+    now = _now()
+    with _get_conn(db_path) as conn:
+        conn.execute("DELETE FROM person_emails WHERE person_id = ?", (person_id,))
+        for addr in clean:
+            conn.execute(
+                "INSERT INTO person_emails (person_id, email, email_norm, source, created_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (person_id, addr, normalize_email(addr), source, now),
+            )
+    return clean
+
+
+MAX_DETAILS = 20
+
+
+def set_person_details(
+    person_id: int, details: list[ContactDetail], *, source: str = "manual", db_path: Path | None = None,
+) -> list[ContactDetail]:
+    """Replace ``person_id``'s contact details with ``details``, each cleaned
+    (``contact_info.clean_detail``; one that isn't plainly its kind is
+    dropped, as is a repeat). Returns the stored list."""
+    from openexecutive.people.contact_info import clean_detail
+
+    clean: list[ContactDetail] = []
+    for detail in details:
+        value = clean_detail(detail.kind, detail.value)
+        if value and (detail.kind, value) not in {(d.kind, d.value) for d in clean}:
+            clean.append(ContactDetail(kind=detail.kind, value=value))
+    clean = clean[:MAX_DETAILS]
+    now = _now()
+    with _get_conn(db_path) as conn:
+        kept = {
+            (row["kind"], row["value"]): row["source"]
+            for row in conn.execute("SELECT kind, value, source FROM person_details WHERE person_id = ?", (person_id,))
+        }
+        conn.execute("DELETE FROM person_details WHERE person_id = ?", (person_id,))
+        for detail in clean:
+            conn.execute(
+                "INSERT INTO person_details (person_id, kind, value, source, created_at) VALUES (?, ?, ?, ?, ?)",
+                (person_id, detail.kind, detail.value, kept.get((detail.kind, detail.value), source), now),
+            )
+    return clean
+
+
+def add_person_detail(
+    person_id: int, kind: str, value: str, *, source: str = "manual", db_path: Path | None = None,
+) -> bool:
+    """Add one contact detail. False when it is already theirs or they have
+    ``MAX_DETAILS``."""
+    with _get_conn(db_path) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM person_details WHERE person_id = ?", (person_id,)).fetchone()[0]
+        if count >= MAX_DETAILS:
+            return False
+        cursor = conn.execute(
+            "INSERT OR IGNORE INTO person_details (person_id, kind, value, source, created_at) VALUES (?, ?, ?, ?, ?)",
+            (person_id, kind, value, source, _now()),
+        )
+        return cursor.rowcount > 0
+
+
+def remove_person_detail(person_id: int, kind: str, value: str, db_path: Path | None = None) -> bool:
+    with _get_conn(db_path) as conn:
+        cursor = conn.execute(
+            "DELETE FROM person_details WHERE person_id = ? AND kind = ? AND value = ?", (person_id, kind, value),
+        )
+        return cursor.rowcount > 0
+
+
+def add_person_email(
+    person_id: int,
+    email: str,
+    *,
+    source: str = "manual",
+    roster_request_id: int | None = None,
+    db_path: Path | None = None,
+) -> bool:
+    """Add one alias to ``person_id``. False when it is already theirs (their
+    address or an alias); raises ``AddressInUseError`` when it is someone
+    else's and ``ValueError`` when it is not an address or the person is
+    full or missing."""
+    person = get_person(person_id, db_path)
+    if person is None:
+        raise ValueError(f"person {person_id} not found")
+    norm = normalize_email(email)
+    if norm in {normalize_email(e) for e in [person.email or "", *person.email_aliases]}:
+        return False
+    clean = clean_aliases([*person.email_aliases, email], primary=person.email)
+    if address_holder(email, db_path, exclude_person_id=person_id) is not None:
+        raise AddressInUseError("that address is already on another person")
+    addr = clean[-1]
+    with _get_conn(db_path) as conn:
+        conn.execute(
+            "INSERT INTO person_emails"
+            " (person_id, email, email_norm, source, roster_request_id, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (person_id, addr, norm, source, roster_request_id, _now()),
+        )
+    return True
+
+
+def find_person_by_discord_id(
+    discord_user_id: str,
+    db_path: Path | None = None,
+    *,
+    include_contacts: bool = False,
+) -> Person | None:
+    """Return the first non-archived team member with this Discord user id, or
+    None. ``include_contacts=True`` also matches contacts."""
+    if not discord_user_id or not _resolve_db_path(db_path).exists():
+        return None
+    with _get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM people WHERE discord_user_id = ? AND archived = 0"
+            + _kind_filter(include_contacts) + " LIMIT 1",
+            (discord_user_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return _row_to_person(row, conn)
+
+
+def _find_email_sender(
+    email: str, db_path: Path | None = None, *, include_contacts: bool = False
+) -> Person | None:
+    """An email recipient or sender as mail is matched: aliases and, on the
+    live store, the company-domain rule (``people.identity``)."""
+    if db_path is not None:
+        return find_person_by_address(email, db_path, include_contacts=include_contacts)
+    from openexecutive.people.identity import resolve_email_sender
+
+    return resolve_email_sender(email, include_contacts=include_contacts)
+
+
+def find_person_by_channel_ref(
+    channel: str,
+    channel_ref: str,
+    db_path: Path | None = None,
+    *,
+    include_contacts: bool = False,
+) -> Person | None:
+    """Map a scheduled-action (channel, channel_ref) to a non-archived Person.
+
+    Dispatches to the per-channel finder. ``channel`` uses the scheduled-action
+    vocabulary (``slack_dm`` / ``discord_dm`` / ``telegram`` / ``email``); email
+    refs may carry a ``address|thread_id`` suffix, so only the address is matched.
+    Returns None for an unknown channel or any miss. Single source of truth for
+    the outbound guard and the outbound-context linkage, which both need to
+    resolve a DM recipient back to a Person. Team only unless
+    ``include_contacts``.
+    """
+    finder = {
+        "slack_dm": find_person_by_slack_id,
+        "discord_dm": find_person_by_discord_id,
+        "telegram": find_person_by_telegram_chat_id,
+        "email": _find_email_sender,
+    }.get(channel)
+    if finder is None:
+        return None
+    ref = channel_ref.split("|", 1)[0] if channel == "email" else channel_ref
+    # Forward db_path only when explicitly given so the common default-DB path
+    # calls the finder with a single positional argument (matching how the
+    # finders are normally invoked across the codebase).
+    if include_contacts:
+        return finder(ref, db_path, include_contacts=True)
+    return finder(ref) if db_path is None else finder(ref, db_path)
+
+
+def find_principal_person(db_path: Path | None = None) -> Person | None:
+    """Return the principal Person (the operator running this instance), or None.
+
+    The web `/chat` endpoint has no per-user auth — it's gated by a shared
+    secret and is the principal's terminal. Resolving web turns to this
+    row lets them flow into Honcho under the same person_id as the
+    principal's Discord/email/Slack/Telegram traffic.
+
+    Tie-break: the schema does not enforce a single is_principal row, so
+    if onboarding ran twice (or someone toggled the flag) multiple rows
+    may match. ``ORDER BY id`` makes the oldest principal win
+    deterministically — a stale row would route web traffic to the
+    wrong peer card. If you re-run onboarding, archive the old
+    principal first.
+    """
+    if not _resolve_db_path(db_path).exists():
+        return None
+    with _get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM people WHERE is_principal = 1 AND archived = 0 "
+            "ORDER BY id LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        return _row_to_person(row, conn)
+
+
+def list_people(
+    include_archived: bool = False,
+    db_path: Path | None = None,
+    *,
+    include_contacts: bool = False,
+) -> list[Person]:
+    """The roster, principal first. Team members only unless
+    ``include_contacts`` — see the module docstring."""
+    if not _resolve_db_path(db_path).exists():
+        return []
+    where = [] if include_archived else ["archived = 0"]
+    if not include_contacts:
+        where.append("kind = 'team'")
+    clause = f" WHERE {' AND '.join(where)}" if where else ""
+    with _get_conn(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT * FROM people{clause} ORDER BY is_principal DESC, id"  # noqa: S608 — fixed fragments
+        ).fetchall()
+        return [_row_to_person(row, conn) for row in rows]
+
+
+def is_principal_or_self(
+    caller_person_id: int | None, person_id: int | None, db_path: Path | None = None
+) -> bool:
+    """Whether ``caller_person_id`` may act on something ``person_id`` owns:
+    it is that person, or the principal. An unresolved caller never may, and
+    something with no owner (``person_id`` None) is the principal's alone.
+
+    The one authorization rule behind closing an open loop and rating a reply,
+    kept here so the chat tools and the HTTP routes cannot drift apart."""
+    if caller_person_id is None:
+        return False
+    if person_id is not None and caller_person_id == person_id:
+        return True
+    caller = get_person(caller_person_id, db_path=db_path)
+    return bool(caller is not None and caller.is_principal and not caller.archived)
+
+
+def _left_the_team(person_id: int) -> None:
+    """A team member just became a contact: close the open loops they own,
+    as archiving does — a contact is never chased, so the loops would
+    otherwise sit in /today until they expire. Best-effort."""
+    try:
+        from openexecutive.attunement.open_loops import close_loops_for_person
+
+        close_loops_for_person(person_id, reason="moved_to_contacts")
+    except Exception:
+        logger.warning("people: closing open loops for a new contact failed", exc_info=True)
+
+
+def archive_person(person_id: int, db_path: Path | None = None) -> bool:
+    """Soft-delete a person. Returns True if a row was found and archived."""
+    with _get_conn(db_path) as conn:
+        cursor = conn.execute(
+            "UPDATE people SET archived = 1, updated_at = ? WHERE id = ? AND archived = 0",
+            (_now(), person_id),
+        )
+        archived = cursor.rowcount > 0
+        # Free the aliases: the addresses are unique across the roster, and an
+        # archived person must not keep someone else from using them.
+        if archived and _table_exists(conn, "person_emails"):
+            conn.execute("DELETE FROM person_emails WHERE person_id = ?", (person_id,))
+    if archived and db_path is None:
+        # An archived person can no longer be chased, so their open loops
+        # would otherwise sit in /today forever. Only on the live store: a
+        # caller passing its own db_path owns its own episodic DB too.
+        try:
+            from openexecutive.attunement.open_loops import close_loops_for_person
+
+            close_loops_for_person(person_id, reason="owner_archived")
+        except Exception:
+            logger.warning("archive_person: closing open loops failed", exc_info=True)
+        try:
+            from openexecutive.attunement.style import delete_profile
+
+            delete_profile(person_id)
+        except Exception:
+            logger.warning("archive_person: dropping working style failed", exc_info=True)
+        try:
+            from openexecutive.people.contact_notes import forget
+
+            forget(person_id)
+        except Exception:
+            logger.warning("archive_person: dropping the contact note failed", exc_info=True)
+    return archived
+
+
+def find_approvers(
+    scope: AuthorityScope,
+    db_path: Path | None = None,
+) -> list[Person]:
+    """Return non-archived team members who can approve the given scope token.
+
+    Includes:
+    - People who hold the exact scope token.
+    - People who hold WILDCARD (approves everything).
+
+    A contact never approves anything, whatever scopes a hand-edited row
+    carries — there is deliberately no opt-in here.
+
+    Sort order: non-principals first (prefer delegated humans over the
+    fallback principal), then by response_sla_hours ASC (fastest SLA first).
+    """
+    if not _resolve_db_path(db_path).exists():
+        return []
+    with _get_conn(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT p.*
+            FROM people p
+            JOIN person_authority_scope pas ON pas.person_id = p.id
+            WHERE p.archived = 0
+              AND p.kind = 'team'
+              AND pas.scope_token IN (?, ?)
+            ORDER BY p.is_principal ASC, p.response_sla_hours ASC, p.id ASC
+            """,
+            (scope.value, AuthorityScope.WILDCARD.value),
+        ).fetchall()
+        return [_row_to_person(row, conn) for row in rows]
+
+
+def update_person(
+    person_id: int,
+    *,
+    full_name: str | None = None,
+    role: str | None = None,
+    email: str | None = None,
+    slack_user_id: str | None = None,
+    telegram_chat_id: str | None = None,
+    discord_user_id: str | None = None,
+    preferred_channel: PreferredChannel | None = None,
+    response_sla_hours: int | None = None,
+    on_leave_until: date | None = None,
+    clear_on_leave: bool = False,
+    reports_to_person_id: int | None = None,
+    department_slugs: list[str] | None = None,
+    kind: PersonKind | None = None,
+    db_path: Path | None = None,
+) -> bool:
+    """Partial update. Returns True if a row was modified.
+
+    Pass `clear_on_leave=True` to explicitly set on_leave_until to NULL.
+    Raises ``PrincipalContactError`` when asked to make the principal a
+    contact.
+    """
+    fields: list[tuple[str, object]] = []
+    became_contact = False
+    if kind is not None:
+        existing = get_person(person_id, db_path)
+        _check_kind(kind, bool(existing is not None and existing.is_principal))
+        fields.append(("kind", kind))
+        became_contact = existing is not None and existing.kind == "team" and kind == "contact"
+    if full_name is not None:
+        fields.append(("full_name", full_name))
+    if role is not None:
+        fields.append(("role", role))
+    if email is not None:
+        fields.append(("email", email))
+    if slack_user_id is not None:
+        fields.append(("slack_user_id", slack_user_id))
+    if telegram_chat_id is not None:
+        fields.append(("telegram_chat_id", telegram_chat_id))
+    if discord_user_id is not None:
+        fields.append(("discord_user_id", discord_user_id))
+    if preferred_channel is not None:
+        fields.append(("preferred_channel", preferred_channel))
+    if response_sla_hours is not None:
+        fields.append(("response_sla_hours", response_sla_hours))
+    if clear_on_leave:
+        fields.append(("on_leave_until", None))
+    elif on_leave_until is not None:
+        fields.append(("on_leave_until", on_leave_until.isoformat()))
+    if reports_to_person_id is not None:
+        fields.append(("reports_to_person_id", reports_to_person_id))
+    if department_slugs is not None:
+        fields.append(("department_slugs_json", json.dumps(department_slugs)))
+    if not fields:
+        return get_person(person_id, db_path) is not None
+    fields.append(("updated_at", _now()))
+    set_clause = ", ".join(f"{n} = ?" for n, _ in fields)
+    values = [v for _, v in fields] + [person_id]
+    with _get_conn(db_path) as conn:
+        cursor = conn.execute(
+            f"UPDATE people SET {set_clause} WHERE id = ?", values
+        )
+        updated = cursor.rowcount > 0
+    if updated and became_contact and db_path is None:
+        _left_the_team(person_id)
+    return updated

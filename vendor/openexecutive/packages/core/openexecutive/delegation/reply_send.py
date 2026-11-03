@@ -1,0 +1,838 @@
+"""Send a reply the inbox watcher drafted, when the person taps Send, or
+on its own under Handle it for me, or an email a workflow wrote as its
+creator, or a draft chat wrote as the person, when they tap Send under it.
+
+The one path in Act as me that sends anything, and all it can send is a
+draft by its id: the exact draft on a ``delegation_reply`` card, the one a
+chat turn wrote (as written), or the one a workflow step just wrote (``DelegateGmail.send_draft`` posts ``{"id": ...}``
+to ``drafts.send``; ``DelegateOutlook.send_draft`` posts nothing to that
+draft's ``send``). Four callers reach it, and a unit test walks the code to
+keep it that way:
+
+- ``send_approved_reply``, after the person approved that card
+  (``POST /decisions/{id}/approve``, a class only the card's own person sees
+  or resolves). Only that route calls it. Sending is the person's own act: it
+  works while the Executive is paused.
+- ``send_on_its_own``, called only by the inbox watcher (``inbox._consider``)
+  for a card it made as ``auto_execute`` after ``handle_it.refusal`` found
+  nothing against it. The person turned Handle it for me on themselves, from
+  a session the API knows is theirs; this path checks that switch and the
+  counted rules (one a thread a day, the daily limit) again, and refuses
+  anything the tap path would ask a second yes for.
+  The watcher runs inside the scheduler's pause gate, so a pause stops it.
+
+- ``send_for_workflow``, called only by ``workflow_email``'s
+  ``oe__send_email_as_me``: a workflow its creator saved, from a session the
+  API knows is theirs, with that tool in it (``workflow_email.save_refusal``),
+  sending the draft it wrote a moment ago to the people it was written to.
+  It checks again that Act as me is on, the API can tie a save to a person
+  (``handle_it.signing_ok``), no client slot is active, and the draft is
+  unchanged, addressed as written, from their own address and never to the
+  Executive's.
+
+- ``send_chat_draft``, after the person tapped Send under a draft chat
+  wrote as them (``ghostwrite_email``; ``POST /delegation/drafts/{id}/send``,
+  the caller's own drafts only). Only that route calls it. It sends that
+  draft exactly as it was written: one changed in the mailbox since is
+  theirs to send from there. Like the card tap it needs a caller the API
+  knows is that person, Act as me on and their mailbox connected, and it
+  checks the recipients the same way; a reply they have answered themselves
+  since is refused, and one whose conversation moved on asks a second yes.
+
+No model, chat turn or MCP call can reach any of them, and no workflow but
+through ``oe__send_email_as_me``.
+
+At send time it checks again, in this order:
+
+1. The caller is the person the card belongs to, and the API knows it:
+   signed callers are on (``CALLER_ASSERTION_PUBLIC_KEYS``) and the caller is
+   that signed-in person (or the local operator under local login), or the
+   API runs for local login, answering this computer only. Anything else is a
+   409 ``caller_signing_required``: with only a shared secret, whoever holds
+   it could send as the owner.
+2. Act as me and Draft replies to my inbox are both on, and no client slot is
+   active.
+3. Their Gmail is connected (``gmail_status``).
+4. The draft still exists, in the same thread, and they haven't replied
+   there themselves since (either way the card closes).
+5. Its recipients: someone, at most 10, never the Executive's own address,
+   and it is from one of their own addresses.
+6. What changed since the card was made needs a second yes: recipients that
+   differ from the card's, or a newer message in the thread. The first tap
+   gets a 409 ``confirm`` naming the recipients; the second tap sends them
+   back (``{"recipients": [...], "thread_moved_on": true}``).
+
+Send + allow (``allow``, a tap only, in training: ``delegation.training``)
+is refused before anything is sent unless Replies (or, on a follow-up card,
+Follow-ups) is in training and their list has room; once the reply went,
+replies to that sender (follow-ups to those people) may go on their own.
+"Do it like this next time" (``example``, with Drafts in training) keeps what
+they sent, when they changed the draft first (on the card or in their
+mailbox), as how they write to that person.
+
+A reply kept on its card alone (``card_drafts``, the default) has no draft
+until Send: it is made from exactly what the card shows just before the
+checks below, and taken back out of the mailbox when they refuse it.
+
+Then it claims the card (``claim_for_execution``, proposed → executing, a
+compare-and-set: a double tap sends once), reads the draft once more and sends
+only if it is still the version checked above (``drafts.send`` sends whatever
+the draft is when Gmail gets the request, so an edit made meanwhile in another
+tab is refused, not sent unchecked), and records it (``finish_execution``:
+``approved_with_edit`` when the draft was edited in Gmail). A failure that
+shows nothing was sent hands the card back. One that leaves it unclear (a
+timeout, a 5xx) leaves it ``executing`` for the reconciler
+(``inbox._settle_unconfirmed_send``), which asks Gmail what happened. Nothing
+is ever retried on its own. Every row it writes is private, and the card's
+person's own (``rows_for_person``).
+"""
+from __future__ import annotations
+
+import logging
+from datetime import UTC, datetime
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+class SendRefused(Exception):
+    """Why a reply was not sent: an HTTP status, a code, a message for the
+    person, and for a confirm the reasons and the recipients."""
+
+    def __init__(self, status: int, code: str, message: str, **extra: Any) -> None:
+        super().__init__(code)
+        self.status = status
+        self.code = code
+        self.message = message
+        self.extra = extra
+
+
+_NOT_YOURS = "Only the person this reply was written for can send it."
+_CONFIRM_TEXT = {
+    "recipients_changed": "The draft's recipients changed since it was written.",
+    "thread_moved_on": "A newer message arrived in this conversation after the draft was written.",
+}
+
+
+def _check_caller(caller: Any, email: str) -> None:
+    """Raise unless the API knows the caller is the person at ``email``
+    (``verified.caller_refusal``)."""
+    from openexecutive.delegation.verified import NOT_YOURS, caller_refusal
+
+    refused = caller_refusal(caller, email)
+    if refused is None:
+        return
+    if refused == NOT_YOURS:
+        raise SendRefused(403, "not_yours", _NOT_YOURS)
+    raise SendRefused(
+        409,
+        "caller_signing_required",
+        "Sending from here needs signed sign-ins, so that nobody else can send as you. "
+        "Until they're set up (Settings → Setup status → API protection), send it from your mailbox.",
+    )
+
+
+async def send_approved_reply(
+    instance: Any,
+    *,
+    caller: Any,
+    resolver: int | None,
+    confirm: dict[str, Any] | None = None,
+    allow: bool = False,
+    example: bool = False,
+    gmail: Any = None,
+    now: datetime | None = None,
+) -> str:
+    """Send the draft on ``instance``, a ``delegation_reply`` card the caller
+    approved. ``allow`` is Send + allow: allow replies to this sender (a
+    follow-up's people) from now on; ``example`` keeps an edited draft as how
+    they write to them. Returns the sent message's id; raises ``SendRefused``."""
+    from openexecutive.audit import rows_for_person
+
+    owner = getattr(instance, "approver_person_id", None)
+    with rows_for_person(owner if isinstance(owner, int) else None):
+        return await _send(
+            instance, caller=caller, resolver=resolver, confirm=confirm or {},
+            gmail=gmail, now=now or datetime.now(UTC), allow=allow, example=example,
+        )
+
+
+async def send_on_its_own(instance: Any, *, gmail: Any = None, now: datetime | None = None) -> str:
+    """Send the draft on ``instance``, a card the inbox watcher made as
+    ``auto_execute`` under Handle it for me. Returns the sent message's id;
+    raises ``SendRefused`` and then leaves the card for the person, as if the
+    switch were off."""
+    from openexecutive.audit import rows_for_person
+
+    owner = getattr(instance, "approver_person_id", None)
+    with rows_for_person(owner if isinstance(owner, int) else None):
+        return await _send(
+            instance, caller=None, resolver=None, confirm={}, gmail=gmail,
+            now=now or datetime.now(UTC), on_its_own=True,
+        )
+
+
+def _addresses(value: Any) -> list[str] | None:
+    from openexecutive.delegation.gmail import normalize_email
+
+    if not isinstance(value, list):
+        return None
+    return sorted({normalize_email(a) for a in value if isinstance(a, str) and a.strip()})
+
+
+async def _send(
+    instance: Any, *, caller: Any, resolver: int | None, confirm: dict[str, Any], gmail: Any, now: datetime,
+    on_its_own: bool = False, allow: bool = False, example: bool = False,
+) -> str:
+    """``_send_checked``, and for a reply kept on its card alone
+    (``card_drafts``): the draft it made is taken back out of the mailbox
+    when the send is refused before anything went."""
+    from openexecutive.delegation import card_drafts
+
+    made: dict[str, Any] = {}
+    try:
+        return await _send_checked(
+            instance, caller=caller, resolver=resolver, confirm=confirm, gmail=gmail, now=now,
+            on_its_own=on_its_own, allow=allow, example=example, made=made,
+        )
+    except SendRefused as refused:
+        if made and refused.code != "send_unconfirmed":
+            await card_drafts.take_back(instance, made["person_id"], made["payload"], made["client"])
+        raise
+
+
+async def _send_checked(
+    instance: Any, *, caller: Any, resolver: int | None, confirm: dict[str, Any], gmail: Any, now: datetime,
+    on_its_own: bool = False, allow: bool = False, example: bool = False, made: dict[str, Any],
+) -> str:
+    from openexecutive.config import get_settings
+    from openexecutive.delegation import card_drafts, drafts, handle_it, training
+    from openexecutive.delegation.answers import CAUGHT_UP_KEY
+    from openexecutive.delegation.gmail import (
+        BLOCKING_CODES,
+        STATUS_MESSAGES,
+        GmailAuthError,
+        GmailError,
+        GmailNotFound,
+        GmailRateLimited,
+        gmail_for,
+        gmail_status,
+        normalize_email,
+    )
+    from openexecutive.delegation.inbox import (
+        CLOSED,
+        SENDING,
+        SENT,
+        _add_flag,
+        _audit,
+        _client_slot_active,
+        _close_card,
+        _set_outcome,
+        card_payload,
+        get_watch,
+        later_messages,
+    )
+    from openexecutive.delegation.settings import can_delegate, is_enabled
+    from openexecutive.delegation.threads import MAX_RECIPIENTS
+    from openexecutive.memory.decision_ledger import (
+        STATUS_APPROVED_UNCHANGED,
+        STATUS_APPROVED_WITH_EDIT,
+        STATUS_EXECUTED,
+        claim_for_execution,
+        finish_execution,
+        release_claim,
+    )
+    from openexecutive.orchestrator import take_the_lead
+    from openexecutive.people.store import get_person
+
+    payload = card_payload(instance)
+    person = get_person(int(payload.get("person_id") or 0))
+    if (
+        person is None or person.id is None or not person.email or not can_delegate(person)
+        or instance.approver_person_id != person.id
+        or (resolver != person.id if not on_its_own else resolver is not None)
+    ):
+        raise SendRefused(403, "not_yours", _NOT_YOURS)
+    email = normalize_email(person.email)
+    follow_up = payload.get("source") == "follow_up"
+    trained = False
+    if on_its_own:
+        # The person's own switch stands in for their tap: it must still be
+        # on, for this kind of sender, and the API must still be able to tie
+        # it to them.
+        handled_as = str(payload.get("handled_as") or "stranger")
+        stored = handle_it.get(person.id)
+        # Take the lead as you lifts the setting; its added rules are read
+        # again here, so one added since the card was made still holds it.
+        # In training, only a sender (a follow-up's people) the person
+        # allowed; removed since, it waits.
+        trained = handle_it.in_training(person.id, training.FOLLOW_UPS if follow_up else training.REPLIES)
+        if trained:
+            by_setting = stored.enabled and (
+                handle_it.follow_up_allowed(person.id, _addresses(payload.get("draft_to")) or []) if follow_up
+                else handle_it.allowed_in_training(person.id, str(payload.get("from_email") or ""))
+            )
+        else:
+            by_setting = (
+                stored.follows_up(handled_as) if follow_up
+                else stored.level(handle_it.kind_for(handled_as)) == handle_it.LEVEL_HANDLE
+            )
+        lead = stored.enabled and not trained and handle_it.leading(person.id)
+        if getattr(instance, "gate_mode", "") != "auto_execute" or not (lead or by_setting):
+            raise SendRefused(409, "handle_it_off", "Handle it for me is off for this reply.")
+        if lead and take_the_lead.reply_hit(
+            person.id,
+            [str(payload.get("subject") or ""), str(payload.get("draft_subject") or ""),
+             str(payload.get("draft_body") or "")],
+            _addresses(payload.get("draft_to")) or [],
+        ) is not None:
+            raise SendRefused(409, "lead_rule", handle_it.REASONS["lead_rule"])
+        if not handle_it.signing_ok():
+            raise SendRefused(409, "caller_signing_required", handle_it.REASONS["signing_off"])
+        counted = handle_it.count_refusal(person.id, str(payload.get("thread_id") or ""), now)
+        if counted is not None:
+            raise SendRefused(409, counted, handle_it.REASONS[counted])
+    else:
+        _check_caller(caller, email)
+        if allow:
+            key = _allow_key(person.id, payload)
+            if key is None:
+                raise SendRefused(
+                    422, "cant_allow",
+                    "Sending on its own next time is for replies and follow-ups while they're in training.",
+                )
+            if not training.room_for(person.id, key):
+                raise SendRefused(
+                    409, "learned_full", "It has learned as much as it can hold. Remove something first.",
+                )
+    if not is_enabled(person.id) or not get_watch(person.id).enabled:
+        raise SendRefused(
+            409, "inbox_off",
+            "Turn on Act as me and Draft replies to my inbox to send from here, or send it from your mailbox.",
+        )
+    if _client_slot_active():
+        raise SendRefused(409, "client_slot", "Sending from here is paused while a client is active. Send it from your mailbox.")
+    client = gmail if gmail is not None else gmail_for(email)
+    status = await gmail_status(email, gmail=client)
+    if status != "connected":
+        raise SendRefused(409, BLOCKING_CODES.get(status, "gmail_error"), STATUS_MESSAGES[status])
+
+    if card_drafts.is_card_only(payload):
+        # Kept on its card alone: make the draft from exactly what the card
+        # shows, then check and send it like any other.
+        payload = await card_drafts.make_draft(instance, person.id, client)
+        made.update(person_id=person.id, payload=payload, client=client)
+    message_id = str(payload.get("message_id") or "")
+    thread_id = str(payload.get("thread_id") or "")
+    unreadable = "Couldn't read the draft in your mailbox. Try again in a moment."
+    try:
+        draft = await client.get_draft(str(payload.get("draft_id") or ""))
+        own = {email, *await client.send_as_addresses()}
+    except GmailError as exc:
+        raise SendRefused(502, "gmail_error", unreadable) from exc
+    if draft is None:
+        _close_card(person.id, instance.id, message_id, "draft_gone", CLOSED)
+        raise SendRefused(409, "draft_gone", "That draft isn't in your mailbox any more: it was sent or deleted there.")
+    try:
+        thread = await client.get_thread(thread_id)
+    except GmailNotFound:
+        _close_card(person.id, instance.id, message_id, "thread_gone", CLOSED)
+        raise SendRefused(409, "draft_gone", "That conversation isn't in your mailbox any more.") from None
+    except GmailError as exc:
+        raise SendRefused(502, "gmail_error", unreadable) from exc
+    if draft.message.thread_id != thread_id:
+        raise SendRefused(409, "draft_moved", "That draft isn't in the same conversation any more. Send it from your mailbox.")
+    later = later_messages(thread, payload, now=now)
+    if any("SENT" in m.labels and m.from_addr in own for m in later):
+        _close_card(person.id, instance.id, message_id, "you_replied", CLOSED)
+        raise SendRefused(409, "you_replied", "You've already replied in this conversation, so this draft wasn't sent.")
+
+    recipients = sorted({*draft.message.to, *draft.message.cc, *draft.message.bcc})
+    exec_address = normalize_email(get_settings().exec_email_address)
+    if not recipients:
+        raise SendRefused(409, "no_recipients", "The draft isn't addressed to anyone. Add someone in your mailbox.")
+    if len(recipients) > MAX_RECIPIENTS:
+        raise SendRefused(
+            409, "too_many_recipients", f"The draft goes to more than {MAX_RECIPIENTS} people. Send it from your mailbox.",
+        )
+    if exec_address and exec_address in recipients:
+        raise SendRefused(
+            409, "executive_recipient", "The draft is addressed to the Executive's own mailbox. Change it in your mailbox.",
+        )
+    if draft.message.from_addr not in own:
+        raise SendRefused(409, "not_from_you", "The draft isn't from one of your own addresses. Check it in your mailbox.")
+
+    reasons: list[str] = []
+    if recipients != _addresses(payload.get("draft_to")) and _addresses(confirm.get("recipients")) != recipients:
+        reasons.append("recipients_changed")
+    moved_on = any(m.from_addr not in own and "SENT" not in m.labels for m in later)
+    if moved_on and confirm.get("thread_moved_on") is not True:
+        reasons.append("thread_moved_on")
+    # Brought up to date with newer mail on its own (answers.catch_up): Send
+    # goes without asking again only when the card that was tapped showed
+    # that version (edits.seen_caught_up_at).
+    caught_up = str(payload.get(CAUGHT_UP_KEY) or "")
+    if (
+        caught_up and confirm.get("seen_caught_up_at") != caught_up
+        and confirm.get("thread_moved_on") is not True and "thread_moved_on" not in reasons
+    ):
+        reasons.append("thread_moved_on")
+    if reasons:
+        raise SendRefused(
+            409, "confirm", " ".join(_CONFIRM_TEXT[r] for r in reasons),
+            reasons=reasons, recipients=recipients,
+        )
+
+    # Changed in the mailbox, or on the card (``card_drafts.edit``).
+    edited = (
+        draft.message.id != str(payload.get("draft_message_id") or "")
+        or payload.get(card_drafts.EDITED_ON_CARD) is True
+    )
+    if on_its_own and edited:
+        # Someone changed it in the mailbox since it was written: that
+        # version was never checked, so the person sends it, not this path.
+        raise SendRefused(409, "draft_changed", "The draft changed in your mailbox, so it waits for you.")
+    if instance.id in SENDING:
+        # Another tap is sending it right now; its mark is its own to clear.
+        raise SendRefused(409, "already_handled", "This reply is being sent already.")
+    SENDING.add(instance.id)
+    try:
+        if not claim_for_execution(instance.id, resolver_person_id=resolver):
+            raise SendRefused(409, "already_handled", "This reply was already sent or dismissed.")
+        if edited:
+            _add_flag(person.id, message_id, "edited_in_gmail")
+        # drafts.send sends the draft as it is when Gmail gets the request,
+        # and everything above checked the version read before the claim:
+        # read it once more, so an edit made meanwhile (another tab, a
+        # delegate) is never sent unchecked.
+        try:
+            current = await client.get_draft(draft.draft_id)
+        except GmailError as exc:
+            release_claim(instance.id)
+            raise SendRefused(502, "gmail_error", unreadable) from exc
+        if current is None:
+            release_claim(instance.id)
+            SENDING.discard(instance.id)
+            _close_card(person.id, instance.id, message_id, "draft_gone", CLOSED)
+            raise SendRefused(409, "draft_gone", "That draft isn't in your mailbox any more: it was sent or deleted there.")
+        if current.message.id != draft.message.id:
+            release_claim(instance.id)
+            raise SendRefused(
+                409, "draft_changed",
+                "The draft changed in your mailbox just now, so nothing was sent. Look it over and tap Send again.",
+            )
+        try:
+            sent = await client.send_draft(draft.draft_id)
+        except GmailError as exc:
+            if exc.maybe_done:
+                # Left executing: the reconciler asks Gmail what happened.
+                logger.warning("delegation.reply_send: Gmail didn't confirm a send (%s)", type(exc).__name__)
+                raise SendRefused(
+                    502, "send_unconfirmed",
+                    "Your mailbox didn't confirm it was sent. Check your Sent folder; this card updates on its own.",
+                ) from exc
+            release_claim(instance.id)
+            if isinstance(exc, GmailNotFound):
+                SENDING.discard(instance.id)
+                _close_card(person.id, instance.id, message_id, "draft_gone", CLOSED)
+                raise SendRefused(
+                    409, "draft_gone", "That draft isn't in your mailbox any more: it was sent or deleted there.",
+                ) from exc
+            if isinstance(exc, GmailAuthError):
+                raise SendRefused(409, "gmail_needs_reconnect", STATUS_MESSAGES["needs_reconnect"]) from exc
+            if isinstance(exc, GmailRateLimited):
+                raise SendRefused(429, "rate_limited", "Your mail service asked to slow down. Nothing was sent; try again in a minute.") from exc
+            raise SendRefused(
+                502, "gmail_error", "Your mailbox refused to send it. Nothing was sent; try again, or send it from your mailbox.",
+            ) from exc
+        # It went: whatever happens to the bookkeeping, say so. A card left
+        # executing is settled by the reconciler from the sent message.
+        if on_its_own:
+            # First and on its own: the daily limit and the once-a-thread
+            # rule count these rows, so nothing else failing may skip it.
+            try:
+                handle_it.record_handled(person.id, thread_id, instance.id, sent.id or None, now=now)
+            except Exception:
+                logger.exception("delegation.reply_send: recording a reply sent on its own failed")
+        try:
+            if on_its_own:
+                final = STATUS_EXECUTED
+            else:
+                final = STATUS_APPROVED_WITH_EDIT if edited else STATUS_APPROVED_UNCHANGED
+            if not finish_execution(
+                instance.id, final,
+                final_payload={
+                    "sent_message_id": sent.id, "recipient_count": len(recipients), "edited": edited,
+                    **({"on_its_own": True} if on_its_own else {}),
+                },
+                external_event_id=sent.id or None,
+            ):
+                logger.warning("delegation.reply_send: a sent reply's card changed under it")
+            _set_outcome(person.id, message_id, SENT, reason="handled" if on_its_own else "sent")
+            if sent.id:
+                drafts.mark_sent(person.id, draft.draft_id, sent.id)
+            if on_its_own and trained:
+                allowance = (
+                    training.allowed_follow_up(person.id, _addresses(payload.get("draft_to")) or []) if follow_up
+                    else training.allowed_sender(person.id, str(payload.get("from_email") or ""))
+                )
+                if allowance is not None:
+                    training.used(allowance)
+            if on_its_own:
+                _audit("delegation_reply_handled", f"Sent a reply as person {person.id}, on its own", {
+                    "person_id": person.id, "decision_id": instance.id, "thread_id": thread_id,
+                    "sent_message_id": sent.id, "recipient_count": len(recipients),
+                })
+            else:
+                _audit("delegation_reply_sent", f"Sent a reply as person {person.id}, on their tap", {
+                    "person_id": person.id, "decision_id": instance.id, "thread_id": thread_id,
+                    "sent_message_id": sent.id, "recipient_count": len(recipients), "edited": edited,
+                })
+        except Exception as exc:
+            logger.warning("delegation.reply_send: recording a sent reply failed (%s)", type(exc).__name__)
+        if allow:
+            _learn(person.id, payload, recipients, decision_id=instance.id)
+        if example and edited:
+            _keep_example(person.id, payload, current.message, decision_id=instance.id)
+        if not on_its_own:
+            # History notes come from the person's own words; a reply sent on
+            # its own isn't that.
+            _note_sent(person.id, current.message, thread, recipients, thread_id, now)
+        return sent.id
+    finally:
+        SENDING.discard(instance.id)
+
+
+def _allow_key(person_id: int, payload: dict[str, Any]) -> str | None:
+    """What Send + allow on this card would allow, when its setting is in
+    training; None when it can't."""
+    from openexecutive.delegation import handle_it, training
+
+    if payload.get("source") == "follow_up":
+        going = _addresses(payload.get("draft_to")) or []
+        if not going or not handle_it.in_training(person_id, training.FOLLOW_UPS):
+            return None
+        return training.follow_up_key(person_id, going)
+    sender = str(payload.get("from_email") or "")
+    if not sender or not handle_it.in_training(person_id, training.REPLIES):
+        return None
+    return training.reply_key(person_id, sender)
+
+
+def _learn(person_id: int, payload: dict[str, Any], recipients: list[str], *, decision_id: int) -> None:
+    """Send + allow, once the reply went: replies to its sender (follow-ups
+    to the people it went to) may go on their own from now on. A failure
+    here never undoes the send."""
+    from openexecutive.delegation import training
+    from openexecutive.delegation.inbox import _audit
+
+    follow_up = payload.get("source") == "follow_up"
+    try:
+        if follow_up:
+            allowed = training.allow_follow_up(person_id, recipients, decision_id=decision_id)
+        else:
+            allowed = training.allow_sender(
+                person_id, str(payload.get("from_email") or ""), str(payload.get("from_name") or ""),
+                decision_id=decision_id,
+            )
+    except Exception:
+        logger.warning("delegation.reply_send: the reply went, but allowing it failed", exc_info=True)
+        return
+    _audit("delegation_reply_allowed", f"Person {person_id} allowed {'follow-ups' if follow_up else 'replies'} in training", {
+        "person_id": person_id, "decision_id": decision_id, "allowed_id": allowed.id,
+        "setting": training.FOLLOW_UPS if follow_up else training.REPLIES,
+    })
+
+
+def _keep_example(person_id: int, payload: dict[str, Any], message: Any, *, decision_id: int) -> None:
+    """"Do it like this next time", with Drafts in training: what they sent
+    after changing the draft is kept as how they write to that person. A
+    failure here never undoes the send."""
+    from openexecutive.delegation import handle_it, training
+    from openexecutive.delegation.inbox import _audit
+
+    if not handle_it.in_training(person_id, training.DRAFTS):
+        return
+    recipient = str(payload.get("from_email") or "")
+    try:
+        kept = training.keep_style(
+            person_id, recipient, str(payload.get("from_name") or ""), str(getattr(message, "text", "") or ""),
+            decision_id=decision_id,
+        )
+    except Exception:
+        logger.warning("delegation.reply_send: the reply went, but keeping it as an example failed", exc_info=True)
+        return
+    if kept is not None:
+        _audit("delegation_example_kept", f"Person {person_id} kept a sent reply as how they write", {
+            "person_id": person_id, "decision_id": decision_id, "allowed_id": kept.id,
+        })
+
+
+# Background note-taking tasks, held so they aren't collected mid-run.
+_NOTE_TASKS: set[Any] = set()
+
+
+def _note_sent(person_id: int, message: Any, thread: Any, recipients: list[str], thread_id: str, now: datetime) -> None:
+    """Always in the loop: once a reply went, note what the person told whom
+    (``memory.history_notes``), in the background, from the words they sent
+    alone. Off unless they turned it on; a failure never touches the send."""
+    import asyncio
+
+    try:
+        from openexecutive.memory.history import person_settings
+        from openexecutive.memory.history_notes import note_sent_reply
+
+        if not person_settings(person_id).reply_notes:
+            return
+        names = {
+            m.from_addr: m.from_name
+            for m in getattr(thread, "messages", []) or []
+            if getattr(m, "from_addr", "") and getattr(m, "from_name", "")
+        }
+        task = asyncio.get_running_loop().create_task(note_sent_reply(
+            person_id,
+            body=str(getattr(message, "text", "") or ""),
+            to_names=[names.get(addr, "") for addr in recipients],
+            to_addresses=list(recipients),
+            subject=str(getattr(message, "subject", "") or ""),
+            thread_id=thread_id,
+            sent_at=now,
+        ))
+        _NOTE_TASKS.add(task)
+        task.add_done_callback(_NOTE_TASKS.discard)
+    except Exception as exc:
+        logger.warning("delegation.reply_send: couldn't start noting a sent reply (%s)", type(exc).__name__)
+
+
+async def send_for_workflow(person: Any, client: Any, *, draft_id: str, recipients: list[str]) -> str:
+    """Send the draft ``draft_id`` a workflow step just wrote as ``person``,
+    to exactly ``recipients``. Returns the sent message's id; raises
+    ``SendRefused`` (``send_unconfirmed`` when the mailbox didn't say whether
+    it went). The caller (``workflow_email``) checked who and the limits."""
+    from openexecutive.config import get_settings
+    from openexecutive.delegation import handle_it
+    from openexecutive.delegation.gmail import (
+        STATUS_MESSAGES,
+        GmailAuthError,
+        GmailError,
+        normalize_email,
+    )
+    from openexecutive.delegation.inbox import _client_slot_active
+    from openexecutive.delegation.settings import can_delegate, is_enabled
+    from openexecutive.delegation.threads import MAX_RECIPIENTS
+
+    if person is None or person.id is None or not person.email or not can_delegate(person):
+        raise SendRefused(403, "not_yours", _NOT_YOURS)
+    if not is_enabled(person.id):
+        raise SendRefused(409, "act_as_me_off", "Act as me is off.")
+    if not handle_it.signing_ok():
+        raise SendRefused(409, "caller_signing_required", handle_it.REASONS["signing_off"])
+    if _client_slot_active():
+        raise SendRefused(409, "client_slot", "Sending is paused while a client is active.")
+    email = normalize_email(person.email)
+    try:
+        draft = await client.get_draft(draft_id)
+        own = {email, *(normalize_email(a) for a in await client.send_as_addresses())}
+    except GmailError as exc:
+        raise SendRefused(502, "gmail_error", "Couldn't read the draft in their mailbox.") from exc
+    if draft is None:
+        raise SendRefused(409, "draft_gone", "The draft isn't in their mailbox any more.")
+    sent_to = sorted({normalize_email(a) for a in [*draft.message.to, *draft.message.cc, *draft.message.bcc]})
+    exec_address = normalize_email(get_settings().exec_email_address)
+    if not sent_to or sent_to != sorted({normalize_email(a) for a in recipients}):
+        raise SendRefused(409, "recipients_changed", "The draft's recipients aren't the ones it was written to.")
+    if len(sent_to) > MAX_RECIPIENTS:
+        raise SendRefused(409, "too_many_recipients", f"At most {MAX_RECIPIENTS} recipients.")
+    if exec_address and exec_address in sent_to:
+        raise SendRefused(409, "executive_recipient", "It is addressed to the Executive's own mailbox.")
+    if normalize_email(draft.message.from_addr) not in own:
+        raise SendRefused(409, "not_from_you", "The draft isn't from one of their own addresses.")
+    try:
+        sent = await client.send_draft(draft_id)
+    except GmailError as exc:
+        if exc.maybe_done:
+            raise SendRefused(502, "send_unconfirmed", "Their mailbox didn't confirm it was sent.") from exc
+        if isinstance(exc, GmailAuthError):
+            raise SendRefused(409, "gmail_needs_reconnect", STATUS_MESSAGES["needs_reconnect"]) from exc
+        raise SendRefused(502, "gmail_error", "Their mailbox refused to send it. Nothing was sent.") from exc
+    return str(sent.id or "")
+
+
+async def send_chat_draft(
+    person: Any,
+    row_id: int,
+    *,
+    caller: Any,
+    confirm: dict[str, Any] | None = None,
+    gmail: Any = None,
+    now: datetime | None = None,
+) -> str:
+    """Send the draft chat wrote as ``person`` (``delegation_drafts`` row
+    ``row_id``), on their tap, exactly as it was written. ``confirm``
+    ``{"thread_moved_on": true}`` is the second yes for a reply whose
+    conversation moved on. Returns the sent message's id; raises
+    ``SendRefused``."""
+    from openexecutive.audit import rows_for_person
+
+    owner = getattr(person, "id", None)
+    with rows_for_person(owner if isinstance(owner, int) else None):
+        return await _send_chat_draft(
+            person, row_id, caller=caller, confirm=confirm or {}, gmail=gmail, now=now or datetime.now(UTC),
+        )
+
+
+_DRAFT_GONE = "That draft isn't in your Drafts any more: it was sent or deleted there."
+_CHAT_SENDING: set[int] = set()
+
+
+async def _send_chat_draft(
+    person: Any, row_id: int, *, caller: Any, confirm: dict[str, Any], gmail: Any, now: datetime,
+) -> str:
+    from openexecutive.config import get_settings
+    from openexecutive.delegation import drafts
+    from openexecutive.delegation.gmail import (
+        BLOCKING_CODES,
+        STATUS_MESSAGES,
+        GmailAuthError,
+        GmailError,
+        GmailNotFound,
+        GmailRateLimited,
+        gmail_for,
+        gmail_status,
+        normalize_email,
+    )
+    from openexecutive.delegation.inbox import _audit, _client_slot_active
+    from openexecutive.delegation.settings import can_delegate, is_enabled
+    from openexecutive.delegation.threads import MAX_RECIPIENTS
+
+    if person is None or person.id is None or not person.email or not can_delegate(person):
+        raise SendRefused(403, "not_yours", _NOT_YOURS)
+    row = drafts.get_row(row_id)
+    if row is None or row.person_id != person.id or row.source != drafts.SOURCE_CHAT:
+        # Someone else's draft reads the same as none at all.
+        raise SendRefused(404, "draft_not_found", "There's no draft of yours with that id.")
+    email = normalize_email(person.email)
+    _check_caller(caller, email)
+    if not is_enabled(person.id):
+        raise SendRefused(409, "act_as_me_off", "Turn on Act as me to send from here, or send it from your mailbox.")
+    if _client_slot_active():
+        raise SendRefused(409, "client_slot", "Sending from here is paused while a client is active. Send it from your mailbox.")
+    if row.sent_message_id:
+        raise SendRefused(409, "already_sent", "That email was already sent.")
+    if row.gone_at or row_id in _CHAT_SENDING:
+        raise SendRefused(409, "draft_gone", _DRAFT_GONE)
+    client = gmail if gmail is not None else gmail_for(email)
+    status = await gmail_status(email, gmail=client)
+    if status != "connected":
+        raise SendRefused(409, BLOCKING_CODES.get(status, "gmail_error"), STATUS_MESSAGES[status])
+
+    unreadable = "Couldn't read the draft in your mailbox. Try again in a moment."
+    try:
+        draft = await client.get_draft(row.draft_id)
+        own = {email, *(normalize_email(a) for a in await client.send_as_addresses())}
+    except GmailError as exc:
+        raise SendRefused(502, "gmail_error", unreadable) from exc
+    if draft is None:
+        drafts.mark_gone(row.id, now)
+        raise SendRefused(409, "draft_gone", _DRAFT_GONE)
+    if draft.message.id != row.message_id:
+        # Changed in the mailbox since chat wrote it: Send under the chat
+        # sends what the chat showed, so that version is theirs to send there.
+        raise SendRefused(
+            409, "draft_changed", "The draft changed in your mailbox since it was written. Send it from there.",
+        )
+
+    recipients = sorted({normalize_email(a) for a in [*draft.message.to, *draft.message.cc, *draft.message.bcc]})
+    exec_address = normalize_email(get_settings().exec_email_address)
+    if not recipients:
+        raise SendRefused(409, "no_recipients", "The draft isn't addressed to anyone. Add someone in your mailbox.")
+    if len(recipients) > MAX_RECIPIENTS:
+        raise SendRefused(
+            409, "too_many_recipients", f"The draft goes to more than {MAX_RECIPIENTS} people. Send it from your mailbox.",
+        )
+    if exec_address and exec_address in recipients:
+        raise SendRefused(
+            409, "executive_recipient", "The draft is addressed to the Executive's own mailbox. Change it in your mailbox.",
+        )
+    if normalize_email(draft.message.from_addr) not in own:
+        raise SendRefused(409, "not_from_you", "The draft isn't from one of your own addresses. Check it in your mailbox.")
+
+    thread_id = row.thread_id or ""
+    if thread_id:
+        # A reply: not when they answered there themselves since, and a second
+        # yes when someone else wrote after the draft was made.
+        try:
+            thread = await client.get_thread(thread_id)
+        except GmailNotFound:
+            drafts.mark_gone(row.id, now)
+            raise SendRefused(409, "draft_gone", "That conversation isn't in your mailbox any more.") from None
+        except GmailError as exc:
+            raise SendRefused(502, "gmail_error", unreadable) from exc
+        saved = drafts._aware(row.created_at)
+        later = [
+            m for m in getattr(thread, "messages", None) or []
+            if "DRAFT" not in m.labels
+            and (saved is None or ((drafts._aware(m.received_at or "") or now) > saved))
+        ]
+        if any("SENT" in m.labels and normalize_email(m.from_addr) in own for m in later):
+            drafts.mark_gone(row.id, now)
+            raise SendRefused(409, "you_replied", "You've already replied in this conversation, so this draft wasn't sent.")
+        moved_on = any("SENT" not in m.labels and normalize_email(m.from_addr) not in own for m in later)
+        if moved_on and confirm.get("thread_moved_on") is not True:
+            raise SendRefused(
+                409, "confirm", _CONFIRM_TEXT["thread_moved_on"], reasons=["thread_moved_on"], recipients=recipients,
+            )
+
+    if row.id in _CHAT_SENDING or not drafts.claim_send(row.id, now):
+        raise SendRefused(409, "already_handled", "This email is being sent already, or was sent.")
+    _CHAT_SENDING.add(row.id)
+    try:
+        # Read once more after the claim: an edit made meanwhile is never
+        # sent unchecked (``drafts.send`` sends whatever the draft is then).
+        try:
+            current = await client.get_draft(row.draft_id)
+        except GmailError as exc:
+            drafts.release_send(row.id)
+            raise SendRefused(502, "gmail_error", unreadable) from exc
+        if current is None:
+            raise SendRefused(409, "draft_gone", _DRAFT_GONE)
+        if current.message.id != row.message_id:
+            drafts.release_send(row.id)
+            raise SendRefused(
+                409, "draft_changed", "The draft changed in your mailbox just now, so nothing was sent. Send it from there.",
+            )
+        try:
+            sent = await client.send_draft(row.draft_id)
+        except GmailError as exc:
+            if exc.maybe_done:
+                # Left claimed, so another tap can't send it twice: their Sent
+                # folder says whether it went.
+                logger.warning("delegation.reply_send: the mailbox didn't confirm a chat draft's send (%s)", type(exc).__name__)
+                raise SendRefused(
+                    502, "send_unconfirmed",
+                    "Your mailbox didn't confirm it was sent. Check your Sent folder before sending it again.",
+                ) from exc
+            if isinstance(exc, GmailNotFound):
+                raise SendRefused(409, "draft_gone", _DRAFT_GONE) from exc
+            drafts.release_send(row.id)
+            if isinstance(exc, GmailAuthError):
+                raise SendRefused(409, "gmail_needs_reconnect", STATUS_MESSAGES["needs_reconnect"]) from exc
+            if isinstance(exc, GmailRateLimited):
+                raise SendRefused(429, "rate_limited", "Your mail service asked to slow down. Nothing was sent; try again in a minute.") from exc
+            raise SendRefused(
+                502, "gmail_error", "Your mailbox refused to send it. Nothing was sent; try again, or send it from your mailbox.",
+            ) from exc
+        # It went: whatever happens to the bookkeeping, say so.
+        try:
+            if sent.id:
+                drafts.mark_sent(person.id, row.draft_id, sent.id)
+            _audit("delegation_chat_draft_sent", f"Sent an email chat wrote as person {person.id}, on their tap", {
+                "person_id": person.id, "draft_row": row.id, "thread_id": thread_id or None,
+                "sent_message_id": sent.id, "recipient_count": len(recipients),
+            })
+        except Exception as exc:
+            logger.warning("delegation.reply_send: recording a sent chat draft failed (%s)", type(exc).__name__)
+        _note_sent(person.id, current.message, None, recipients, thread_id, now)
+        return str(sent.id or "")
+    finally:
+        _CHAT_SENDING.discard(row.id)

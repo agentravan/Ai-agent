@@ -1,0 +1,420 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import threading
+import time
+from collections import deque
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from openexecutive.alerts import dispatcher, preferences, store
+from openexecutive.alerts.models import (
+    AlertChannel,
+    AlertEvent,
+    TriageDecision,
+)
+
+if TYPE_CHECKING:
+    from openexecutive.people.models import Person
+
+logger = logging.getLogger(__name__)
+
+# Hold strong references to in-flight background tasks so GC cannot cancel them
+# mid-flight (mirrors memory.episodic._background_tasks).
+_background_tasks: set[asyncio.Task[Any]] = set()
+
+# Simple rolling-window rate limiter on event evaluations. Cost guard against
+# runaway cost from a misbehaving integration. Single-process only.
+_RATE_LIMIT_PER_MIN = 60
+_recent_event_ts: deque[float] = deque(maxlen=_RATE_LIMIT_PER_MIN)
+_rate_lock = threading.Lock()
+
+
+# Severities that justify re-dispatching a coalesced alert (a repeat that
+# escalated the open situation into "look now" territory).
+_REDISPATCH_SEVERITIES = frozenset({"high", "urgent"})
+
+
+def _person_id_from_event(event: AlertEvent) -> int | None:
+    """Routing target: ONLY the explicit ``routed_to_person_id`` field.
+
+    ``event.user`` is deliberately not parsed: integrations fill it with a
+    sender's self-chosen display name (Telegram, Google Chat), so a
+    ``person:<id>`` there would let an outsider pick the routing target.
+    The create_alert tool sets the explicit field itself.
+    """
+    return event.routed_to_person_id
+
+
+def _with_department_tag(tags: list[str], channel: str | None) -> list[str]:
+    """Carry a ``department:<slug>`` routing hint into the row's tags.
+
+    Accepts the bare slug (``AlertEvent.department``) or the legacy
+    ``department:<slug>`` channel form."""
+    chan = (channel or "").strip()
+    if chan.startswith("department:"):
+        chan = chan.split(":", 1)[1]
+    slug = chan.strip().lower()
+    if not slug:
+        return list(tags)
+    tag = f"department:{slug}"
+    return list(tags) if tag in tags else [*tags, tag]
+
+
+def _rate_limited() -> bool:
+    """Returns True when the per-minute cap has been hit."""
+    now = time.monotonic()
+    with _rate_lock:
+        cutoff = now - 60.0
+        while _recent_event_ts and _recent_event_ts[0] < cutoff:
+            _recent_event_ts.popleft()
+        if len(_recent_event_ts) >= _RATE_LIMIT_PER_MIN:
+            return True
+        _recent_event_ts.append(now)
+        return False
+
+
+def _make_private(
+    topic_tags: list[str], dedup_key: str
+) -> tuple[list[str], int | None, str, list[AlertChannel]]:
+    """An alert only the principal may see: tagged, routed to the principal,
+    stored but never pushed live or broadcast, and deduplicated only against
+    other private alerts (coalescing into a shared card would copy its body
+    there)."""
+    from openexecutive.alerts.models import PRIVATE_ALERT_TAG
+
+    principal_id: int | None = None
+    try:
+        from openexecutive.people.store import find_principal_person
+
+        principal = find_principal_person()
+        principal_id = principal.id if principal is not None else None
+    except Exception:
+        logger.exception("alerts.pipeline: principal lookup failed for a private alert")
+    tags = [t for t in topic_tags if t != PRIVATE_ALERT_TAG] + [PRIVATE_ALERT_TAG]
+    # Stored for the principal's /today only: no live push to every open
+    # browser (dispatch_web), no email, no team-room broadcast.
+    persisted_only: list[AlertChannel] = [AlertChannel.PERSISTED]
+    return tags, principal_id, f"private:{dedup_key}", persisted_only
+
+
+def _ground_decision(
+    decision: TriageDecision, event: AlertEvent, initiatives: list[Any],
+) -> TriageDecision:
+    """``decision`` with any headline / body sentence / suggested action that
+    names a person or figure absent from the event dropped (see
+    ``briefing.grounding``). Unchanged when grounded, and on any error."""
+    from openexecutive.briefing.grounding import (
+        ground_alert_text,
+        profile_sources,
+        sources_from_text,
+    )
+
+    event_text = "\n".join(
+        part for part in (
+            event.subject, event.from_ or "", event.title or "", event.body,
+        ) if part
+    )
+    sources = (
+        sources_from_text(event_text, "Event", "event")
+        + sources_from_text("\n".join(str(i) for i in initiatives), "Initiatives", "init")
+        + profile_sources()
+    )
+    headline, body, action, changed = ground_alert_text(
+        decision.headline, decision.body, decision.suggested_action,
+        sources=sources,
+        fallback_headline=event.subject or event.title or "",
+        fallback_body=event.body,
+        surface="alert triage",
+        private=event.private,
+    )
+    if not changed:
+        return decision
+    return decision.model_copy(
+        update={"headline": headline, "body": body, "suggested_action": action}
+    )
+
+
+def _label_team_raised(decision: TriageDecision, name: str) -> TriageDecision:
+    """``decision`` with its body led by who raised it, so a card a team
+    member raised from chat never reads as news from anywhere else."""
+    label = f"Raised by {name}."
+    body = decision.body.strip()
+    if body.startswith(label):
+        return decision
+    return decision.model_copy(update={"body": f"{label} {body}".strip()})
+
+
+async def evaluate_and_dispatch(
+    event: AlertEvent,
+    db_path: Path | None = None,
+) -> tuple[TriageDecision, int | None]:
+    """Run triage on a single event and dispatch the alert.
+
+    Returns (decision, alert_id). alert_id is None when the alert is
+    suppressed or a duplicate.
+    """
+    from openexecutive.agents.triage import TriageAgent
+    from openexecutive.memory.episodic import get_active_initiatives
+
+    path = db_path or store.DB_PATH
+
+    if _rate_limited():
+        logger.warning(
+            "alerts.pipeline rate-limited: dropping event source=%s ext_id=%s",
+            event.source,
+            event.external_id,
+        )
+        return (
+            TriageDecision(
+                alert=False,
+                dedup_key=f"rate-limited-{event.source}-{event.external_id}",
+                reason_if_suppressed="rate_limited",
+            ),
+            None,
+        )
+
+    # Cheap pre-checks: load context for the triage prompt + post-decision mute.
+    prefs = preferences.get_preferences(db_path=path)
+    mutes = [m.pattern for m in store.list_mutes(db_path=path)]
+    recent = [
+        {
+            "headline": a.headline,
+            "severity": a.severity,
+            "dedup_key": a.dedup_key,
+            "topic_tags": a.topic_tags,
+        }
+        # Never anyone's drafted documents: they are their owners' alone.
+        for a in store.recent_alerts(limit=20, db_path=path, exclude_source="artifact")
+    ]
+    try:
+        initiatives = get_active_initiatives()
+    except Exception:
+        initiatives = []
+
+    agent = TriageAgent()
+    decision = await agent.triage(
+        event,
+        recent_alerts=recent,
+        mute_patterns=mutes,
+        active_initiatives=initiatives,
+    )
+
+    # Post-decision mute check: triage may have produced a tag we mute.
+    if decision.alert and preferences.matches_mute(decision.topic_tags, mutes):
+        logger.info(
+            "alerts.pipeline post-mute suppressing event source=%s ext_id=%s tags=%s",
+            event.source,
+            event.external_id,
+            decision.topic_tags,
+        )
+        decision = decision.model_copy(
+            update={"alert": False, "reason_if_suppressed": "muted_post_triage"}
+        )
+
+    if not decision.alert:
+        # We still persist a low-severity record so the UI can show "23 events
+        # triaged, 1 surfaced" if we ever want it. For now keep it simple:
+        # only persist when the decision says alert=true.
+        return decision, None
+
+    # Triage rewrote the event into a headline and body nobody reads before
+    # dispatch: keep only what the event itself (or the profile, or the
+    # initiatives triage was shown) supports.
+    decision = _ground_decision(decision, event, initiatives)
+    if event.raised_by:
+        decision = _label_team_raised(decision, event.raised_by)
+
+    effective_channels = preferences.resolve_channels(
+        decision.channels, decision.severity, prefs
+    )
+    if event.raised_by:
+        # People and departments only: a company-wide post stays with the
+        # owner, whatever triage made of what the team member wrote.
+        effective_channels = [
+            c for c in effective_channels if c != AlertChannel.COMPANY_BROADCAST
+        ]
+
+    # A producer that knows the stable identity of the situation (a watch
+    # slug) wins over the model's free-text key.
+    dedup_key = event.dedup_hint or decision.dedup_key
+    if event.raised_by:
+        # One team member's alert never folds into another's card.
+        dedup_key = f"raised_by:{(event.from_ or event.raised_by).lower()}:{dedup_key}"
+    topic_tags = _with_department_tag(
+        decision.topic_tags, event.department or event.channel,
+    )
+    routed_to = _person_id_from_event(event)
+    if event.private:
+        topic_tags, routed_to, dedup_key, effective_channels = _make_private(
+            topic_tags, dedup_key
+        )
+
+    # A replay of the SAME upstream event (webhook retry, re-poll) is a
+    # no-op, exactly as before: the (source, external_id) row already exists.
+    if event.external_id and store.get_alert_by_external(
+        event.source, event.external_id, db_path=path
+    ) is not None:
+        logger.info(
+            "alerts.pipeline duplicate suppressed source=%s ext_id=%s",
+            event.source, event.external_id,
+        )
+        return decision, None
+
+    # Coalesce a repeat of an open alert into the existing row instead of
+    # stacking another card — and stay quiet unless the repeat is graver
+    # (a 2% move followed by a 10% crash must still ping).
+    coalesced = store.coalesce_alert(
+        source=event.source,
+        dedup_key=dedup_key,
+        severity=decision.severity.value,
+        body=decision.body,
+        db_path=path,
+    )
+    if coalesced is not None:
+        existing_id, raised = coalesced
+        logger.info(
+            "alerts.pipeline coalesced source=%s ext_id=%s into alert=%d raised=%s",
+            event.source, event.external_id, existing_id, raised,
+        )
+        if not (raised and decision.severity.value in _REDISPATCH_SEVERITIES):
+            return decision, None
+        alert = store.get_alert(existing_id, db_path=path)
+        if alert is None:
+            return decision, None
+        await dispatcher.dispatch_all(
+            alert,
+            effective_channels,
+            db_path=path,
+            department_slug=decision.department_slug,
+            broadcast_integration=decision.broadcast_integration,
+        )
+        return decision, existing_id
+
+    alert_id = store.insert_alert(
+        source=event.source,
+        external_id=event.external_id,
+        severity=decision.severity.value,
+        headline=decision.headline or (event.subject or event.title or event.source),
+        body=decision.body,
+        suggested_action=decision.suggested_action,
+        # Only an extension's own code files a document in its collection
+        # (orchestrator/extensions.py): a triaged alert never claims one.
+        topic_tags=[t for t in topic_tags if not t.startswith("collection:")],
+        dedup_key=dedup_key,
+        routed_to_person_id=routed_to,
+        db_path=path,
+    )
+    if alert_id is None:
+        logger.info(
+            "alerts.pipeline duplicate suppressed source=%s ext_id=%s",
+            event.source,
+            event.external_id,
+        )
+        return decision, None
+
+    alert = store.get_alert(alert_id, db_path=path)
+    if alert is None:
+        logger.error("alerts.pipeline could not re-read alert id=%s", alert_id)
+        return decision, alert_id
+
+    await dispatcher.dispatch_all(
+        alert,
+        effective_channels,
+        db_path=path,
+        # Shift 3: thread the broadcast-routing context through so the
+        # DEPARTMENT_CHANNEL / COMPANY_BROADCAST dispatchers can resolve
+        # the right room. Empty strings when triage picked per-person
+        # channels only — those dispatchers ignore the kwargs.
+        department_slug=decision.department_slug,
+        broadcast_integration=decision.broadcast_integration,
+    )
+    return decision, alert_id
+
+
+def schedule_chat_message_evaluation(
+    *,
+    source: str,
+    external_id: str,
+    body: str,
+    sender: Person | None,
+    fallback_name: str,
+    channel: str | None = None,
+) -> None:
+    """Triage one inbound chat-app message, naming the sender as the roster does.
+
+    A chat app's own name for the sender is whatever they typed into it, so
+    a linked person is named by their People record instead: otherwise the
+    principal writing from an account called something else reads to triage
+    (and then to their own brief) as a stranger. ``fallback_name`` is used
+    only when nobody on the roster matched.
+
+    The principal's own messages to their Executive are a conversation with
+    it, not news for their brief, so they are not triaged at all.
+    """
+    if sender is not None and sender.is_principal:
+        return
+    name = sender.full_name if sender is not None else fallback_name
+    schedule_evaluation(
+        AlertEvent(
+            source=source,
+            external_id=external_id,
+            body=body,
+            channel=channel,
+            user=name or None,
+        )
+    )
+
+
+def schedule_evaluation(event: AlertEvent) -> None:
+    """Fire-and-forget evaluation. Safe to call from sync or async context.
+
+    Mirrors memory.episodic.schedule_extraction's GC-safe pattern, including
+    its audit-context snapshot: the triage model call happens in a task that
+    starts after the caller's ``with set_turn(...)`` has exited, so without
+    carrying the ids explicitly every triage row records with
+    ``session_id=NULL``. The thread branch needs it even more — a new thread
+    starts from an empty context and inherits nothing.
+
+    A caller with no turn bound (the scheduler, an external-monitor sweep)
+    snapshots ``(None, None)`` and is unchanged: those really are
+    out-of-turn calls.
+    """
+    from openexecutive.audit.context import get_active_ids
+
+    audit_sid, audit_tid = get_active_ids()
+    try:
+        loop = asyncio.get_running_loop()
+        task = loop.create_task(_evaluate_in_turn(event, audit_sid, audit_tid))
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+    except RuntimeError:
+        threading.Thread(
+            target=lambda: asyncio.run(
+                _evaluate_in_turn(event, audit_sid, audit_tid)
+            ),
+            daemon=True,
+        ).start()
+
+
+async def _evaluate_in_turn(
+    event: AlertEvent,
+    audit_session_id: str | None,
+    audit_turn_id: str | None,
+) -> None:
+    """Re-bind the scheduling caller's audit ids, then evaluate."""
+    from openexecutive.audit.context import get_active_ids, set_turn
+
+    # Per-field fallback — see memory.episodic.extract_and_store for why a
+    # half-empty snapshot must not erase the ambient counterpart.
+    ambient_session, ambient_turn = get_active_ids()
+    effective_session = audit_session_id if audit_session_id is not None else ambient_session
+    effective_turn = audit_turn_id if audit_turn_id is not None else ambient_turn
+
+    if (effective_session, effective_turn) == (ambient_session, ambient_turn):
+        await evaluate_and_dispatch(event)
+        return
+
+    with set_turn(session_id=effective_session, turn_id=effective_turn):
+        await evaluate_and_dispatch(event)

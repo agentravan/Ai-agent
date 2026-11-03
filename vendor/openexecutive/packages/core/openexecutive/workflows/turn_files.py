@@ -1,0 +1,103 @@
+"""The files attached to the chat message being answered, as sent.
+
+The web chat extracts an attachment's text into the message, which is all the
+model reads. A Python job needs the file itself (a PDF to split, a workbook to
+rework), and having the model retype the extracted text into the job costs
+output tokens, takes minutes for a large file and loses everything that isn't
+text. So ``POST /chat/upload`` binds the turn's uploads here for the whole
+turn, and ``run_python_job`` takes them by name (``attachment_files``).
+
+The binding lasts for the turn that carried the files and no later one, as
+the extracted text does (api/routes/chat.py); a later message reaches the
+conversation's copy (``orchestrator.conversation_files``) by ``file:<name>``.
+
+A chat app (Telegram, Slack, Discord, Google Chat) reads its files through
+``integrations.attachments.build_attachment_output``, which ``offer``s each
+one here; ``Executive.chat`` takes them for its turn (``take_offered``), so
+a PDF sent in Telegram can be split, attached or saved like a web upload.
+"""
+from __future__ import annotations
+
+import contextlib
+import re
+from collections.abc import Iterator
+from contextvars import ContextVar
+
+_files: ContextVar[dict[str, bytes] | None] = ContextVar("turn_files", default=None)
+# Files a chat app read for the message it is about to answer, waiting for
+# that turn (``offer`` / ``take_offered``). A coroutine awaited by the
+# adapter shares its context, so what the reader offers the adapter's own
+# chat call takes.
+_offered: ContextVar[list[tuple[str, bytes]] | None] = ContextVar("turn_files_offered", default=None)
+
+_UNSAFE = re.compile(r"[^A-Za-z0-9 ._()-]")
+
+
+def safe_name(filename: str) -> str:
+    """A plain file name for ``filename``: its last path part, with anything a
+    job's file names don't allow replaced, so the name the model saw on the
+    attachment finds the file."""
+    base = filename.replace("\\", "/").rsplit("/", 1)[-1].strip()
+    cleaned = _UNSAFE.sub("_", base).lstrip("._- ")[:120]
+    return cleaned or "attachment"
+
+
+def collect(uploads: list[tuple[str, bytes]]) -> dict[str, bytes]:
+    """The turn's files by safe name; a repeated name gets " (2)", " (3)"."""
+    files: dict[str, bytes] = {}
+    for filename, data in uploads:
+        name = safe_name(filename)
+        stem, dot, ext = name.rpartition(".")
+        if not dot:
+            stem, ext = name, ""
+        n = 2
+        while name in files:
+            name = f"{stem} ({n}){dot}{ext}"
+            n += 1
+        files[name] = data
+    return files
+
+
+@contextlib.contextmanager
+def bind(files: dict[str, bytes] | None) -> Iterator[None]:
+    # Save/restore rather than Token.reset(), as set_session and set_turn do:
+    # the SSE route can exit this in a different Context than it entered.
+    prior = _files.get()
+    _files.set(dict(files) if files else None)
+    try:
+        yield
+    finally:
+        _files.set(prior)
+
+
+def get(name: str) -> bytes | None:
+    """The attached file of that name (or the name it was sent under)."""
+    files = _files.get()
+    if not files:
+        return None
+    if name in files:
+        return files[name]
+    return files.get(safe_name(name))
+
+
+def names() -> list[str]:
+    return sorted(_files.get() or {})
+
+
+def offer(filename: str, data: bytes) -> None:
+    """Hold a file a chat app read for the next turn this context runs."""
+    pending = _offered.get()
+    if pending is None:
+        pending = []
+        _offered.set(pending)
+    pending.append((filename, data))
+
+
+def take_offered() -> dict[str, bytes]:
+    """The files offered since the last take, by safe name, and forget them."""
+    pending = _offered.get()
+    if not pending:
+        return {}
+    files = collect(pending)
+    pending.clear()
+    return files

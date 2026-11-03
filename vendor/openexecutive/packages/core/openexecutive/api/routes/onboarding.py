@@ -1,0 +1,922 @@
+from __future__ import annotations
+
+import asyncio
+import copy
+import dataclasses
+import logging
+import sqlite3
+import time
+import uuid
+from collections import OrderedDict
+from dataclasses import dataclass, field
+
+from fastapi import APIRouter, File, Form, HTTPException, Request, Response, UploadFile
+
+from openexecutive.api import caller as api_caller
+from openexecutive.api.intake_uploads import (
+    _INTAKE_GEN_CHARS_PER_FILE,
+    _INTAKE_MAX_DOC_CHARS,
+    _gather_intake_attachments,
+)
+from openexecutive.api.models import (
+    ONBOARD_ANSWER_MAX_CHARS,
+    ONBOARD_MESSAGE_MAX_CHARS,
+    CompanyProfileResponse,
+    OnboardAnswerRequest,
+    OnboardCommitRequest,
+    OnboardDepartmentDraft,
+    OnboardGoalDraft,
+    OnboardMessageRequest,
+    OnboardPersonDraft,
+    OnboardReviseRequest,
+    OnboardSessionRequest,
+    OnboardSessionResponse,
+    OnboardStatusResponse,
+    OnboardTranscriptTurn,
+    OnboardTurnResponse,
+    OnboardUnderstandingResponse,
+)
+from openexecutive.config import get_settings
+from openexecutive.memory.company_profile import CompanyProfile
+from openexecutive.onboarding import interview_store
+from openexecutive.onboarding.interview import (
+    MAX_QUESTIONS,
+    MAX_TRANSCRIPT_CHARS,
+    OPENING_PROMPT,
+    CompanyDraft,
+    Turn,
+    transcript_chars,
+    validate_draft,
+)
+from openexecutive.onboarding.website import (
+    WebsiteError,
+    WebsitePage,
+    normalize_url,
+    read_website,
+)
+from openexecutive.onboarding.wizard import (
+    WizardState,
+    get_current_question,
+    get_step,
+    process_answer,
+)
+from openexecutive.orchestrator.content_trust import wrap_untrusted
+from openexecutive.workflows.gate import ensure_workflow_event
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+_wizard_sessions: dict[str, WizardState] = {}
+# Hold strong refs to background research runs so GC can't cancel
+# them mid-flight (mirrors alerts/pipeline.py). Auto-cleared via
+# add_done_callback after the task finishes.
+_background_research_tasks: set[asyncio.Task] = set()
+# Per-session dedup — a client that retries the final answer between
+# our process_answer commit and the 400 response would otherwise spawn
+# a second research run. Persistence is OK at module scope: a process
+# restart loses the set but onboarding is rare, the cap on the auto-
+# fire below means duplicates are still bounded by elapsed time.
+_onboarding_research_fired: set[str] = set()
+# Hard ceiling on a single auto-fire — 7 specialists × web_search +
+# tool-use should finish well under this, but we don't want a hung
+# provider to leak a long-lived background task.
+_RESEARCH_WALLCLOCK_TIMEOUT_SECONDS = 600
+
+
+def _wizard_status(session_id: str, state: WizardState) -> OnboardStatusResponse:
+    question = get_current_question(state) if not state.completed else None
+    step = get_step(state.current_step)
+    return OnboardStatusResponse(
+        session_id=session_id,
+        current_step=state.position(),
+        total_steps=state.total_steps(),
+        current_question=question,
+        progress_percent=state.get_progress()["percent"],
+        completed=state.completed,
+        optional=bool(step is not None and not state.completed and not step["required"]),
+    )
+
+
+@router.get("/onboard/start", response_model=OnboardStatusResponse)
+async def start_onboarding() -> OnboardStatusResponse:
+    from openexecutive.memory.workspace_settings import get_workspace
+
+    session_id = str(uuid.uuid4())
+    # The mode is read once, here: a solo workspace skips the team steps, and
+    # the first-run choice screen sets it before this is called.
+    state = WizardState(solo=get_workspace().mode == "solo")
+    _wizard_sessions[session_id] = state
+    return _wizard_status(session_id, state)
+
+
+@router.post("/onboard/answer", response_model=OnboardStatusResponse)
+async def submit_answer(body: OnboardAnswerRequest, request: Request) -> OnboardStatusResponse:
+    state = _wizard_sessions.get(body.session_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Onboarding session not found")
+    if state.completed:
+        raise HTTPException(status_code=400, detail="Onboarding already completed")
+    if len(body.answer) > ONBOARD_ANSWER_MAX_CHARS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Answer is too long (limit {ONBOARD_ANSWER_MAX_CHARS:,} characters).",
+        )
+
+    # process_answer mutates the stored state in place. Keep a snapshot so
+    # a failed profile build on the final answer can be rolled back —
+    # otherwise the session is stuck at completed=True and every retry
+    # hits the 400 above, forcing the user to restart onboarding.
+    snapshot = copy.deepcopy(state)
+    state = process_answer(state, body.answer)
+
+    if state.completed:
+        from openexecutive.api.routes.chat import _caller_is_principal_or_unclaimed
+        from openexecutive.onboarding.profile_builder import build_and_save_profile
+
+        # Saving adds people with their emails (the web sign-in allow-list)
+        # and a principal, so once there is an owner it is theirs to do — the
+        # People routes' rule. Rolled back like a failed build, so the owner
+        # can still finish this session.
+        if not _caller_is_principal_or_unclaimed(request):
+            _wizard_sessions[body.session_id] = snapshot
+            raise HTTPException(
+                status_code=403,
+                detail="Only the owner can save this form, because it adds people and their emails.",
+            )
+        try:
+            build_and_save_profile(state)
+        except Exception as exc:
+            # Type name only: a pydantic ValidationError's str() embeds the
+            # offending input, and the wizard answers include financials
+            # the UI promises are "stored locally only".
+            logger.error(
+                "onboarding: profile build failed on the final answer (%s)",
+                type(exc).__name__,
+            )
+            _wizard_sessions[body.session_id] = snapshot
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Could not build the company profile from your answers. "
+                    "Rephrase your last answer and try again, or restart "
+                    "onboarding if an earlier answer is the problem."
+                ),
+            ) from exc
+
+        # Fire the watchlist-research workflow once at onboarding
+        # completion so the principal's first /today after install
+        # carries a "here's what I researched we should be watching"
+        # alert. Best-effort — a research failure must NOT block
+        # finishing onboarding, so the helper swallows exceptions.
+        # Dedup on session_id so a duplicate completion (client retry
+        # before we 400) can't double-fire.
+        if body.session_id not in _onboarding_research_fired:
+            _onboarding_research_fired.add(body.session_id)
+            task = asyncio.create_task(
+                _fire_post_onboarding_research(body.session_id)
+            )
+            _background_research_tasks.add(task)
+            # Auto-cleanup so the set doesn't grow unboundedly across
+            # the process lifetime.
+            task.add_done_callback(_background_research_tasks.discard)
+
+    _wizard_sessions[body.session_id] = state
+    return _wizard_status(body.session_id, state)
+
+
+async def _fire_post_onboarding_research(session_id: str) -> None:
+    """Run the executive_research workflow once at end of onboarding.
+
+    The workflow itself routes findings via the Executive's outbound
+    toolkit — DMs to heads of departments, briefing alerts via
+    create_alert, watchlist additions via add_watchlist_entry, etc.
+    This wrapper just runs the workflow with a wall-clock ceiling and
+    creates / completes the workflow_run row for audit.
+
+    Best-effort: any exception is logged and swallowed. Onboarding
+    has already returned 200 to the client by the time this fires.
+    """
+    from openexecutive.workflows.persistence import (
+        complete_run,
+        create_run,
+        fail_run,
+    )
+
+    run_id = str(uuid.uuid4())
+    last_error = ""
+    try:
+        from openexecutive.config import get_settings
+        from openexecutive.knowledge.store import ChromaDBStore
+        from openexecutive.workflows import WORKFLOW_REGISTRY
+
+        workflow = WORKFLOW_REGISTRY["executive_research"]
+        input_cls = workflow.input_model()
+        wf_inputs = input_cls(note="initial post-onboarding research run")
+
+        try:
+            create_run(
+                run_id,
+                "executive_research",
+                f"{workflow.title} (post-onboarding auto-fire)",
+                wf_inputs.model_dump(),
+            )
+        except Exception:
+            logger.exception("post-onboarding research: create_run failed")
+
+        store = ChromaDBStore(persist_directory=get_settings().vector_store_path)
+        artifact = ""
+
+        async def _run() -> str:
+            captured = ""
+            async for event in workflow.run(inputs=wf_inputs, store=store):
+                event = ensure_workflow_event(event, site='onboarding.post_onboarding_research')
+                if event.type == "artifact" and event.content:
+                    captured = event.content
+                elif event.type == "error" and event.message:
+                    raise RuntimeError(event.message)
+            return captured
+
+        artifact = await asyncio.wait_for(
+            _run(), timeout=_RESEARCH_WALLCLOCK_TIMEOUT_SECONDS,
+        )
+
+        try:
+            complete_run(run_id, artifact or "(no artifact)")
+        except Exception:
+            logger.exception("post-onboarding research: complete_run failed")
+    except TimeoutError:
+        last_error = "wall-clock timeout"
+        logger.warning(
+            "post-onboarding research timed out after %ds (session=%s)",
+            _RESEARCH_WALLCLOCK_TIMEOUT_SECONDS, session_id,
+        )
+    except Exception as exc:
+        last_error = str(exc)[:200]
+        logger.exception(
+            "post-onboarding research failed (session=%s)", session_id,
+        )
+
+    if last_error:
+        try:
+            fail_run(run_id, last_error)
+        except Exception:
+            logger.exception("post-onboarding research: fail_run failed")
+
+
+@router.get("/onboard/status/{session_id}", response_model=OnboardStatusResponse)
+async def get_onboard_status(session_id: str) -> OnboardStatusResponse:
+    state = _wizard_sessions.get(session_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Onboarding session not found")
+    return _wizard_status(session_id, state)
+
+
+# ── conversational onboarding (/onboard/interview/*) ─────────────────────────
+#
+# The user describes their business, the interviewer asks clarifying questions,
+# and the result is a DRAFT the user reviews and edits before anything is
+# written. The step-by-step wizard above stays reachable as a fallback.
+#
+# Two properties this code exists to preserve, both tested:
+#
+# 1. **Nothing echoes the user's input.** Every 4xx/5xx detail below is a fixed
+#    string, and every log line carries an exception TYPE, not its message.
+#    These transcripts contain ARR, burn, and runway.
+#
+# 2. **The commit is write-once and ordered.** Validation happens before the
+#    first write, so a failure leaves the session exactly as it was and the
+#    user can fix the draft and retry. That replaces the deepcopy-snapshot
+#    rollback the wizard needs (process_answer mutates before it can fail);
+#    here the interview never writes at all, so ordering alone is enough.
+
+
+@dataclass
+class InterviewSession:
+    # Who started it (api_caller.identity_key): only they can read or carry
+    # it on. The id alone is not a capability now that sessions outlive the
+    # process and a browser remembers its id.
+    owner_key: str = ""
+    transcript: list[Turn] = field(default_factory=list)
+    questions_asked: int = 0
+    draft: CompanyDraft | None = None
+    # Hint for the LATEST question only. Lives on the session (not a side
+    # dict) so it is swept with everything else and cannot leak.
+    last_hint: str = ""
+    # Suggested answers for the LATEST question only, like last_hint.
+    last_options: list[str] = field(default_factory=list)
+    # The company website setup read (normalized), saved on the draft profile.
+    website: str = ""
+    saved: bool = False
+    last_touched: float = field(default_factory=time.monotonic)
+    # Wall-clock time of the stored copy this one matches (interview_store).
+    stored_at: float = 0.0
+    # Start over removed it: a turn still in flight must not write it back.
+    discarded: bool = False
+
+
+# Where an attached file's text starts in the opening turn. An edit to the
+# description (POST /onboard/interview/revise) replaces only what is before it.
+# The website's pages follow the files under the same marker.
+ATTACHED_MARKER = "\n\n=== Attached: "
+
+
+def _opening_text(
+    description: str,
+    extracted: list[tuple[str, str]],
+    pages: list[WebsitePage],
+) -> str:
+    """The opening turn: what was typed, then each file and website page as
+    untrusted content (someone else's words, never instructions)."""
+    text = description.strip()
+    for name, body in extracted:
+        wrapped = wrap_untrusted(body[:_INTAKE_GEN_CHARS_PER_FILE], source="attachment", author=name)
+        text += f"{ATTACHED_MARKER}{name} ===\n{wrapped}"
+    for page in pages:
+        wrapped = wrap_untrusted(page.text, source="website", author=page.label)
+        text += f"{ATTACHED_MARKER}{page.label} (website) ===\n{wrapped}"
+    return text
+
+
+async def _read_site(website: str) -> tuple[str, list[WebsitePage]]:
+    """The normalized address and its readable pages; ("", []) when none was
+    given. A typo that is no address at all is a 422; a site that can't be
+    read is just no pages, and setup goes on from the text."""
+    if not website.strip():
+        return "", []
+    try:
+        url = normalize_url(website)
+    except WebsiteError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    pages = await read_website(
+        url,
+        max_chars_per_page=_INTAKE_GEN_CHARS_PER_FILE,
+        max_total_chars=_INTAKE_MAX_DOC_CHARS,
+    )
+    return url, pages
+
+# The working table of this process, with a TTL and cap. Every turn is also
+# written through to SQLite (onboarding/interview_store.py), so a restart or
+# another worker finds the session again; a saved session's row is deleted
+# there at once, since the transcript carries the company's financials. A
+# page refresh is covered by GET /onboard/interview/{id}.
+_interview_sessions: OrderedDict[str, InterviewSession] = OrderedDict()
+_INTERVIEW_TTL_SECONDS = 2 * 3600
+_MAX_INTERVIEW_SESSIONS = 50
+
+
+def _sweep_interview_sessions() -> None:
+    now = time.monotonic()
+    for sid in [
+        s
+        for s, sess in _interview_sessions.items()
+        if now - sess.last_touched > _INTERVIEW_TTL_SECONDS
+    ]:
+        _interview_sessions.pop(sid, None)
+        interview_store.delete(sid)
+    while len(_interview_sessions) > _MAX_INTERVIEW_SESSIONS:
+        _interview_sessions.popitem(last=False)
+
+
+def _persist_interview(session_id: str, session: InterviewSession) -> None:
+    if session.discarded:
+        return
+    interview_store.save(session_id, session)
+
+
+def _get_interview(session_id: str, request: Request) -> InterviewSession:
+    """The caller's session, or 404: unknown, expired, or someone else's.
+
+    The owner check comes before the session is touched or cached, so a
+    caller who guesses another person's id can neither keep it alive past
+    the TTL nor pull its transcript into this worker's table.
+    """
+    _sweep_interview_sessions()
+    held = _interview_sessions.get(session_id)
+    session = held
+    if session is None:
+        # Not held here: started before a restart, or on another worker.
+        session = interview_store.load(session_id)
+    elif not session.saved:
+        # Held here, but another worker may have taken turns since: a newer
+        # stored row wins, so two processes never overwrite each other.
+        fresher = interview_store.load(session_id, newer_than=session.stored_at)
+        if fresher is not None:
+            session = fresher
+    if session is None or session.owner_key != api_caller.identity_key(request):
+        # Someone else's gets the same answer as an unknown id.
+        raise HTTPException(status_code=404, detail="Setup session not found or expired.")
+    if session is not held:
+        _interview_sessions[session_id] = session
+    session.last_touched = time.monotonic()
+    _interview_sessions.move_to_end(session_id)
+    return session
+
+
+def _turn_response(session_id: str, session: InterviewSession) -> OnboardTurnResponse:
+    """Render a session's current state. Phase is driven by draft presence."""
+    if session.draft is not None:
+        d = session.draft
+        profile = d.profile.model_dump()
+        profile["website"] = profile.get("website") or session.website
+        return OnboardTurnResponse(
+            session_id=session_id,
+            phase="draft",
+            questions_asked=session.questions_asked,
+            max_questions=MAX_QUESTIONS,
+            draft=CompanyProfileResponse(**profile),
+            draft_people=[
+                OnboardPersonDraft(**p.model_dump()) for p in d.people
+            ],
+            draft_departments=[
+                OnboardDepartmentDraft(
+                    title=dep.title,
+                    mission=dep.mission,
+                    head_person_name=dep.head_person_name,
+                    authority_level=dep.authority_level.value,
+                )
+                for dep in d.departments
+            ],
+            draft_goals=[OnboardGoalDraft(**g.model_dump()) for g in d.goals],
+            confidence_notes=list(d.confidence_notes),
+            summary=d.summary,
+        )
+    question = ""
+    for turn in reversed(session.transcript):
+        if turn.role == "assistant":
+            question = turn.text
+            break
+    return OnboardTurnResponse(
+        session_id=session_id,
+        phase="question",
+        questions_asked=session.questions_asked,
+        max_questions=MAX_QUESTIONS,
+        question=question or OPENING_PROMPT,
+        question_hint=session.last_hint or None,
+        question_options=list(session.last_options),
+    )
+
+
+
+async def _advance_interview(
+    session_id: str, session: InterviewSession, *, force_draft: bool = False
+) -> OnboardTurnResponse:
+    """Run one interviewer turn and fold the result into the session."""
+    from openexecutive.onboarding.interview import (
+        InterviewError,
+        InterviewTimeout,
+        advance,
+    )
+    from openexecutive.onboarding.profile_builder import load_or_create_profile
+
+    existing = load_or_create_profile()
+    try:
+        result = await advance(
+            session.transcript,
+            existing_profile=None if existing.is_empty() else existing,
+            force_draft=force_draft,
+            questions_asked=session.questions_asked,
+        )
+    except InterviewTimeout as exc:
+        logger.warning("onboarding interview: timed out (%s)", type(exc).__name__)
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
+    except InterviewError as exc:
+        # InterviewError messages are fixed, input-free strings by contract.
+        logger.error("onboarding interview: failed (%s)", type(exc).__name__)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    if isinstance(result, CompanyDraft):
+        session.draft = result
+        session.last_hint = ""
+        session.last_options = []
+        # Record the draft as an assistant turn. Without it the transcript ends
+        # on a user turn, and the next message would make two user turns in a
+        # row — which the Messages API rejects, bricking the session.
+        session.transcript.append(
+            Turn(
+                role="assistant",
+                text=result.summary.strip()
+                or f"(drafted a profile for {result.profile.name})",
+            )
+        )
+    else:
+        # A new question supersedes any previous draft — but only now that the
+        # call has succeeded.
+        session.draft = None
+        session.transcript.append(Turn(role="assistant", text=result.question))
+        session.questions_asked += 1
+        session.last_hint = result.hint
+        session.last_options = list(result.options)
+    _persist_interview(session_id, session)
+    return _turn_response(session_id, session)
+
+
+@router.post("/onboard/interview/start", response_model=OnboardTurnResponse)
+async def start_interview(
+    request: Request,
+    description: str = Form(""),
+    website: str = Form(""),
+    files: list[UploadFile] = File(  # noqa: B008 — FastAPI multipart marker, mirrors chat.py
+        default_factory=list
+    ),
+) -> OnboardTurnResponse:
+    """Open a setup session from a free-text description, an optional
+    website and optional files.
+
+    Returns the fixed opening prompt when there is nothing to read (nothing
+    typed, no files, a site that couldn't be read) — that path costs no model
+    call and cannot fail. ``website_pages`` says which pages were read.
+    """
+    if len(description) > ONBOARD_MESSAGE_MAX_CHARS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Description is too long (limit {ONBOARD_MESSAGE_MAX_CHARS:,} characters).",
+        )
+
+    # Extract BEFORE registering a session. 400/413 from here propagate
+    # unchanged (they name a filename and a limit, never file contents), and
+    # doing it first means a rejected upload cannot leave an orphan session
+    # behind — 50 of those would evict every live session via the cap sweep.
+    extracted = await _gather_intake_attachments(files or [])
+    site_url, pages = await _read_site(website)
+    page_labels = [p.label for p in pages]
+
+    session_id = str(uuid.uuid4())
+    session = InterviewSession(owner_key=api_caller.identity_key(request), website=site_url)
+    _interview_sessions[session_id] = session
+    # Sweep AFTER inserting: the cap is an invariant on what is stored, and
+    # sweeping first would let the dict sit one over the cap until the next
+    # request touched it.
+    _sweep_interview_sessions()
+
+    opening = _opening_text(description, extracted, pages)
+
+    if not opening.strip():
+        # Nothing to work with yet — ask the opening question without a model
+        # call so an empty start is instant and free.
+        _persist_interview(session_id, session)
+        return _turn_response(session_id, session)
+
+    # rstrip only: with no description the turn starts at ATTACHED_MARKER,
+    # which an edit of the description (revise) relies on to keep the files.
+    session.transcript.append(Turn(role="user", text=opening.rstrip()))
+    try:
+        turn = await _advance_interview(session_id, session)
+        return turn.model_copy(update={"website_pages": page_labels})
+    except HTTPException:
+        # The error body carries no session_id, so the client can never resume
+        # this one — leaving it in the dict would orphan it until the TTL, and
+        # a burst of failures during a provider blip would evict live sessions.
+        _interview_sessions.pop(session_id, None)
+        raise
+
+
+@router.post("/onboard/interview/understand", response_model=OnboardUnderstandingResponse)
+async def understand_description(
+    description: str = Form(""),
+    website: str = Form(""),
+    files: list[UploadFile] = File(  # noqa: B008 — FastAPI multipart marker, as in start_interview
+        default_factory=list
+    ),
+) -> OnboardUnderstandingResponse:
+    """Read the first free-text description (plus files) once, before any session.
+
+    Reports personal-or-team, role and company where the text says so, so the
+    UI can confirm them and the interview asks only for what is missing. It
+    stores nothing; a failure here is not fatal, the UI just asks instead.
+    """
+    from openexecutive.onboarding.interview import InterviewError, InterviewTimeout
+    from openexecutive.onboarding.understand import understand
+
+    if len(description) > ONBOARD_MESSAGE_MAX_CHARS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Description is too long (limit {ONBOARD_MESSAGE_MAX_CHARS:,} characters).",
+        )
+    extracted = await _gather_intake_attachments(files or [])
+    _, pages = await _read_site(website)
+    text = _opening_text(description, extracted, pages)
+    if not text.strip():
+        raise HTTPException(status_code=422, detail="Tell me a little about your work first.")
+    try:
+        result = await understand(text.strip())
+    except InterviewTimeout as exc:
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
+    except InterviewError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return OnboardUnderstandingResponse(**result.model_dump())
+
+
+@router.post("/onboard/interview/message", response_model=OnboardTurnResponse)
+async def interview_message(body: OnboardMessageRequest, request: Request) -> OnboardTurnResponse:
+    # Bounded here, not with Field(max_length=...) — FastAPI's 422 body echoes
+    # the rejected input, and this message may carry financials.
+    if len(body.message) > ONBOARD_MESSAGE_MAX_CHARS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Message is too long (limit {ONBOARD_MESSAGE_MAX_CHARS:,} characters).",
+        )
+    session = _get_interview(body.session_id, request)
+    if session.saved:
+        raise HTTPException(status_code=409, detail="This setup session was already saved.")
+    if not body.message.strip():
+        raise HTTPException(status_code=422, detail="Message is empty.")
+
+    # Bound the conversation in memory as well as in questions. The budget in
+    # interview.py only forces a draft; without this a client could grow the
+    # transcript (and the payload re-sent every turn) without limit.
+    if transcript_chars(session.transcript) + len(body.message) > MAX_TRANSCRIPT_CHARS:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "This setup conversation has gotten long. Draft the profile "
+                "now and edit it directly."
+            ),
+        )
+
+    session.transcript.append(Turn(role="user", text=body.message.strip()))
+    # NOTE: the stale draft is cleared by _advance_interview only once the new
+    # turn succeeds. Clearing it up front would mean a 502 destroyed the draft
+    # the user was in the middle of reviewing.
+    return await _advance_interview(body.session_id, session)
+
+
+@router.post("/onboard/interview/revise", response_model=OnboardTurnResponse)
+async def interview_revise(body: OnboardReviseRequest, request: Request) -> OnboardTurnResponse:
+    """Change an earlier answer and carry on from there.
+
+    Everything after that answer is dropped (the questions it led to and any
+    draft), the question count goes back to what had been asked before it,
+    and the interviewer runs again: a new question, or a fresh draft when it
+    already has enough. Editing the description keeps the files attached to
+    it. Nothing changes unless the new turn succeeds, so a 502 leaves the
+    interview as it was.
+    """
+    if len(body.message) > ONBOARD_MESSAGE_MAX_CHARS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Message is too long (limit {ONBOARD_MESSAGE_MAX_CHARS:,} characters).",
+        )
+    session = _get_interview(body.session_id, request)
+    if session.saved:
+        raise HTTPException(status_code=409, detail="This setup session was already saved.")
+    if not body.message.strip():
+        raise HTTPException(status_code=422, detail="Message is empty.")
+    answers = [i for i, t in enumerate(session.transcript) if t.role == "user"]
+    if not 0 <= body.answer < len(answers):
+        raise HTTPException(status_code=404, detail="That answer is not in this setup session.")
+
+    at = answers[body.answer]
+    text = body.message.strip()
+    if body.answer == 0:
+        # The opening turn carries the attached files' text after the
+        # description; an edit replaces only what was typed.
+        old = session.transcript[at].text
+        cut = old.find(ATTACHED_MARKER)
+        if cut != -1:
+            text += old[cut:]
+    kept = session.transcript[:at]
+    if transcript_chars(kept) + len(text) > MAX_TRANSCRIPT_CHARS:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "This setup conversation has gotten long. Draft the profile "
+                "now and edit it directly."
+            ),
+        )
+
+    # The new turn runs on a copy and replaces the session only once it
+    # succeeds, so a failure leaves it untouched. On success the edit wins
+    # over a turn another tab took meanwhile: editing an answer drops
+    # everything after it anyway.
+    trial = dataclasses.replace(
+        session,
+        transcript=[*kept, Turn(role="user", text=text)],
+        # Every assistant turn before the edit was a question, or a draft the
+        # person answered past; counting both errs towards fewer questions.
+        questions_asked=sum(1 for t in kept if t.role == "assistant"),
+        draft=None,
+        last_hint="",
+        last_options=[],
+    )
+    response = await _advance_interview(body.session_id, trial)
+    session.transcript = trial.transcript
+    session.questions_asked = trial.questions_asked
+    session.draft = trial.draft
+    session.last_hint = trial.last_hint
+    session.last_options = trial.last_options
+    session.stored_at = trial.stored_at
+    if session.discarded:
+        # Start over landed while this turn was running: don't keep it.
+        interview_store.delete(body.session_id)
+    return response
+
+
+@router.delete("/onboard/interview/{session_id}", status_code=204)
+async def discard_interview(session_id: str, request: Request) -> Response:
+    """Start over: forget this setup session here and in the store at once.
+
+    Only its owner can (someone else's gets the same 404 as an unknown id).
+    """
+    _get_interview(session_id, request).discarded = True
+    _interview_sessions.pop(session_id, None)
+    interview_store.delete(session_id)
+    return Response(status_code=204)
+
+
+@router.post("/onboard/interview/draft", response_model=OnboardTurnResponse)
+async def interview_draft(body: OnboardSessionRequest, request: Request) -> OnboardTurnResponse:
+    """Force a draft now, however much is still unknown."""
+    session = _get_interview(body.session_id, request)
+    if session.saved:
+        raise HTTPException(status_code=409, detail="This setup session was already saved.")
+    if not session.transcript:
+        raise HTTPException(
+            status_code=422,
+            detail="Tell me a little about your company first.",
+        )
+    return await _advance_interview(body.session_id, session, force_draft=True)
+
+
+@router.get("/onboard/interview/{session_id}", response_model=OnboardSessionResponse)
+async def get_interview(session_id: str, request: Request) -> OnboardSessionResponse:
+    """Resume after a page refresh: the transcript plus any existing draft."""
+    session = _get_interview(session_id, request)
+    base = _turn_response(session_id, session)
+    return OnboardSessionResponse(
+        **base.model_dump(),
+        turns=[
+            OnboardTranscriptTurn(role=t.role, text=t.text) for t in session.transcript
+        ],
+        saved=session.saved,
+    )
+
+
+@router.post("/onboard/interview/commit", response_model=CompanyProfileResponse)
+async def commit_interview(body: OnboardCommitRequest, request: Request) -> CompanyProfileResponse:
+    """Save the reviewed draft. The single write in this whole flow.
+
+    Ordering matters and is load-bearing — see the section header above.
+    Validation and the empty-name check run before ``save_to_yaml``, so any
+    rejection leaves the session untouched and the user can edit and retry.
+    """
+    from openexecutive.onboarding.commit import (
+        OwnerEmailError,
+        adopt_owner_row,
+        check_owner_email,
+        derive_org_structure,
+        link_owner_email,
+        owner_change_blocked,
+        owner_email_blocked,
+        reconcile_onboarding_departments,
+        save_onboarding_goals,
+        save_onboarding_people,
+    )
+    from openexecutive.onboarding.interview import DepartmentDraft, GoalDraft, PersonDraft
+
+    session = _get_interview(body.session_id, request)
+    if session.saved:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This setup session was already saved. Edit your company "
+                "profile on the Company Profile page."
+            ),
+        )
+    # A service (signed callers on, no assertion) names no one. On a first
+    # setup the owner checks below let anyone choose the owner and their
+    # sign-in email, which must be someone signed in.
+    if api_caller.caller(request).kind == "service":
+        raise HTTPException(status_code=403, detail="Sign in to save setup.")
+
+    settings = get_settings()
+
+    # 1. Validate — nothing is written yet.
+    # model_dump already converted every nested model to a plain dict, so this
+    # is the merge input as-is.
+    update_data = body.profile.model_dump(exclude_unset=True)
+    try:
+        people = [PersonDraft(**p.model_dump()) for p in body.people]
+        departments = [DepartmentDraft(**d.model_dump()) for d in body.departments]
+        goals = [GoalDraft(**g.model_dump()) for g in body.goals]
+        merged = CompanyProfile().model_copy(update=update_data)
+        profile = CompanyProfile.model_validate(merged.model_dump())
+    except Exception as exc:
+        # Type name only: a ValidationError's str() embeds the offending input.
+        logger.error(
+            "onboarding commit: profile did not validate (%s)", type(exc).__name__
+        )
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "That profile could not be saved. Check that numbers are "
+                "numbers and no field was left in a bad state, then try again."
+            ),
+        ) from exc
+
+    # The body is client-supplied and need not match the drafted session, so the
+    # referential invariants have to be re-checked HERE, not only inside
+    # advance(). Without this a caller can save a company with no principal at
+    # all — find_principal_person() then returns None and caller resolution,
+    # alert routing and the scheduler's brief have nobody to target.
+    errors = validate_draft(
+        CompanyDraft(profile=profile, people=people, departments=departments, goals=goals)
+    )
+    if errors:
+        # .safe, never .detail — the detailed rendering quotes the rejected
+        # value (a name, a head reference), which is client text sitting next
+        # to the company's financials. Only the repair turn sees .detail.
+        logger.info("onboarding commit: rejected draft (%d error(s))", len(errors))
+        raise HTTPException(status_code=422, detail=errors[0].safe)
+
+    # validate_draft guarantees exactly one principal. Their sign-in email is
+    # checked now, while a rejection still leaves the draft editable.
+    principal_name = next(p.full_name.strip() for p in people if p.is_principal)
+    # Setup demotes the current owner when it drafts someone else, so only the
+    # owner may do that (owner_change_blocked explains the rule).
+    from openexecutive.api.routes.chat import _resolve_caller_person_id
+
+    caller_person_id = _resolve_caller_person_id(request)
+    try:
+        blocked = owner_change_blocked(principal_name, caller_person_id)
+    except (OSError, sqlite3.Error) as exc:
+        logger.warning("onboarding commit: owner lookup failed (%s)", type(exc).__name__)
+        raise HTTPException(
+            status_code=503, detail="Could not check who owns this workspace. Try again."
+        ) from exc
+    if blocked:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Only the current owner can make someone else the owner. Mark the current "
+                'owner as "This is me", or ask them to run setup.'
+            ),
+        )
+    caller_email = api_caller.caller_email(request)
+    try:
+        owner_email = check_owner_email(
+            body.owner_email, principal_name, caller_email=caller_email
+        )
+    except OwnerEmailError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    # Someone who isn't the owner may fill in the owner's missing email only
+    # with the address they signed in with (owner_email_blocked explains why).
+    try:
+        email_blocked = owner_email_blocked(owner_email, caller_person_id, caller_email)
+    except (OSError, sqlite3.Error) as exc:
+        logger.warning("onboarding commit: owner lookup failed (%s)", type(exc).__name__)
+        raise HTTPException(
+            status_code=503, detail="Could not check who owns this workspace. Try again."
+        ) from exc
+    if email_blocked:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Only the owner can put another address on the owner's entry. If you "
+                "are the owner, use the email you signed in with; if not, leave it blank."
+            ),
+        )
+
+    profile = derive_org_structure(profile, people, departments, goals)
+
+    # 2. is_empty() keys off the name — a nameless profile is invisible to
+    #    every consumer, including the health check that gates onboarding.
+    if not profile.name.strip():
+        raise HTTPException(status_code=422, detail="Your company needs a name.")
+
+    # 3. The write. Atomic (write-then-rename, O_EXCL, fsync) inside.
+    try:
+        profile.save_to_yaml(settings.company_profile_path)
+    except Exception as exc:
+        logger.error("onboarding commit: save failed (%s)", type(exc).__name__)
+        raise HTTPException(
+            status_code=422,
+            detail="Could not save the company profile. Try again.",
+        ) from exc
+
+    # 4. Past this point the profile exists; nothing below may fail the request.
+    session.saved = True
+    # The stored copy goes now: the transcript holds the financials, and the
+    # profile is on disk. This process still answers a repeat save with 409.
+    interview_store.delete(body.session_id)
+
+    # 5-6. Best-effort seeding. Departments are reconciled additively — see
+    #      onboarding/commit.py for why this must not mirror the fixture loader.
+    # The owner's seeded entry takes the drafted name first, so the upsert
+    # below updates it instead of adding a namesake (adopt_owner_row).
+    adopt_owner_row(owner_email, principal_name, caller_email)
+    person_ids = save_onboarding_people(people)
+    principal_id = person_ids.get(principal_name)
+    if owner_email and principal_id is not None:
+        link_owner_email(principal_id, owner_email)
+    reconcile_onboarding_departments(departments, person_ids)
+    save_onboarding_goals(goals, person_ids, principal_id)
+
+    # 7. Same post-onboarding research fire the wizard does, same dedup set.
+    if body.session_id not in _onboarding_research_fired:
+        _onboarding_research_fired.add(body.session_id)
+        task = asyncio.create_task(_fire_post_onboarding_research(body.session_id))
+        _background_research_tasks.add(task)
+        task.add_done_callback(_background_research_tasks.discard)
+
+    return CompanyProfileResponse(**profile.model_dump())

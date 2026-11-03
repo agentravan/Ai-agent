@@ -1,0 +1,1035 @@
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import hmac
+import logging
+import os
+import re
+import sys
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING, Any
+
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+from openexecutive import mcp_server
+from openexecutive.api import caller as api_caller
+from openexecutive.api.routes import (
+    agents,
+    alerts,
+    architecture,
+    artifacts,
+    audit,
+    chat,
+    chat_directory,
+    clients,
+    company_profile,
+    contacts,
+    decisions,
+    delegation,
+    departments,
+    documents,
+    episodic,
+    evals,
+    executive,
+    fixtures,
+    guide,
+    health,
+    history,
+    knowledge,
+    may_do,
+    notifications,
+    onboarding,
+    people,
+    personas,
+    python_jobs,
+    reflection,
+    review,
+    saved_tools,
+    scheduled,
+    sessions,
+    setup_status,
+    skills,
+    take_the_lead,
+    today,
+    version,
+    watchlist,
+    workflow_designer,
+    workflows,
+    workspace,
+)
+from openexecutive.api.routes import (
+    auth as auth_route,
+)
+from openexecutive.integrations.google_chat import router as google_chat_router
+from openexecutive.integrations.slack_events import router as slack_events_router
+from openexecutive.integrations.telegram_bot import router as telegram_router
+from openexecutive.observability import configure_tracing
+from openexecutive.utils.deployment import is_local_login, is_public_deployment
+
+if TYPE_CHECKING:
+    from openexecutive.config import Settings
+
+
+class _OELogFormatter(logging.Formatter):
+    """Compact, scannable formatter for openexecutive logs.
+
+    - Strips the redundant `openexecutive.` prefix from logger names.
+    - Right-pads the module column so the message gutter aligns.
+    - ANSI-colors level + module when stdout is a TTY; plain otherwise.
+    - Honours `extra={"turn_break": True}` / `extra={"iter_marker": True}`
+      to draw visual separators between chat turns and iteration loops.
+    """
+
+    _LEVEL_COLORS = {
+        "DEBUG": "\033[2;37m",   # dim gray
+        "INFO": "\033[36m",       # cyan
+        "WARNING": "\033[33m",    # yellow
+        "ERROR": "\033[31m",      # red
+        "CRITICAL": "\033[1;31m", # bold red
+    }
+    _DIM = "\033[2m"
+    _RESET = "\033[0m"
+    _MODULE_WIDTH = 28
+
+    def __init__(self, *, color: bool) -> None:
+        super().__init__(datefmt="%H:%M:%S")
+        self._color = color
+
+    def format(self, record: logging.LogRecord) -> str:
+        ts = self.formatTime(record, self.datefmt)
+        name = record.name
+        if name.startswith("openexecutive."):
+            name = name[len("openexecutive."):]
+        elif name == "openexecutive":
+            name = "app"
+        if len(name) > self._MODULE_WIDTH:
+            name_col = name[: self._MODULE_WIDTH - 1] + "…"
+        else:
+            name_col = name.ljust(self._MODULE_WIDTH)
+        level = record.levelname.ljust(7)
+        msg = record.getMessage()
+        if record.exc_info:
+            msg = msg + "\n" + self.formatException(record.exc_info)
+
+        if self._color:
+            lvl_c = self._LEVEL_COLORS.get(record.levelname, "")
+            line = (
+                f"{self._DIM}{ts}{self._RESET}  "
+                f"{lvl_c}{level}{self._RESET}  "
+                f"{self._DIM}{name_col}{self._RESET} │ {msg}"
+            )
+        else:
+            line = f"{ts}  {level}  {name_col} │ {msg}"
+
+        if getattr(record, "turn_break", False):
+            rule = "─" * 60
+            sep = f"{self._DIM}{rule}{self._RESET}" if self._color else rule
+            return f"\n{sep}\n{line}"
+        if getattr(record, "iter_marker", False):
+            return f"\n{line}"
+        return line
+
+
+def _configure_logging() -> None:
+    """Send `openexecutive.*` logs to stdout at INFO level.
+
+    Attaches the handler directly to the `openexecutive` logger (not root)
+    with propagate=False, so uvicorn's `dictConfig` clobbering the root
+    handler list doesn't silence us.
+    """
+    level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    app_logger = logging.getLogger("openexecutive")
+    if not any(getattr(h, "_oe_configured", False) for h in app_logger.handlers):
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(_OELogFormatter(color=sys.stdout.isatty()))
+        handler._oe_configured = True  # type: ignore[attr-defined]
+        app_logger.addHandler(handler)
+    app_logger.setLevel(level)
+    app_logger.propagate = False
+    # Quiet down a few chatty libraries.
+    for noisy in ("httpx", "httpcore", "chromadb", "anthropic._base_client"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
+_configure_logging()
+
+
+# Paths that bypass the shared-secret gate. /health is hit by the platform's
+# health checker;
+# the /webhook/* routes are called by external services (Google, Telegram) and
+# carry their own verification.
+_UNAUTHENTICATED_PATHS: frozenset[str] = frozenset(
+    {"/health", "/webhook/telegram", "/webhook/google-chat", "/webhook/slack"}
+)
+
+
+# How long the MCP gateway gets to come up, per attempt. The child is
+# `uvx --from git+https://…/extensible-mcp`, which resolves and may clone that
+# repo on a cold start, so this is generous; what it must not be is unbounded.
+# `MCPGateway.start` builds `ClientSession` with no `read_timeout_seconds`, so
+# `initialize()` waits forever on a child that is alive but silent — and a
+# lifespan that never yields is a healthcheck that never passes, which is
+# #122's symptom with none of its traceback. A dead child is already fine
+# (the session's receive loop fails every pending request on close); it is the
+# silent one that needs a clock. A failed attempt is retried in the
+# background with backoff (orchestrator/gateway_boot.py), so one slow or
+# faulty start no longer costs the whole process its MCP tools.
+_MCP_START_TIMEOUT_S = 120.0
+
+
+async def _start_mcp_gateway(
+    app: FastAPI, settings: Settings
+) -> asyncio.Task[None] | None:
+    """Bring the MCP gateway up, or leave MCP off and say why.
+
+    Sets ``app.state.mcp_gateway`` — the gateway on success, ``None`` otherwise
+    — and returns the email-poller task that rides on it, or ``None``. The
+    supervisor that made the attempt stays on ``app.state.mcp_supervisor``:
+    when the first attempt fails it keeps retrying with backoff, and a later
+    success wires the gateway, the pinned-tool priming and the email poller
+    exactly as a first-time success does here; ``/health`` reports its state.
+
+    Never raises and never blocks indefinitely. The gateway spawns
+    extensible-mcp as a subprocess, and a failure there used to propagate out
+    of the lifespan and kill the container; under ``restart: unless-stopped``
+    that is a crash loop whose only outward symptom is a healthcheck that never
+    passes (#122). Booting without MCP costs the Gmail/Calendar/Drive tool
+    surface and the email poller; refusing to boot costs everything, so degrade
+    and log loudly enough to alert on. The supervisor contains the same
+    failure shapes (``except BaseException`` with real cancellation re-raised
+    first: anyio wraps a task group's failures in ``BaseExceptionGroup`` as
+    soon as one of them is a ``CancelledError``, and that group is not an
+    ``Exception``).
+    """
+    app.state.mcp_gateway = None
+    app.state.mcp_supervisor = None
+    if not settings.mcp_enabled:
+        return None
+
+    from openexecutive.config import mcp_config_file_present
+    from openexecutive.orchestrator.gateway_boot import GatewaySupervisor
+    from openexecutive.orchestrator.mcp_gateway import (
+        configured_server_names,
+        set_gateway_supervisor,
+    )
+
+    log = logging.getLogger("openexecutive")
+    config_path = settings.mcp_servers_config_path
+    servers = configured_server_names(config_path)
+    # With MCP_ENABLED unset it is the config file's presence that turned MCP
+    # on (config._resolve_mcp), so an operator can arrive here without having
+    # asked for MCP. Naming which it was is the fact the original traceback
+    # never carried — and the remedy has to track it, or we tell someone who
+    # set MCP_ENABLED=true to unset the file that enabled MCP.
+    auto = settings.mcp_auto_enabled
+    why = (
+        "auto-enabled by the presence of the config file"
+        if auto
+        else "MCP_ENABLED was set explicitly"
+    )
+
+    if not servers:
+        log.warning(
+            "MCP is on (%s) but %s %s; starting without MCP tools. %s.",
+            why,
+            config_path,
+            "defines no servers under 'mcpServers'"
+            if mcp_config_file_present(config_path)
+            else "is not a readable file",
+            "Add a server to that file, or set MCP_ENABLED=false so its "
+            "presence stops enabling MCP"
+            if auto
+            else "Point MCP_SERVERS_CONFIG_PATH at a config that defines a "
+            "server, or set MCP_ENABLED=false",
+        )
+        return None
+
+    supervisor = GatewaySupervisor(
+        config_path=config_path,
+        servers=servers,
+        app_state=app.state,
+        start_timeout_s=_MCP_START_TIMEOUT_S,
+        why=why,
+    )
+    app.state.mcp_supervisor = supervisor
+    set_gateway_supervisor(supervisor)
+    if not await supervisor.start():
+        return None
+
+    # Say which mail/calendar backends the fixed code paths will use, and warn
+    # (never fail) when a chosen backend's server is not in the config.
+    from openexecutive.integrations.workspace.registry import log_provider_status
+    log_provider_status(settings, config_path)
+    return supervisor.poller_task
+
+
+# How long the lifespan waits for the Slack socket to cancel its pending
+# connect and close cleanly before abandoning it. Named so tests can shrink it.
+SLACK_SHUTDOWN_TIMEOUT_S = 10.0
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    from openexecutive.alerts.store import initialize_db as initialize_alerts_db
+    from openexecutive.audit import AuditLogger, set_audit_logger
+    from openexecutive.config import get_settings
+    from openexecutive.knowledge.loader import (
+        migrate_attachments_out_of_company_docs,
+        reconcile_company_docs,
+        seed_builtin_knowledge,
+        seed_failures,
+    )
+    from openexecutive.knowledge.skills_index import seed_builtin_skills
+    from openexecutive.knowledge.store import ChromaDBStore
+    from openexecutive.memory.episodic import initialize_db
+
+    # Re-assert logging config AFTER uvicorn's own dictConfig, then announce.
+    _configure_logging()
+    logging.getLogger("openexecutive").info(
+        "openexecutive API starting (LOG_LEVEL=%s) — chat turn logs will appear below",
+        os.environ.get("LOG_LEVEL", "INFO").upper(),
+    )
+
+    settings = get_settings()
+
+    # Installed extensions (orchestrator/extensions.py) load here, so the
+    # first chat turn or Documents read doesn't import them on the loop.
+    from openexecutive.orchestrator import extensions
+
+    extensions.load()
+
+    store = ChromaDBStore(persist_directory=settings.vector_store_path)
+    app.state.store = store
+    # Hand the warm store to the MCP server's resource/tool handlers, which
+    # have no FastAPI Request to reach app.state through.
+    mcp_server.set_store(store)
+
+    await seed_builtin_knowledge(store=store)
+    await seed_builtin_skills(store=store)
+    await seed_failures(store=store)
+
+    # Two boot-time repairs of company_docs, in one task, in order.
+    #
+    # First, move out any attachment chunks: they were written into
+    # company_docs under a domain outside the specialist set, which did NOT
+    # keep them out of retrieval (an unfiltered query builds no `where`
+    # clause and matches every domain). They belong in the isolated
+    # collection nothing queries. It runs first so that a row it is about to
+    # move cannot also be re-indexed by the reconcile in the same pass.
+    #
+    # Then repair rows left by the old upload path, which indexed documents
+    # under their random staging filename: those chunks match no DELETE and
+    # are displaced by no re-upload, so nothing else can reach them. Both
+    # converge on a stable store, so it is safe to run every boot.
+    #
+    # Deliberately NOT awaited here. `ingest_file` does synchronous embedding
+    # work, and the boot that matters most — the first one after this deploy —
+    # is exactly the one where every pre-fix document needs re-embedding at
+    # once. Awaiting that would stall the lifespan before the app serves
+    # anything, failing the container healthcheck and crash-looping on
+    # precisely the installs with the most to repair. A degraded search index
+    # for a few seconds after boot is the cheaper failure.
+    #
+    # Strong ref, same reason as `_thread_rename_tasks` in discord_bot: a bare
+    # create_task is only weakly held and can be GC'd mid-flight.
+    async def _reconcile_company_docs() -> None:
+        try:
+            # On a thread, not merely off the lifespan: every step of the
+            # migration blocks (metadata scan, text fetch, embedding pass), so
+            # scheduling it on this loop would defer the stall rather than
+            # avoid it, and `/health` would go unanswered for the whole repair.
+            moved = await asyncio.to_thread(
+                migrate_attachments_out_of_company_docs, store
+            )
+            if moved:
+                logging.getLogger("openexecutive").info(
+                    "company_docs reconcile: moved %d attachment chunk(s) out of the "
+                    "company collection",
+                    moved,
+                )
+        except Exception:
+            logging.getLogger("openexecutive").exception("attachment migration failed")
+
+        try:
+            swept, indexed = await reconcile_company_docs(
+                store, settings.company_profile_path.parent / "docs"
+            )
+            if swept or indexed:
+                logging.getLogger("openexecutive").info(
+                    "company_docs reconcile: dropped %d orphaned chunk(s), indexed %d document(s)",
+                    swept,
+                    indexed,
+                )
+        except Exception:
+            logging.getLogger("openexecutive").exception("company_docs reconcile failed")
+
+    _reconcile_task = asyncio.create_task(_reconcile_company_docs())
+    app.state.reconcile_task = _reconcile_task
+
+    initialize_db()
+    initialize_alerts_db()
+    # A card approval still running was cut off by the restart: mark it
+    # failed so the card can be approved again (alerts/approvals.py).
+    from openexecutive.alerts import approvals as alert_approvals
+
+    alert_approvals.fail_stale_running()
+
+    # Solo / team mode and the user's time zone (memory.workspace_settings).
+    # Right after the episodic DB so every bootstrap below reads it.
+    from openexecutive.memory.workspace_settings import (
+        get_workspace,
+        init_workspace_settings_db,
+    )
+    init_workspace_settings_db()
+
+    # User-generated company fixtures (DB-backed; persists on the data volume).
+    from openexecutive.fixtures.store import initialize_db as initialize_fixtures_db
+    initialize_fixtures_db()
+
+    from openexecutive.agents.overrides import initialize_overrides_db
+    initialize_overrides_db()
+
+    # People: init BEFORE departments so the people table exists when
+    # departments code references person IDs (FK ordering).
+    from openexecutive.people.store import initialize_db as initialize_people_db
+    initialize_people_db()
+    # Telegram chats the bot has seen, for the People and department pickers.
+    from openexecutive.integrations.telegram_chats import (
+        initialize_db as initialize_telegram_chats_db,
+    )
+    initialize_telegram_chats_db()
+    # Replays of held roster-request messages run on this loop, whichever
+    # thread resolves the request (integrations.roster_intake).
+    from openexecutive.integrations.roster_intake import bind_loop
+    bind_loop()
+
+    # One-shot cleanup of reminders the removed talent / staff-onboarding
+    # workflows left pending on the principal's DM channel (see the function's
+    # docstring for the removal schedule). Runs after `initialize_db()` so the
+    # `app_migrations` table exists.
+    from openexecutive.memory.episodic import cancel_orphaned_talent_reminders
+    try:
+        _swept = cancel_orphaned_talent_reminders()
+    except Exception:
+        # Best-effort data cleanup — a locked DB must not block boot.
+        logging.getLogger("openexecutive").exception("orphaned-reminder sweep failed")
+    else:
+        if _swept:
+            logging.getLogger("openexecutive").info(
+                "cancelled %d orphaned talent/onboarding reminder(s) on startup", _swept
+            )
+
+    # One-shot: cut each chat app's saved stream into conversations by the
+    # same quiet-gap rule new messages follow (memory.conversations).
+    from openexecutive.memory.conversations import split_existing_streams
+    try:
+        await asyncio.to_thread(split_existing_streams)
+    except Exception:
+        logging.getLogger("openexecutive").exception("chat-app conversation split failed")
+
+    # Departments: persistent state layer over the specialist agents. Init
+    # AFTER episodic_db so the additive ALTERs (department column on decisions,
+    # initiatives, advice_given, scheduled_actions) have already run by the
+    # time anything else writes to those tables.
+    # No departments are created here: a new install starts with none, and
+    # setup creates only the ones the company has.
+    from openexecutive.departments.store import (
+        initialize_db as initialize_departments_db,
+    )
+    initialize_departments_db()
+
+    # Solo installs have no team to be incomplete: the check only warns
+    # about departments with no head, which is every department there.
+    if get_workspace().mode != "solo":
+        from openexecutive.departments.completeness import check_org_completeness
+        _org_warnings = check_org_completeness()
+        for _w in _org_warnings:
+            logging.getLogger("openexecutive").warning("org-completeness: %s", _w)
+
+    from openexecutive.departments.cadence import (
+        bootstrap_cadences,
+        cancel_orphaned_cadences,
+    )
+    # Sweep first: cancel cadence actions left behind by deleted departments
+    # so they stop firing check-in alerts, then enqueue for live departments.
+    cancel_orphaned_cadences()
+    bootstrap_cadences()
+
+    if settings.nudge_scan_enabled:
+        from openexecutive.scheduler.nudge_engine import bootstrap_nudge_scan
+        bootstrap_nudge_scan()
+
+    # External-condition monitor — init the watchlist / external_signals
+    # tables, then seed the heartbeat row so the scheduler picks it up
+    # on its next tick. Same shape as nudge_scan above.
+    from openexecutive.monitoring.store import (
+        initialize_db as initialize_monitoring_db,
+    )
+    initialize_monitoring_db()
+    if settings.external_monitor_enabled:
+        from openexecutive.monitoring.pipeline import (
+            bootstrap_external_monitor_scan,
+        )
+        bootstrap_external_monitor_scan()
+
+    # Watchlist research cron — periodic re-run gated by a state-hash
+    # check so quiet days cost nothing. Mirrors the external_monitor
+    # heartbeat above.
+    if settings.watchlist_research_enabled:
+        from openexecutive.monitoring.research.scheduler import (
+            bootstrap_watchlist_research_scan,
+        )
+        bootstrap_watchlist_research_scan()
+
+    if settings.notion_sync_enabled:
+        from openexecutive.knowledge.notion_sync import bootstrap_notion_sync_scan
+        bootstrap_notion_sync_scan()
+    if settings.drive_sync_enabled:
+        from openexecutive.knowledge.drive_sync import bootstrap_drive_sync_scan
+
+        bootstrap_drive_sync_scan()
+    if settings.onedrive_sync_enabled:
+        from openexecutive.knowledge.onedrive_sync import bootstrap_onedrive_sync_scan
+
+        bootstrap_onedrive_sync_scan()
+    if settings.confluence_sync_enabled:
+        from openexecutive.knowledge.confluence_sync import bootstrap_confluence_sync_scan
+
+        bootstrap_confluence_sync_scan()
+
+    audit_logger = AuditLogger()
+    app.state.audit = audit_logger
+    set_audit_logger(audit_logger)
+
+    # Honcho per-fixture workspace reconcile: if a previous process
+    # crashed mid-demo, the active-workspace override may persist past
+    # the fixture-active sentinel and route Honcho traffic to a stale
+    # demo workspace forever. Clear it on boot.
+    from openexecutive.cli.fixture_loader import reconcile_honcho_workspace_on_startup
+    reconcile_honcho_workspace_on_startup(settings)
+
+    from openexecutive.knowledge.external_sources import load_manifest
+    from openexecutive.knowledge.review_store import ReviewStore
+
+    # Pass the path the readers resolve (`api/routes/review._store` and
+    # `retriever._default_review_store` both use `memory.episodic.DB_PATH`).
+    # `review_store.DB_PATH` is bound at import, so a bare call could write the
+    # backfill marker to a different file than the app reads.
+    from openexecutive.memory.episodic import DB_PATH as REVIEW_DB_PATH
+
+    ReviewStore.initialize_db(REVIEW_DB_PATH)
+    ReviewStore.sync_builtin_registrations(REVIEW_DB_PATH)
+
+    # Register any OER sources that were already ingested before this PR deployed.
+    ingested_external = [
+        {"id": src.id, "domains": src.domains}
+        for src in load_manifest()
+        if src.cache_dir.exists() and any(src.cache_dir.iterdir())
+    ]
+    if ingested_external:
+        ReviewStore.sync_external_registrations(ingested_external, REVIEW_DB_PATH)
+
+    # One-shot legacy migration. Must run AFTER both syncs: it only promotes
+    # rows they have flagged as shipped, so an older install's phantom
+    # "81 items need review" backlog clears without touching a user's own
+    # uploads that are genuinely awaiting a first review.
+    ReviewStore.backfill_trusted_defaults(REVIEW_DB_PATH)
+
+    from openexecutive.evals.persistence import (
+        initialize_eval_runs_db,
+        initialize_user_scenarios_db,
+    )
+    from openexecutive.workflows.dynamic_store import initialize_dynamic_workflows_db
+    from openexecutive.workflows.persistence import initialize_runs_db
+
+    initialize_runs_db()
+    initialize_dynamic_workflows_db()
+    from openexecutive.scheduler.pause import initialize_pause_db, is_paused
+
+    initialize_pause_db()
+    if is_paused():
+        logging.getLogger("openexecutive").warning(
+            "Executive is PAUSED — scheduler, email poller and workflow "
+            "resumer are holding all autonomous work until resumed"
+        )
+    initialize_eval_runs_db()
+    initialize_user_scenarios_db()
+
+    email_poller_task: asyncio.Task[None] | None = None
+    scheduler_task: asyncio.Task[None] | None = None
+    resumer_task: asyncio.Task[None] | None = None
+    catalog_refresh_task: asyncio.Task[None] | None = None
+
+    # Live OpenRouter model catalog for the Council dropdown. Awaited so the
+    # first /agents/models call already sees it; the fetch carries its own
+    # total deadline (OPENROUTER_CATALOG_TIMEOUT_S, default 10s) and body cap,
+    # and a failure just leaves the hardcoded fallback in place — startup
+    # can be delayed by at most that timeout, never blocked.
+    if settings.openrouter_enabled and settings.openrouter_catalog_enabled:
+        from openexecutive.providers.openrouter_catalog import (
+            refresh_openrouter_catalog,
+            run_catalog_refresher,
+        )
+
+        await refresh_openrouter_catalog(settings)
+        catalog_refresh_task = asyncio.create_task(run_catalog_refresher(settings))
+    discord_bot: Any = None
+    discord_bot_task: asyncio.Task[None] | None = None
+    slack_handler: Any = None
+    slack_connect_task: asyncio.Task[None] | None = None
+    # Read by the Setup status page (api/setup_checks.py) to tell a
+    # connected bot from one that is still trying or has given up.
+    app.state.discord_bot = None
+    app.state.discord_bot_task = None
+    app.state.slack_handler = None
+
+    email_poller_task = await _start_mcp_gateway(app, settings)
+
+    # Mail read from anywhere but the Executive's own mailbox: whatever a
+    # deployment registered (integrations.mail_sources). None by default.
+    from openexecutive.integrations.mail_sources import start_mail_sources
+
+    mail_source_tasks = start_mail_sources()
+
+    if settings.scheduler_enabled:
+        from openexecutive.scheduler import run_scheduler
+
+        scheduler_task = asyncio.create_task(
+            run_scheduler(
+                gateway=getattr(app.state, "mcp_gateway", None),
+                poll_interval_seconds=settings.scheduler_poll_interval_seconds,
+            )
+        )
+
+    # Start the WaitForHuman resumer alongside the scheduler (same single-worker
+    # constraint — do not run in more than one process against the same DB).
+    from openexecutive.workflows.resumer import run_resumer
+    resumer_task = asyncio.create_task(run_resumer())
+
+    # Discord gateway bot. Embedded in the lifespan (rather than a sibling
+    # service) because the bot needs direct access to the same SQLite + ChromaDB
+    # under /data, and that volume attaches to a single instance. Same pattern as
+    # email_poller above. Skipped when no token is configured.
+    if settings.discord_bot_token:
+        _discord_log = logging.getLogger("openexecutive")
+        try:
+            from openexecutive.integrations.discord_bot import create_discord_bot
+        except ImportError:
+            _discord_log.exception(
+                "Discord bot enabled but discord.py is not installed; skipping bot"
+            )
+        else:
+            try:
+                discord_bot = create_discord_bot()
+                discord_bot_task = asyncio.create_task(
+                    discord_bot.start(settings.discord_bot_token)
+                )
+
+                # Surface bot crashes (invalid token, gateway 4004, network)
+                # immediately instead of waiting for shutdown to discover them.
+                def _on_discord_done(task: asyncio.Task[None]) -> None:
+                    if task.cancelled():
+                        return
+                    exc = task.exception()
+                    if exc is not None:
+                        _discord_log.error(
+                            "Discord bot exited unexpectedly", exc_info=exc
+                        )
+
+                discord_bot_task.add_done_callback(_on_discord_done)
+                app.state.discord_bot = discord_bot
+                app.state.discord_bot_task = discord_bot_task
+            except Exception:
+                _discord_log.exception(
+                    "Failed to start Discord bot; continuing without it"
+                )
+                discord_bot = None
+                discord_bot_task = None
+
+    # Slack Socket Mode listener. Embedded for the same reason as Discord
+    # above: the bot reads the same SQLite + ChromaDB under /data, and that
+    # volume attaches to a single instance. Before this, `make dev` started
+    # only uvicorn + the UI, so Slack silently never listened unless someone
+    # ran `python -m openexecutive.integrations.slack_bot` by hand (#131).
+    #
+    # Needs the bot token (it authenticates the Web API calls) and a way to
+    # hear Slack: the app-level token opens the Socket Mode connection, or the
+    # signing secret lets Slack post events to /webhook/slack instead.
+    if settings.slack_bot_token and (settings.slack_app_token or settings.slack_signing_secret):
+        _slack_log = logging.getLogger("openexecutive")
+        try:
+            # Imported inside the try, not above it: slack_bolt is itself
+            # imported lazily inside create_slack_app, so a missing dependency
+            # surfaces from the await rather than from this line — but keeping
+            # the import here means a future third-party import added to
+            # slack_bot.py degrades to "continue without Slack" instead of
+            # failing the whole boot.
+            from openexecutive.integrations.slack_bot import create_slack_app
+
+            _, slack_handler = await create_slack_app()
+
+            # connect_async() does NOT fail fast: on a bad app token or an
+            # unreachable Slack it retries internally and never returns, so
+            # awaiting it here would hang boot forever. Run it as a
+            # background task, like the Discord bot above. Unlike Discord's
+            # callback this one also logs on success: "listener connected"
+            # is the operator's confirmation that `make dev` really did
+            # bring Slack up, which is the whole point of #131.
+            slack_connect_task = asyncio.create_task(
+                slack_handler.connect_async()
+            )
+
+            def _on_slack_connect_done(task: asyncio.Task[None]) -> None:
+                if task.cancelled():
+                    return
+                exc = task.exception()
+                if exc is not None:
+                    _slack_log.error(
+                        "Slack socket mode connect failed", exc_info=exc
+                    )
+                elif getattr(slack_handler, "mode", None) == "http":
+                    _slack_log.info("Slack events accepted at /webhook/slack")
+                else:
+                    _slack_log.info("Slack socket mode listener connected")
+
+            slack_connect_task.add_done_callback(_on_slack_connect_done)
+            app.state.slack_handler = slack_handler
+        except Exception:
+            # Covers a missing slack_bolt, a malformed token, and any
+            # failure building the app. Nothing to release here: the
+            # handler is only bound by the tuple unpack above, so it is
+            # still None on this path. A connect_async() that fails later
+            # lands in the task and is released by the shutdown block.
+            _slack_log.exception(
+                "Failed to start Slack bot; continuing without it"
+            )
+
+    # Run the MCP Streamable-HTTP session manager for the life of the app.
+    # Mounting the sub-app does NOT run its lifespan, so without this every
+    # /mcp request 500s. The session manager was created when create_app()
+    # called mcp_server.mount() → streamable_http_app(). The run-once guard
+    # tolerates repeated create_app() lifespans in the test suite (the manager
+    # can only be run once per instance).
+    async with mcp_server.run_session_manager():
+        yield
+
+    # Shut Discord down FIRST so the gateway stops accepting new events before
+    # we tear down email_poller/scheduler/resumer that handlers might call into.
+    # Bounded timeout: discord.py's close handshake can stall during a reconnect,
+    # and a hung shutdown blocks the FastAPI lifespan and risks SIGKILL.
+    if discord_bot is not None or discord_bot_task is not None:
+        async def _shutdown_discord() -> None:
+            if discord_bot is not None:
+                with contextlib.suppress(Exception):
+                    await discord_bot.close()
+            if discord_bot_task is not None:
+                with contextlib.suppress(
+                    asyncio.CancelledError, Exception
+                ):
+                    await discord_bot_task
+
+        try:
+            await asyncio.wait_for(_shutdown_discord(), timeout=10.0)
+        except TimeoutError:
+            logging.getLogger("openexecutive").warning(
+                "Discord shutdown exceeded 10s; cancelling task"
+            )
+            if discord_bot_task is not None and not discord_bot_task.done():
+                discord_bot_task.cancel()
+                with contextlib.suppress(
+                    asyncio.CancelledError, Exception
+                ):
+                    await discord_bot_task
+
+    # Close the Slack socket before tearing down the gateway/poller/scheduler
+    # that its handlers call into. Cancelling the pending connect and closing
+    # the client are bounded together under ONE deadline — the same shape as
+    # the Discord shutdown above — so neither step can hang the lifespan.
+    if slack_handler is not None or slack_connect_task is not None:
+        async def _shutdown_slack() -> None:
+            if slack_connect_task is not None and not slack_connect_task.done():
+                slack_connect_task.cancel()
+                # asyncio.wait(), not `suppress(CancelledError): await task`.
+                # wait_for enforces its deadline BY cancelling us, so
+                # suppressing CancelledError here would swallow that signal
+                # and the 10s bound would never fire. wait() reports the
+                # task's outcome without re-raising it, and still propagates
+                # a cancellation aimed at this coroutine.
+                await asyncio.wait([slack_connect_task])
+            if slack_handler is not None:
+                # close_async() disconnects and shuts down the client's
+                # monitor, message processor and worker pool. CancelledError
+                # is not an Exception subclass, so this suppress() does not
+                # swallow the deadline either.
+                with contextlib.suppress(Exception):
+                    await slack_handler.close_async()
+
+        try:
+            await asyncio.wait_for(
+                _shutdown_slack(), timeout=SLACK_SHUTDOWN_TIMEOUT_S
+            )
+        except TimeoutError:
+            logging.getLogger("openexecutive").warning(
+                "Slack shutdown exceeded %.0fs; abandoning the socket",
+                SLACK_SHUTDOWN_TIMEOUT_S,
+            )
+            if slack_connect_task is not None and not slack_connect_task.done():
+                slack_connect_task.cancel()
+
+    # The supervisor owns the poller it started (at boot or on a retry), the
+    # priming task and the retries themselves; closing it stops all three
+    # and the gateway. The task returned at boot is the same object, so the
+    # cancel below is a no-op after this.
+    supervisor = getattr(app.state, "mcp_supervisor", None)
+    if supervisor is not None:
+        from openexecutive.orchestrator.mcp_gateway import set_gateway_supervisor
+
+        set_gateway_supervisor(None)
+        with contextlib.suppress(Exception):
+            await supervisor.close()
+
+    if email_poller_task is not None:
+        email_poller_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await email_poller_task
+
+    for task in mail_source_tasks:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+
+    if scheduler_task is not None:
+        scheduler_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await scheduler_task
+
+    if resumer_task is not None:
+        resumer_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await resumer_task
+
+    if catalog_refresh_task is not None:
+        catalog_refresh_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await catalog_refresh_task
+
+    prime_task = getattr(app.state, "mcp_prime_task", None)
+    if prime_task is not None:
+        prime_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await prime_task
+
+    if getattr(app.state, "mcp_gateway", None) is not None:
+        from openexecutive.orchestrator.mcp_gateway import set_active_gateway
+        set_active_gateway(None)
+        await app.state.mcp_gateway.close()
+
+    # Cleanup if needed (ChromaDB handles persistence)
+
+
+# The deployment flags live in utils.deployment, shared with code that must
+# not import this module (it builds the app at import). Kept under their
+# old names here for the guards below and their callers.
+_is_public_deployment = is_public_deployment
+_is_local_login = is_local_login
+
+
+# A raw Host header naming this machine, with an optional port — the same rule
+# as isLoopbackHost in packages/ui/src/lib/localLogin.ts, and
+# packages/ui/scripts/localLogin.test.mjs fails if the two ever disagree.
+_LOOPBACK_HOST_RE = re.compile(r"(localhost|127\.0\.0\.1|\[::1\])(:\d{1,5})?", re.IGNORECASE)
+
+# Sec-Fetch-Site values a browser sends when the page's own origin (or a typed
+# URL) made the request — the same set as OWN_PAGE_FETCH_SITES in
+# packages/ui/src/lib/crossSite.ts, and packages/ui/scripts/crossSite.test.mjs
+# fails if the two ever disagree.
+_OWN_PAGE_FETCH_SITES = frozenset({"same-origin", "none"})
+_READ_ONLY_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+def _webhook_verifies_its_caller(path: str) -> bool:
+    """Whether this webhook authenticates its caller by itself. Google Chat
+    always checks the signed JWT and Slack its signature (the route answers
+    503 unless a signing secret is set); Telegram only when TELEGRAM_WEBHOOK_SECRET is
+    set to a value Telegram can send — without it, it accepts anyone's
+    update."""
+    if path in ("/webhook/google-chat", "/webhook/slack"):
+        return True
+    if path == "/webhook/telegram":
+        from openexecutive.config import get_settings
+
+        return get_settings().telegram_webhook_secret_valid
+    return False
+
+
+# The UI `make dev` serves. Allowed only off a public deployment: there,
+# anything listening on a visitor's localhost:3000 (another dev server, a
+# local tool) could otherwise read this API's answers with their cookies.
+_DEV_UI_ORIGINS = ("http://localhost:3000", "http://127.0.0.1:3000")
+
+
+def _cors_origins() -> list[str]:
+    """Origins allowed through CORS: the ones in BACKEND_ALLOWED_ORIGINS
+    (comma-separated, e.g. "https://exec.example.com,https://exec.mycompany.com"),
+    plus the `make dev` UI unless OE_PUBLIC_DEPLOYMENT is set."""
+    extra = [o.strip() for o in os.environ.get("BACKEND_ALLOWED_ORIGINS", "").split(",") if o.strip()]
+    dev = [] if _is_public_deployment() else list(_DEV_UI_ORIGINS)
+    return [*dev, *extra]
+
+
+def create_app() -> FastAPI:
+    app = FastAPI(
+        title="Open Executive API",
+        description="AI-powered virtual executive team",
+        version="0.6.8",  # x-release-please-version
+        lifespan=lifespan,
+    )
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins(),
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # Signed callers (api/caller.py). With CALLER_ASSERTION_PUBLIC_KEYS set, who
+    # is calling comes from an assertion the UI proxy signs, never from the
+    # x-caller-email header alone. Added before the shared-secret gate so it
+    # runs after it. Keys that can't be read stop the boot: carrying on would
+    # trust the header again, i.e. fail open.
+    try:
+        caller_keys = api_caller.public_keys_from_env()
+    except api_caller.CallerKeysError as exc:
+        raise RuntimeError(f"CALLER_ASSERTION_PUBLIC_KEYS can't be used: {exc}") from exc
+    if caller_keys:
+        app.middleware("http")(api_caller.caller_gate(caller_keys))
+        logging.getLogger("openexecutive").info(
+            "Signed callers on (%d key%s)", len(caller_keys), "" if len(caller_keys) == 1 else "s"
+        )
+
+    # Shared-secret gate. If BACKEND_SHARED_SECRET is set, every non-exempt
+    # request must include a matching x-api-key header. If unset, the gate is
+    # off (intended for local dev only — production deploys MUST set it).
+    # Fail closed on any internet-reachable instance: set OE_PUBLIC_DEPLOYMENT=1
+    # there, and a missing secret becomes a boot failure rather than a warning.
+    shared_secret = os.environ.get("BACKEND_SHARED_SECRET", "").strip()
+    if not shared_secret and _is_public_deployment():
+        raise RuntimeError(
+            "BACKEND_SHARED_SECRET is required when OE_PUBLIC_DEPLOYMENT is set. "
+            "Generate one with: openssl rand -hex 32"
+        )
+    if shared_secret:
+        @app.middleware("http")
+        async def _shared_secret_gate(request: Request, call_next):  # type: ignore[no-untyped-def]
+            if request.url.path in _UNAUTHENTICATED_PATHS or request.method == "OPTIONS":
+                return await call_next(request)
+            provided = request.headers.get("x-api-key", "")
+            if not provided or not hmac.compare_digest(provided, shared_secret):
+                return JSONResponse({"error": "unauthorized"}, status_code=401)
+            # What the MCP server reads before it lets a request turn on
+            # "may act" (mcp_server.may_act): this request passed the check.
+            request.state.shared_secret_ok = True
+            return await call_next(request)
+    else:
+        logging.getLogger("openexecutive").warning(
+            "BACKEND_SHARED_SECRET is unset — API is open. Acceptable for local "
+            "dev only; set this secret in any environment reachable from the "
+            "public internet."
+        )
+
+    # Local login: the UI admits the owner with no password, guarded by where
+    # requests come from, and this API needs the same guard — it usually has
+    # no shared secret, and a request with no x-caller-email runs as the
+    # principal. Two ways a web page could otherwise drive it from the
+    # owner's browser:
+    #   - DNS rebinding: a page re-points its own hostname at 127.0.0.1 and
+    #     calls this API same-origin. A browser always sends the page's real
+    #     hostname as Host, and scripts cannot change it. A webhook that
+    #     verifies its caller may arrive via a tunnel under another name.
+    #   - A plain form POST from any other site or localhost port: no cookie
+    #     or preflight is needed. Browsers stamp Sec-Fetch-Site on it; the UI
+    #     proxy, the CLI and the webhook senders don't send it at all.
+    if _is_local_login():
+        @app.middleware("http")
+        async def _local_login_gate(request: Request, call_next):  # type: ignore[no-untyped-def]
+            addressed_here = _LOOPBACK_HOST_RE.fullmatch(request.headers.get("host", "").strip())
+            if not addressed_here and not _webhook_verifies_its_caller(request.url.path):
+                return JSONResponse(
+                    {"error": "local login only accepts requests addressed to this computer"},
+                    status_code=403,
+                )
+            fetch_site = request.headers.get("sec-fetch-site", "").strip().lower()
+            if (
+                request.method not in _READ_ONLY_METHODS
+                and fetch_site
+                and fetch_site not in _OWN_PAGE_FETCH_SITES
+            ):
+                return JSONResponse({"error": "cross-site request refused"}, status_code=403)
+            return await call_next(request)
+
+    app.include_router(auth_route.router, tags=["auth"])
+    app.include_router(fixtures.router, tags=["fixtures"])
+    app.include_router(clients.router, tags=["clients"])
+    app.include_router(agents.router, tags=["agents"])
+    app.include_router(personas.router, tags=["personas"])
+    app.include_router(chat.router, tags=["chat"])
+    app.include_router(sessions.router, tags=["sessions"])
+    app.include_router(onboarding.router, tags=["onboarding"])
+    app.include_router(company_profile.router, tags=["company-profile"])
+    app.include_router(documents.router, tags=["documents"])
+    app.include_router(knowledge.router, tags=["knowledge"])
+    app.include_router(skills.router, tags=["skills"])
+    # Ahead of workflows.router so no /workflows/{name}/... pattern can shadow
+    # the literal /workflows/designer/* paths.
+    app.include_router(workflow_designer.router, tags=["workflows"])
+    app.include_router(workflows.router, tags=["workflows"])
+    app.include_router(saved_tools.router, tags=["workflows"])
+    app.include_router(python_jobs.router, tags=["workflows"])
+    app.include_router(evals.router, tags=["evals"])
+    app.include_router(episodic.router, tags=["memories"])
+    app.include_router(review.router, tags=["review"])
+    app.include_router(alerts.router, tags=["alerts"])
+    app.include_router(artifacts.router, tags=["artifacts"])
+    app.include_router(decisions.router, tags=["decisions"])
+    app.include_router(delegation.router, tags=["delegation"])
+    app.include_router(take_the_lead.router, tags=["take-the-lead"])
+    app.include_router(may_do.router, tags=["delegation"])
+    app.include_router(history.router, tags=["memories"])
+    app.include_router(reflection.router, tags=["memories"])
+    app.include_router(audit.router, tags=["audit"])
+    app.include_router(departments.router, tags=["departments"])
+    app.include_router(people.router, tags=["people"])
+    app.include_router(contacts.router, tags=["people"])
+    app.include_router(chat_directory.router, tags=["people"])
+    app.include_router(today.router, tags=["today"])
+    app.include_router(scheduled.router, tags=["scheduled"])
+    app.include_router(executive.router, tags=["executive"])
+    app.include_router(workspace.router, tags=["workspace"])
+    app.include_router(notifications.router, tags=["notifications"])
+    app.include_router(watchlist.router, tags=["watchlist"])
+    app.include_router(google_chat_router, tags=["google-chat"])
+    app.include_router(telegram_router, tags=["telegram"])
+    app.include_router(slack_events_router, tags=["slack"])
+    app.include_router(architecture.router, tags=["architecture"])
+    app.include_router(guide.router, tags=["guide"])
+    app.include_router(health.router, tags=["health"])
+    app.include_router(version.router, tags=["health"])
+    app.include_router(setup_status.router, tags=["setup"])
+
+    # Expose Open Executive as an MCP server at /mcp (Streamable-HTTP). Gated
+    # by the same shared-secret middleware as every other route — clients pass
+    # x-api-key. Mounting also lazily creates mcp.session_manager, which the
+    # lifespan runs (see above).
+    mcp_server.mount(app)
+
+    configure_tracing(app)
+
+    return app
+
+
+app = create_app()

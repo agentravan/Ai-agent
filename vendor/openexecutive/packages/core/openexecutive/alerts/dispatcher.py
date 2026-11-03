@@ -1,0 +1,336 @@
+from __future__ import annotations
+
+import logging
+from datetime import UTC, datetime
+from pathlib import Path
+
+from openexecutive.alerts import sse_bus
+from openexecutive.alerts.models import Alert, AlertChannel
+from openexecutive.alerts.store import DB_PATH, update_delivery
+
+logger = logging.getLogger(__name__)
+
+
+def _alert_to_event(alert: Alert) -> dict:
+    return {
+        "id": alert.id,
+        "external_id": alert.external_id,
+        "source": alert.source,
+        "severity": alert.severity,
+        "headline": alert.headline,
+        "body": alert.body,
+        "suggested_action": alert.suggested_action,
+        "topic_tags": alert.topic_tags,
+        "status": alert.status,
+        "created_at": alert.created_at,
+    }
+
+
+async def dispatch_web(alert: Alert) -> bool:
+    try:
+        sse_bus.publish({"type": "alert", "alert": _alert_to_event(alert)})
+        return True
+    except Exception:
+        logger.exception("dispatch_web failed")
+        return False
+
+
+async def dispatch_persisted(alert: Alert) -> bool:
+    # Already persisted by the pipeline before dispatch; this is a no-op marker.
+    return True
+
+
+# The lowest severity sent to a chat app on its own; the rest wait on Home.
+_CHAT_DM_MIN_SEVERITY = "high"
+
+
+async def dispatch_slack_dm(alert: Alert) -> bool:
+    """A high or urgent alert to its person's own chat app: the one it was
+    routed to, else the principal (always the principal for a private one),
+    on the first of their Slack, Discord or Telegram DMs that sends
+    (``people.reach``; ``scheduler.runner.deliver_to_person``, chat apps
+    only). Not during their quiet hours, unless it is urgent and they let
+    urgent things through; it still waits on Home. The channel keeps its old
+    name, ``slack_dm``, in stored preferences."""
+    from openexecutive.alerts.models import SEVERITY_RANK, is_private_alert
+    from openexecutive.people.channel import is_within_availability
+    from openexecutive.people.store import find_principal_person, get_person
+    from openexecutive.scheduler.runner import deliver_to_person
+
+    if SEVERITY_RANK.get(str(alert.severity), 0) < SEVERITY_RANK[_CHAT_DM_MIN_SEVERITY]:
+        return False
+    try:
+        principal = find_principal_person()
+        person = get_person(alert.routed_to_person_id) if alert.routed_to_person_id is not None else None
+        if person is None or person.archived or is_private_alert(alert):
+            person = principal
+        if person is None:
+            return False
+        urgent = str(alert.severity) == "urgent"
+        if not is_within_availability(person, now=datetime.now(UTC), quiet_hours=True, urgent=urgent):
+            logger.info("dispatch_slack_dm: alert=%s waits on Home (quiet hours)", alert.id)
+            return False
+        delivery = await deliver_to_person(person, _format_broadcast_body(alert), label="Alert", chat_only=True)
+    except Exception:
+        logger.exception("dispatch_slack_dm failed for alert=%s", alert.id)
+        return False
+    if not delivery.ok:
+        logger.info("dispatch_slack_dm: alert=%s not sent: %s", alert.id, delivery.detail)
+    return delivery.ok
+
+
+async def dispatch_email(alert: Alert) -> bool:
+    from openexecutive.config import get_settings
+    from openexecutive.orchestrator.mcp_gateway import get_active_gateway
+
+    gateway = get_active_gateway()
+    if gateway is None:
+        logger.warning("dispatch_email: MCP gateway not available — skipping")
+        return False
+
+    from openexecutive.integrations.workspace.registry import get_mail_provider
+    from openexecutive.orchestrator.mcp_gateway import _is_error_payload
+
+    settings = get_settings()
+    provider = get_mail_provider(settings)
+    try:
+        subject = f"[{alert.severity.upper()}] {alert.headline}"
+        body = f"{alert.body}\n\nSuggested action: {alert.suggested_action or 'None'}"
+        # A self-send to the Executive's own mailbox, through whichever backend
+        # EMAIL_PROVIDER names; the provider spells the tool's argument shape.
+        result = await gateway.call_tool({
+            "name": provider.send_tool_name,
+            "arguments": provider.build_send_arguments(
+                mailbox=settings.exec_email_address,
+                to=settings.exec_email_address,
+                subject=subject,
+                body=body,
+            ),
+        })
+        # The send tool reports a soft failure in-band (`{"error": ...}`), so
+        # a delivery row must not claim success for mail that never left.
+        if isinstance(result, str) and _is_error_payload(result):
+            logger.warning(
+                "dispatch_email: %s reported an error for alert=%s: %s",
+                provider.send_tool_name, alert.id, result[:300],
+            )
+            return False
+        return True
+    except Exception:
+        logger.exception("dispatch_email failed for alert=%s", alert.id)
+        return False
+
+
+# Tags that MUST NOT broadcast — even if the triage prompt would have
+# routed them to a department channel or company broadcast. Mirrors the
+# privacy invariant codified in the Executive persona's "Choosing Who
+# to Tell" section. Defence-in-depth: the prompt is the primary
+# enforcement, this is the backstop against a single model misroute
+# leaking comp / board / legal context to the entire team.
+#
+# Exact match (not substring) — a substring check overmatched the
+# documented tag vocabulary in round-1 review (e.g. "comp" matching
+# "competitor", "legal" matching "legalese"). The set lists every
+# spelling triage might emit; new sensitive vocabulary must be added
+# here explicitly.
+_PRIVACY_SENSITIVE_TAGS: frozenset[str] = frozenset({
+    # models.PRIVATE_ALERT_TAG: an alert only the principal may see. The
+    # pipeline already keeps such an alert off every broadcast channel; this
+    # is the backstop.
+    "private:principal",
+    "board",
+    "comp",
+    "compensation",
+    "compensation-refresh",
+    "comp-refresh",
+    "legal",
+    "litigation",
+    "layoffs",
+    "severance",
+    "valuation",
+    "term-sheet",
+    "termsheet",
+    "term_sheet",
+    "revenue",
+})
+
+
+def _violates_privacy_invariant(alert: Alert) -> bool:
+    """True when any of the alert's topic_tags is in the sensitive set.
+
+    Uses exact (case-insensitive) match on each tag rather than
+    substring — a substring check would block legitimate broadcasts on
+    "competitor" / "compliance" / "legalese" / etc.
+    """
+    if not alert.topic_tags:
+        return False
+    return any(tag.lower() in _PRIVACY_SENSITIVE_TAGS for tag in alert.topic_tags)
+
+
+def _format_broadcast_body(alert: Alert) -> str:
+    """Render an alert as a short broadcast-friendly plain-text body.
+
+    Plain text — no `*foo*` markdown. Slack treats `*foo*` as bold but
+    Discord renders it as italic; Telegram MarkdownV2 needs escaping.
+    Cross-platform plain text is the safest cut.
+    """
+    parts = [alert.headline, "", alert.body]
+    if alert.suggested_action:
+        parts.append("")
+        parts.append(f"Suggested action: {alert.suggested_action}")
+    return "\n".join(parts).strip()
+
+
+async def dispatch_department_channel(
+    alert: Alert, *, department_slug: str, integration: str
+) -> bool:
+    """Post the alert to a department's configured team room.
+
+    Uses the existing `send_department_message` handler so the routing
+    + channel-lookup + error-shape logic lives in one place. Returns
+    False when the department has no channel configured for the
+    requested integration; the triage decision should have fallen
+    back to another channel type at that point.
+    """
+    if not department_slug or not integration:
+        logger.warning(
+            "dispatch_department_channel: missing routing context "
+            "(alert=%s slug=%r integration=%r)",
+            alert.id, department_slug, integration,
+        )
+        return False
+    if _violates_privacy_invariant(alert):
+        # Triage prompt is supposed to prevent this; defence-in-depth
+        # backstop. Log loudly so a misroute is visible in the audit.
+        logger.error(
+            "privacy invariant breach: refusing department broadcast for "
+            "alert=%s tags=%s",
+            alert.id, alert.topic_tags,
+        )
+        return False
+    import json as _json
+
+    # Lazy import so test code can `monkeypatch.setattr(bt, "handle_send_…", …)`
+    # against the broadcast_tools module attribute and have the dispatcher
+    # pick it up. A module-level import would freeze the binding at import
+    # time and silently bypass the monkeypatch.
+    from openexecutive.orchestrator.broadcast_tools import (
+        handle_send_department_message,
+    )
+    try:
+        result = await handle_send_department_message({
+            "department_slug": department_slug,
+            "integration": integration,
+            "text": _format_broadcast_body(alert),
+        })
+        parsed = _json.loads(result)
+    except Exception:
+        logger.exception(
+            "dispatch_department_channel failed for alert=%s slug=%s",
+            alert.id, department_slug,
+        )
+        return False
+    return isinstance(parsed, dict) and "error" not in parsed
+
+
+async def dispatch_company_broadcast(
+    alert: Alert, *, integration: str
+) -> bool:
+    """Post the alert to the configured company-wide channel.
+
+    Returns False when the env-level default channel for the
+    integration is unset — the triage decision should have fallen
+    back to /today-only in that case.
+    """
+    if not integration:
+        logger.warning(
+            "dispatch_company_broadcast: missing integration (alert=%s)", alert.id,
+        )
+        return False
+    if _violates_privacy_invariant(alert):
+        logger.error(
+            "privacy invariant breach: refusing company broadcast for "
+            "alert=%s tags=%s",
+            alert.id, alert.topic_tags,
+        )
+        return False
+    import json as _json
+
+    # Lazy import so test code can `monkeypatch.setattr(bt, "handle_send_…", …)`
+    # against the broadcast_tools module attribute and have the dispatcher
+    # pick it up. A module-level import would freeze the binding at import
+    # time and silently bypass the monkeypatch.
+    from openexecutive.orchestrator.broadcast_tools import (
+        handle_send_company_broadcast,
+    )
+    try:
+        result = await handle_send_company_broadcast({
+            "integration": integration,
+            "text": _format_broadcast_body(alert),
+        })
+        parsed = _json.loads(result)
+    except Exception:
+        logger.exception("dispatch_company_broadcast failed for alert=%s", alert.id)
+        return False
+    return isinstance(parsed, dict) and "error" not in parsed
+
+
+# Per-channel single-arg dispatchers — used for channels that need no
+# extra routing context (web, persisted, email, a chat DM).
+# The two broadcast channels are dispatched separately in dispatch_all
+# because they need the department_slug / broadcast_integration kwargs.
+_SIMPLE_DISPATCHERS = {
+    AlertChannel.WEB.value: dispatch_web,
+    AlertChannel.PERSISTED.value: dispatch_persisted,
+    AlertChannel.SLACK_DM.value: dispatch_slack_dm,
+    AlertChannel.EMAIL.value: dispatch_email,
+}
+
+
+async def dispatch_all(
+    alert: Alert,
+    channels: list[AlertChannel],
+    db_path: Path = DB_PATH,
+    *,
+    department_slug: str = "",
+    broadcast_integration: str = "",
+) -> tuple[list[str], list[str]]:
+    """Fire all per-channel dispatchers. Returns (attempted, delivered).
+
+    The two Shift 3 broadcast channels (DEPARTMENT_CHANNEL,
+    COMPANY_BROADCAST) need extra routing context — `department_slug`
+    names which dept room to post to, `broadcast_integration` names
+    the integration ("slack" / "discord" / "telegram"). The triage
+    agent emits these on the TriageDecision; the alerts pipeline
+    threads them through.
+    """
+    attempted: list[str] = []
+    delivered: list[str] = []
+    for ch in channels:
+        attempted.append(ch.value)
+        ok = False
+        try:
+            if ch == AlertChannel.DEPARTMENT_CHANNEL:
+                ok = await dispatch_department_channel(
+                    alert,
+                    department_slug=department_slug,
+                    integration=broadcast_integration,
+                )
+            elif ch == AlertChannel.COMPANY_BROADCAST:
+                ok = await dispatch_company_broadcast(
+                    alert, integration=broadcast_integration,
+                )
+            else:
+                fn = _SIMPLE_DISPATCHERS.get(ch.value)
+                if fn is None:
+                    logger.warning("dispatch_all: unknown channel %s", ch)
+                    continue
+                ok = await fn(alert)
+        except Exception:
+            logger.exception("dispatcher %s raised", ch.value)
+            ok = False
+        if ok:
+            delivered.append(ch.value)
+    if alert.id is not None:
+        update_delivery(alert.id, attempted, delivered, db_path=db_path)
+    return attempted, delivered

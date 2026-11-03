@@ -1,0 +1,698 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"html"
+	"net/url"
+	"os"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+	"unicode"
+
+	"awesome-ai-agents/internal/contributions"
+	"awesome-ai-agents/internal/projectdata"
+	"gopkg.in/yaml.v3"
+)
+
+type item struct {
+	Project projectdata.Project
+	Growth  *growth
+}
+type growth struct {
+	Delta, Days int
+	Relative    float64
+}
+
+const latestGrowthWindow = 0
+
+type emojiFile struct {
+	CategoryEmojis map[string]string `yaml:"category_emojis"`
+}
+
+var githubPattern = regexp.MustCompile(`(?i)github\.com/([^/]+)/([^/#?]+)`)
+
+func main() {
+	if e := run(); e != nil {
+		fmt.Fprintln(os.Stderr, "ERROR:", e)
+		os.Exit(1)
+	}
+}
+func run() error {
+	root := projectdata.Root()
+	data, e := projectdata.LoadData(root + "/awesome-agents.json")
+	if e != nil {
+		return e
+	}
+	credits, e := contributions.Read(root + "/contributions.json")
+	if e != nil {
+		return e
+	}
+	if e = contributions.Validate(data, credits); e != nil {
+		return e
+	}
+	emojis, e := loadEmojis(root + "/awesome-categories.yaml")
+	if e != nil {
+		fmt.Fprintln(os.Stderr, "WARN:", e)
+	}
+	template, e := os.ReadFile(root + "/README.template.md")
+	if e != nil {
+		return e
+	}
+	hist := loadHistory(root + "/github-stars-history.json")
+	sections := renderSections(data, emojis, hist, credits)
+	categories, e := loadCategories(root + "/awesome-categories.yaml")
+	if e != nil {
+		fmt.Fprintln(os.Stderr, "WARN:", e)
+	}
+	legend := renderCategoryLegend(data, categories, templateHeadings(string(template)))
+	top, _ := topProjects(data)
+	content := strings.ReplaceAll(string(template), "${CATEGORY_LEGEND}", legend)
+	content = strings.ReplaceAll(content, "${SECTIONS}", sections)
+	content = strings.ReplaceAll(content, "${TOP_STARRED_PROJECTS}", renderList(top, hist))
+	for _, window := range []int{1, 7, 30} {
+		content = strings.ReplaceAll(content, growthPlaceholder(window), renderGrowthList(data, top, hist, window))
+	}
+	if e = os.WriteFile(root+"/README.md", []byte(content), 0644); e != nil {
+		return e
+	}
+	fmt.Printf("Successfully generated %s\n", root+"/README.md")
+	return nil
+}
+
+type categoryInfo struct {
+	Name  string
+	Emoji string
+}
+
+// loadCategories returns the categories in the order awesome-categories.yaml lists them.
+func loadCategories(path string) ([]categoryInfo, error) {
+	b, e := os.ReadFile(path)
+	if e != nil {
+		return nil, e
+	}
+	var raw []struct {
+		Category string `yaml:"category"`
+		Emoji    string `yaml:"emoji"`
+	}
+	if e = yaml.Unmarshal(b, &raw); e != nil {
+		return nil, e
+	}
+	out := make([]categoryInfo, 0, len(raw))
+	for _, c := range raw {
+		if c.Category != "" {
+			out = append(out, categoryInfo{c.Category, c.Emoji})
+		}
+	}
+	return out, nil
+}
+
+// headingSlug mirrors how GitHub derives an anchor from a Markdown heading.
+func headingSlug(heading string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(strings.TrimSpace(heading)) {
+		switch {
+		case unicode.IsLetter(r) || unicode.IsNumber(r) || unicode.IsMark(r) || r == '_' || r == '-':
+			b.WriteRune(r)
+		case r == ' ':
+			b.WriteByte('-')
+		}
+	}
+	return b.String()
+}
+
+// templateHeadings lists the Markdown headings the template places before the project sections.
+func templateHeadings(template string) []string {
+	if i := strings.Index(template, "${SECTIONS}"); i >= 0 {
+		template = template[:i]
+	}
+	var out []string
+	for _, line := range strings.Split(template, "\n") {
+		if trimmed := strings.TrimLeft(line, "#"); trimmed != line && strings.HasPrefix(trimmed, " ") {
+			out = append(out, strings.TrimSpace(trimmed))
+		}
+	}
+	return out
+}
+
+// renderCategoryLegend lists every category with its projects, each linking to
+// that project's heading in the All Projects section. Anchors follow GitHub's
+// duplicate rule, so a repeated heading gets a numeric suffix.
+func renderCategoryLegend(d projectdata.Data, categories []categoryInfo, preceding []string) string {
+	seen := map[string]int{}
+	for _, heading := range preceding {
+		seen[headingSlug(heading)]++
+	}
+	names := map[string]string{}
+	byCategory := map[string][]string{}
+	keys := []string{}
+	for _, p := range d.Agents {
+		k := strings.ToLower(p.Project)
+		if _, ok := names[k]; !ok {
+			names[k] = p.Project
+			keys = append(keys, k)
+		}
+		for _, c := range p.Categories {
+			byCategory[c] = append(byCategory[c], k)
+		}
+	}
+	sort.Strings(keys)
+	anchors := map[string]string{}
+	for _, k := range keys {
+		slug := headingSlug(names[k])
+		anchor := slug
+		if n := seen[slug]; n > 0 {
+			anchor = fmt.Sprintf("%s-%d", slug, n)
+		}
+		seen[slug]++
+		anchors[k] = anchor
+	}
+	ordered := append([]categoryInfo{}, categories...)
+	known := map[string]bool{}
+	for _, c := range categories {
+		known[c.Name] = true
+	}
+	extra := []string{}
+	for c := range byCategory {
+		if !known[c] {
+			extra = append(extra, c)
+		}
+	}
+	sort.Strings(extra)
+	for _, c := range extra {
+		ordered = append(ordered, categoryInfo{Name: c})
+	}
+	var b strings.Builder
+	for _, c := range ordered {
+		members := append([]string{}, byCategory[c.Name]...)
+		if len(members) == 0 {
+			continue
+		}
+		sort.Strings(members)
+		label := c.Name
+		if c.Emoji != "" {
+			label = c.Emoji + " " + label
+		}
+		fmt.Fprintf(&b, "<details>\n<summary>%s (%d)</summary>\n<ul>\n", html.EscapeString(label), len(members))
+		last := ""
+		for _, k := range members {
+			if k == last {
+				continue
+			}
+			last = k
+			fmt.Fprintf(&b, "<li><a href=\"#%s\">%s</a></li>\n", anchors[k], html.EscapeString(names[k]))
+		}
+		b.WriteString("</ul>\n</details>\n\n")
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func hasGrowthBaseline(data projectdata.Data, history map[string][]projectdata.HistoryRow, days int) bool {
+	for _, project := range data.Agents {
+		if projectGrowth(project, history, days) != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func loadEmojis(path string) (map[string]string, error) {
+	b, e := os.ReadFile(path)
+	if e != nil {
+		return nil, e
+	}
+	var raw any
+	if e = yaml.Unmarshal(b, &raw); e != nil {
+		return nil, e
+	}
+	out := map[string]string{}
+	switch v := raw.(type) {
+	case []any:
+		for _, x := range v {
+			if m, ok := x.(map[string]any); ok {
+				c, _ := m["category"].(string)
+				em, _ := m["emoji"].(string)
+				if c != "" && em != "" {
+					out[c] = em
+				}
+			}
+		}
+	case map[string]any:
+		if m, ok := v["category_emojis"].(map[string]any); ok {
+			for k, x := range m {
+				if s, ok := x.(string); ok {
+					out[k] = s
+				}
+			}
+		}
+	}
+	return out, nil
+}
+func loadHistory(path string) map[string][]projectdata.HistoryRow {
+	var h projectdata.History
+	if projectdata.ReadJSON(path, &h) != nil {
+		return nil
+	}
+	m := map[string][]projectdata.HistoryRow{}
+	for _, r := range h.Snapshots {
+		if r.Stars != nil && r.Status == "active" {
+			k := strings.ToLower(r.Repository)
+			m[k] = append(m[k], r)
+		}
+	}
+	for k := range m {
+		sort.Slice(m[k], func(i, j int) bool { return m[k][i].Date < m[k][j].Date })
+	}
+	return m
+}
+func github(p projectdata.Project) *projectdata.Source {
+	for i := range p.Sources {
+		if p.Sources[i].Source == "github" {
+			return &p.Sources[i]
+		}
+	}
+	return nil
+}
+func stars(p projectdata.Project) int {
+	s := github(p)
+	if s == nil || s.Stars == nil {
+		return -1
+	}
+	return *s.Stars
+}
+func repoKey(url string) string {
+	m := githubPattern.FindStringSubmatch(url)
+	if len(m) < 3 {
+		return ""
+	}
+	return strings.ToLower(m[1] + "/" + strings.TrimSuffix(m[2], ".git"))
+}
+func projectGrowth(p projectdata.Project, h map[string][]projectdata.HistoryRow, days int) *growth {
+	s := github(p)
+	if s == nil {
+		return nil
+	}
+	rows := h[repoKey(s.SourceURL)]
+	if len(rows) < 2 {
+		return nil
+	}
+	latest, e := time.Parse("2006-01-02", rows[len(rows)-1].Date)
+	if e != nil {
+		return nil
+	}
+	lookback := days
+	if days == latestGrowthWindow {
+		lookback = 1
+	}
+	target := latest.AddDate(0, 0, -lookback)
+	base := -1
+	for i := 0; i < len(rows)-1; i++ {
+		d, e := time.Parse("2006-01-02", rows[i].Date)
+		if e == nil && !d.After(target) {
+			base = i
+		}
+	}
+	if base < 0 {
+		return nil
+	}
+	prev, e := time.Parse("2006-01-02", rows[base].Date)
+	if e != nil {
+		return nil
+	}
+	elapsed := int(latest.Sub(prev).Hours() / 24)
+	// The latest-update ranking allows gaps and labels the actual elapsed days.
+	maxElapsed := days + 2
+	if days == 1 {
+		maxElapsed = 1
+	}
+	if days != latestGrowthWindow {
+		if elapsed > maxElapsed {
+			return nil
+		}
+	}
+	if elapsed < 1 {
+		return nil
+	}
+	delta := *rows[len(rows)-1].Stars - *rows[base].Stars
+	relative := 0.0
+	if *rows[base].Stars != 0 {
+		relative = float64(delta) / float64(*rows[base].Stars) * 100
+	}
+	return &growth{delta, elapsed, relative}
+}
+func topProjects(d projectdata.Data) ([]item, map[string]bool) {
+	all := []item{}
+	for _, p := range d.Agents {
+		if stars(p) >= 0 && github(p) != nil {
+			all = append(all, item{Project: p})
+		}
+	}
+	sort.SliceStable(all, func(i, j int) bool { return stars(all[i].Project) > stars(all[j].Project) })
+	if len(all) > 10 {
+		all = all[:10]
+	}
+	exclude := map[string]bool{}
+	for _, x := range all {
+		exclude[x.Project.Project] = true
+	}
+	return all, exclude
+}
+func risingProjects(d projectdata.Data, exclude map[string]bool, h map[string][]projectdata.HistoryRow, days int) []item {
+	all := []item{}
+	for _, p := range d.Agents {
+		if exclude[strings.ToLower(p.Project)] || stars(p) < 100 {
+			continue
+		}
+		window := days
+		if days == 1 {
+			window = latestGrowthWindow
+		}
+		g := projectGrowth(p, h, window)
+		if g != nil && g.Delta > 0 {
+			all = append(all, item{p, g})
+		}
+	}
+	sort.SliceStable(all, func(i, j int) bool {
+		a, b := all[i].Growth, all[j].Growth
+		if a.Delta != b.Delta {
+			return a.Delta > b.Delta
+		}
+		return a.Relative > b.Relative
+	})
+	if len(all) > 10 {
+		all = all[:10]
+	}
+	return all
+}
+func renderList(items []item, history map[string][]projectdata.HistoryRow) string {
+	if len(items) == 0 {
+		return "<p><em>No projects to display.</em></p>"
+	}
+	var b strings.Builder
+	b.WriteString("<ol>\n")
+	for _, x := range items {
+		p := x.Project
+		src := github(p)
+		if src == nil {
+			src = &p.Sources[0]
+		}
+		display := ""
+		if src.Stars != nil {
+			display = fmt.Sprintf(" - %s stars", comma(*src.Stars))
+		}
+		if x.Growth != nil {
+			display += " · " + growthText(x.Growth)
+		} else {
+			metrics := []string{}
+			for _, days := range []int{1, 7, 30} {
+				if g := projectGrowth(p, history, days); g != nil {
+					metrics = append(metrics, growthText(g))
+				}
+			}
+			if len(metrics) > 0 {
+				display += " · " + strings.Join(metrics, " · ")
+			}
+		}
+		desc := ""
+		if p.ProjectDescription != nil {
+			desc = "<br>" + *p.ProjectDescription
+		}
+		fmt.Fprintf(&b, "<li><a href=\"%s\"><strong>%s</strong></a>%s%s</li>\n", src.SourceURL, p.Project, display, desc)
+	}
+	b.WriteString("</ol>")
+	return b.String()
+}
+
+func growthText(g *growth) string {
+	period := fmt.Sprintf("%dd", g.Days)
+	if g.Days == 1 {
+		period = "today"
+	}
+	return fmt.Sprintf("%s %s stars (%+.1f%%)", period, signedComma(g.Delta), g.Relative)
+}
+
+func growthPlaceholder(days int) string {
+	return fmt.Sprintf("${RISING_%dD}", days)
+}
+
+func renderGrowthList(data projectdata.Data, top []item, history map[string][]projectdata.HistoryRow, days int) string {
+	excluded := make(map[string]bool, len(top))
+	for _, project := range top {
+		excluded[strings.ToLower(project.Project.Project)] = true
+	}
+	items := risingProjects(data, excluded, history, days)
+	if len(items) > 0 {
+		return renderList(items, history)
+	}
+	if days == 1 {
+		if len(top) == 0 {
+			top, _ = topProjects(data)
+		}
+		return "<p><em>Top projects by current stars in the latest update:</em></p>\n" + renderList(top, history)
+	}
+	if !hasGrowthBaseline(data, history, days) {
+		return renderMissingGrowthBaseline(data, history, days)
+	}
+	return "<p><em>No positive star growth found for this window among eligible projects.</em></p>"
+}
+
+func renderMissingGrowthBaseline(data projectdata.Data, history map[string][]projectdata.HistoryRow, days int) string {
+	var earliest, latest time.Time
+	for _, project := range data.Agents {
+		source := github(project)
+		if source == nil {
+			continue
+		}
+		for _, row := range history[repoKey(source.SourceURL)] {
+			date, err := time.Parse("2006-01-02", row.Date)
+			if err != nil {
+				continue
+			}
+			if earliest.IsZero() {
+				earliest = date
+			} else if date.Before(earliest) {
+				earliest = date
+			}
+			if date.After(latest) {
+				latest = date
+			}
+		}
+	}
+	if latest.IsZero() {
+		return fmt.Sprintf("<p><em>No %d-day comparison is available: no usable star snapshots have been recorded.</em></p>", days)
+	}
+	target := latest.AddDate(0, 0, -days)
+	baseline := "on " + target.Format("2006-01-02")
+	if days > 1 {
+		baseline = "between " + target.AddDate(0, 0, -2).Format("2006-01-02") + " and " + target.Format("2006-01-02")
+	}
+	return fmt.Sprintf("<p><em>No %d-day comparison is available. Recorded snapshots span %s to %s; a comparison ending %s needs a baseline snapshot %s.</em></p>",
+		days, earliest.Format("2006-01-02"), latest.Format("2006-01-02"), latest.Format("2006-01-02"), baseline)
+}
+
+func renderSections(d projectdata.Data, em map[string]string, h map[string][]projectdata.HistoryRow, credits contributions.Data) string {
+	type agg struct {
+		p    projectdata.Project
+		cats map[string]bool
+	}
+	m := map[string]*agg{}
+	creditByID := make(map[string]contributions.Project, len(credits.Projects))
+	for _, credit := range credits.Projects {
+		creditByID[credit.ProjectID] = credit
+	}
+	for _, p := range d.Agents {
+		k := strings.ToLower(p.Project)
+		if m[k] == nil {
+			m[k] = &agg{p, map[string]bool{}}
+		}
+		for _, c := range p.Categories {
+			m[k].cats[c] = true
+		}
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var out strings.Builder
+	for _, k := range keys {
+		a := m[k]
+		p := a.p
+		badge := p.Sources[0].SourceURL
+		if s := github(p); s != nil {
+			badge = s.SourceURL
+		}
+		yn, color := "Unverified", "red"
+		if p.HasPublicRepository {
+			yn, color = "Public", "green"
+		}
+		starBadge := ""
+		if s := github(p); s != nil {
+			if mm := githubPattern.FindStringSubmatch(s.SourceURL); len(mm) > 2 {
+				starBadge = fmt.Sprintf("<a href=\"%s\"><img src=\"https://img.shields.io/github/stars/%s/%s?style=social\" alt=\"GitHub stars\"></a>", s.SourceURL, mm[1], mm[2])
+			}
+		}
+		fmt.Fprintf(&out, "### %s\n<div><a href=\"%s\"><img src=\"https://img.shields.io/badge/Repository-%s-%s\" alt=\"Repository verification\"></a> %s</div>\n", p.Project, badge, yn, color, starBadge)
+		if provenance := renderProvenance(p, creditByID[p.ID]); provenance != "" {
+			fmt.Fprintf(&out, "<p class=\"project-provenance\">%s</p>\n", provenance)
+		}
+		if s := github(p); s != nil && s.Stars != nil {
+			growthLabels := []string{}
+			for _, window := range []int{1, 7, 30} {
+				if g := projectGrowth(p, h, window); g != nil {
+					growthLabels = append(growthLabels, growthText(g))
+				}
+			}
+			fmt.Fprintf(&out, "<p>⭐ %s stars", comma(*s.Stars))
+			if len(growthLabels) > 0 {
+				fmt.Fprintf(&out, " · Growth: %s", strings.Join(growthLabels, " · "))
+			}
+			fmt.Fprintln(&out, "</p>")
+		}
+		cats := []string{}
+		for c := range a.cats {
+			cats = append(cats, c)
+		}
+		sort.Strings(cats)
+		shown := []string{}
+		for _, c := range cats {
+			shown = append(shown, em[c]+" "+c)
+		}
+		fmt.Fprintf(&out, "<p>%s</p>\n\n<p>%s</p>\n\n<p>%s</p>\n", strings.Join(shown, " | "), value(p.ProjectDescription, "No description provided."), formatSources(p.Sources))
+		if len(p.Capabilities) > 0 {
+			fmt.Fprintf(&out, "<p><strong>Capabilities:</strong> %s</p>\n", strings.Join(p.Capabilities, " · "))
+		}
+		if len(p.Interfaces) > 0 {
+			fmt.Fprintf(&out, "<p><strong>Interfaces:</strong> %s</p>\n", strings.Join(p.Interfaces, " · "))
+		}
+		out.WriteString("</div>\n\n")
+	}
+	return strings.TrimSuffix(out.String(), "\n\n")
+}
+
+func renderProvenance(p projectdata.Project, credit contributions.Project) string {
+	parts := make([]string, 0, 3)
+	if len(credit.SubmittedBy) > 0 {
+		people := make([]string, 0, len(credit.SubmittedBy))
+		for _, person := range credit.SubmittedBy {
+			label := fmt.Sprintf("<a href=\"https://github.com/%s\">@%s</a>", html.EscapeString(person.Login), html.EscapeString(person.Login))
+			if person.FounderTeamClaim {
+				label += " <small>(self-reported founder/team)</small>"
+			}
+			label += fmt.Sprintf(" <a href=\"%s\">submission</a>", html.EscapeString(person.EvidenceURL))
+			for _, evidenceURL := range person.AdditionalEvidenceURLs {
+				label += fmt.Sprintf(" <a href=\"%s\">related submission</a>", html.EscapeString(evidenceURL))
+			}
+			label += fmt.Sprintf(" <a href=\"%s\">accepted PR</a>", html.EscapeString(person.AcceptanceURL))
+			people = append(people, label)
+		}
+		parts = append(parts, "<strong>Submitted by:</strong> "+strings.Join(people, ", "))
+	} else {
+		parts = append(parts, "<strong>Submitted by:</strong> <em>not yet recovered from repository history</em>")
+	}
+	if len(credit.MaintainedBy) > 0 {
+		people := make([]string, 0, len(credit.MaintainedBy))
+		for _, person := range credit.MaintainedBy {
+			label := fmt.Sprintf("<a href=\"https://github.com/%s\">@%s</a>", html.EscapeString(person.Login), html.EscapeString(person.Login))
+			if person.Status == "self_reported" {
+				label += " <small>(self-reported)</small>"
+			}
+			label += fmt.Sprintf(" <a href=\"%s\">evidence</a>", html.EscapeString(person.EvidenceURL))
+			people = append(people, label)
+		}
+		parts = append(parts, "<strong>Maintained by:</strong> "+strings.Join(people, ", "))
+	} else {
+		parts = append(parts, "<strong>Maintained by:</strong> <em>not yet verified</em>")
+	}
+	if owner, ownerURL := repositoryOwner(p); owner != "" {
+		parts = append(parts, fmt.Sprintf("<strong>Repository owner:</strong> <a href=\"%s\">@%s</a>", html.EscapeString(ownerURL), html.EscapeString(owner)))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, " · ")
+}
+
+func repositoryOwner(p projectdata.Project) (string, string) {
+	for _, source := range p.Sources {
+		forge, path, canonical, ok := projectdata.ForgeRepository(source.SourceURL)
+		if !ok {
+			continue
+		}
+		owner, ownerURL := source.RepositoryOwner, source.RepositoryOwnerURL
+		if owner == "" || ownerURL == "" {
+			parts := strings.Split(path, "/")
+			if len(parts) < 2 {
+				continue
+			}
+			parsed, err := url.Parse(canonical)
+			if err != nil {
+				continue
+			}
+			derivedOwner := strings.Join(parts[:len(parts)-1], "/")
+			if owner == "" {
+				owner = derivedOwner
+			}
+			if ownerURL == "" {
+				ownerURL = "https://" + parsed.Host + "/" + derivedOwner
+			}
+		}
+		if owner != "" && validOwnerURL(ownerURL, forge) {
+			return owner, ownerURL
+		}
+	}
+	return "", ""
+}
+
+func validOwnerURL(raw, forge string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "https" || u.User != nil {
+		return false
+	}
+	switch forge {
+	case "github":
+		return strings.EqualFold(u.Hostname(), "github.com")
+	case "gitlab":
+		return strings.EqualFold(u.Hostname(), "gitlab.com")
+	case "codeberg":
+		return strings.EqualFold(u.Hostname(), "codeberg.org")
+	default:
+		return false
+	}
+}
+func formatSources(s []projectdata.Source) string {
+	v := []string{}
+	for _, x := range s {
+		v = append(v, fmt.Sprintf("<a href=\"%s\">%s</a>", x.SourceURL, x.Source))
+	}
+	return strings.Join(v, " | ")
+}
+func value(p *string, fallback string) string {
+	if p == nil || *p == "" {
+		return fallback
+	}
+	return *p
+}
+func comma(n int) string {
+	s := strconv.Itoa(n)
+	sign := ""
+	if strings.HasPrefix(s, "-") {
+		sign = "-"
+		s = s[1:]
+	}
+	for i := len(s) - 3; i > 0; i -= 3 {
+		s = s[:i] + "," + s[i:]
+	}
+	return sign + s
+}
+func signedComma(n int) string {
+	if n > 0 {
+		return "+" + comma(n)
+	}
+	return comma(n)
+}
+
+var _ = json.Valid

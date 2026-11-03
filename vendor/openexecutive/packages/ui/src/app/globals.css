@@ -1,0 +1,268 @@
+@import "tailwindcss";
+@config "../../tailwind.config.ts";
+
+/* `dark:` follows the system, as Tailwind's default does, unless a host's
+ * frame set <html data-theme> (embedded mode): then that. */
+@custom-variant dark {
+  &:where([data-theme="dark"], [data-theme="dark"] *) {
+    @slot;
+  }
+  @media (prefers-color-scheme: dark) {
+    &:not(:where([data-theme="light"], [data-theme="light"] *)) {
+      @slot;
+    }
+  }
+}
+
+/* Design tokens. Values are space-separated RGB triplets so Tailwind's
+ * `<alpha-value>` interpolation can apply opacity modifiers like
+ * `bg-surface-overlay/60`. Dark is the default; light flips via
+ * prefers-color-scheme. */
+:root {
+  --surface-base: 9 9 11;          /* zinc-950 */
+  --surface-elevated: 17 17 19;
+  --surface-overlay: 24 24 27;     /* zinc-900 */
+  --surface-input: 39 39 42;       /* zinc-800 */
+  --surface-hover: 31 31 35;
+
+  --border-default: 39 39 42;
+  --border-strong: 63 63 70;
+  --border-subtle: 24 24 27;
+
+  --fg: 250 250 250;
+  --fg-muted: 161 161 170;
+  --fg-subtle: 113 113 122;
+  --fg-inverse: 24 24 27;
+
+  --accent: 129 140 248;
+  --accent-strong: 99 102 241;
+
+  --scrollbar-thumb: #3f3f46;
+  --scrollbar-thumb-hover: #52525b;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --surface-base: 250 250 250;
+    --surface-elevated: 255 255 255;
+    --surface-overlay: 244 244 245;
+    --surface-input: 228 228 231;
+    --surface-hover: 244 244 245;
+
+    --border-default: 228 228 231;
+    --border-strong: 161 161 170;
+    --border-subtle: 244 244 245;
+
+    --fg: 24 24 27;
+    --fg-muted: 82 82 91;
+    --fg-subtle: 113 113 122;
+    --fg-inverse: 250 250 250;
+
+    --accent: 79 70 229;
+    --accent-strong: 67 56 202;
+
+    --scrollbar-thumb: #d4d4d8;
+    --scrollbar-thumb-hover: #a1a1aa;
+  }
+}
+
+/* A host's frame (embedded mode, components/embed/EmbedProvider.tsx) says
+ * light or dark on <html data-theme>, whatever the system prefers; its own
+ * colours, when it sends them, are set inline on top.
+ *
+ * A `.consent` surface (a Yes asked inside a frame: FrameConfirm, the inline
+ * Approve) declares this app's own colours and face again on itself, so the
+ * host's colours and font never reach it: a host could otherwise draw the
+ * question white on white, or in a symbol font, while the browser still
+ * reports it seen (lib/seen.ts). The host's light or dark stays. */
+.consent,
+.consent * {
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+:root[data-theme="dark"],
+[data-theme="dark"] .consent {
+  --surface-base: 9 9 11;          /* zinc-950 */
+  --surface-elevated: 17 17 19;
+  --surface-overlay: 24 24 27;     /* zinc-900 */
+  --surface-input: 39 39 42;       /* zinc-800 */
+  --surface-hover: 31 31 35;
+
+  --border-default: 39 39 42;
+  --border-strong: 63 63 70;
+  --border-subtle: 24 24 27;
+
+  --fg: 250 250 250;
+  --fg-muted: 161 161 170;
+  --fg-subtle: 113 113 122;
+  --fg-inverse: 24 24 27;
+
+  --accent: 129 140 248;
+  --accent-strong: 99 102 241;
+
+  --scrollbar-thumb: #3f3f46;
+  --scrollbar-thumb-hover: #52525b;
+}
+
+:root[data-theme="light"],
+[data-theme="light"] .consent {
+  --surface-base: 250 250 250;
+  --surface-elevated: 255 255 255;
+  --surface-overlay: 244 244 245;
+  --surface-input: 228 228 231;
+  --surface-hover: 244 244 245;
+
+  --border-default: 228 228 231;
+  --border-strong: 161 161 170;
+  --border-subtle: 244 244 245;
+
+  --fg: 24 24 27;
+  --fg-muted: 82 82 91;
+  --fg-subtle: 113 113 122;
+  --fg-inverse: 250 250 250;
+
+  --accent: 79 70 229;
+  --accent-strong: 67 56 202;
+
+  --scrollbar-thumb: #d4d4d8;
+  --scrollbar-thumb-hover: #a1a1aa;
+}
+
+@layer base {
+  /* Brand: page and section headings in the display face (Bricolage
+   * Grotesque, loaded in app/layout.tsx). Small card titles (an h3, or an h2
+   * set at text-base or smaller) keep the body face, where the display face
+   * looks heavy. Chat answers and other Markdown (.prose) keep it too. */
+  :where(h1, h2):not(:where(.prose *, [class*="text-xs"], [class*="text-sm"], [class*="text-base"])) {
+    font-family: var(--font-display), var(--font-sans), system-ui, sans-serif;
+    letter-spacing: -0.015em;
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+
+  html, body {
+    height: 100%;
+    background-color: rgb(var(--surface-base));
+    color: rgb(var(--fg));
+    font-family: var(--font-sans), system-ui, -apple-system, "Segoe UI", sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  ::-webkit-scrollbar {
+    width: 4px;
+    height: 4px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--scrollbar-thumb);
+    border-radius: 2px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--scrollbar-thumb-hover);
+  }
+}
+
+@layer utilities {
+  .cursor-blink {
+    animation: blink 1s step-end infinite;
+  }
+
+  @keyframes blink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0; }
+  }
+}
+
+/* Consult: the Council mark while the Executive works on a reply (CouncilMark
+ * with `consulting`). A line reaches from the Executive to each specialist in
+ * turn and lights it up, then lets go; the loop starts again from the still
+ * mark. The base styles below are that still mark, so with reduced motion
+ * (animation: none) nothing is dimmed and no line shows. */
+.council-consult circle {
+  transform-box: fill-box;
+  transform-origin: center;
+}
+.council-consult .council-spoke {
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-dasharray: 14;
+  stroke-dashoffset: 14;
+  opacity: 0;
+  animation: council-spoke 3.6s ease-out infinite both;
+}
+.council-consult .council-seat {
+  animation: council-seat 3.6s ease-out infinite both;
+}
+.council-consult .council-core {
+  animation: council-core 3.6s ease-in-out infinite both;
+}
+@keyframes council-spoke {
+  0% { stroke-dashoffset: 14; opacity: 0.85; }
+  14%, 62% { stroke-dashoffset: 0; opacity: 0.85; }
+  80%, 100% { stroke-dashoffset: 0; opacity: 0; }
+}
+@keyframes council-seat {
+  0% { opacity: 0.45; transform: scale(1); }
+  8% { opacity: 1; transform: scale(1.28); }
+  20%, 62% { opacity: 1; transform: scale(1); }
+  80%, 100% { opacity: 0.45; transform: scale(1); }
+}
+@keyframes council-core {
+  0%, 100% { transform: scale(1); }
+  70% { transform: scale(1.14); }
+  78% { transform: scale(1); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .council-consult * {
+    animation: none !important;
+  }
+}
+
+/* Respect user motion preferences. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Phones. Many labels, badges and timestamps are sized 9 to 11px for dense
+ * desktop panels; on a phone screen that is too small to read, so the floor
+ * is 12px there. Form fields go to 16px, the size below which iOS Safari
+ * zooms the page in whenever one is tapped. Markdown tables scroll sideways
+ * inside their own box instead of pushing the page wider than the screen.
+ * Unlayered on purpose, so these win over Tailwind's utility layer. */
+@media (max-width: 639.98px) {
+  .text-\[9px\],
+  .text-\[10px\],
+  .text-\[11px\] {
+    font-size: 12px;
+  }
+
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+  textarea,
+  select {
+    font-size: 16px;
+  }
+
+  .prose table {
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
+  }
+}
+
+/* Words found in an opened chat (components/Chat.tsx, CSS Custom Highlight API). */
+::highlight(chat-find) {
+  background-color: rgb(99 102 241 / 0.35);
+  color: inherit;
+}

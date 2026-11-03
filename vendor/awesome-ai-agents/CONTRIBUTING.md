@@ -1,0 +1,67 @@
+# Contributing
+
+Thanks for helping people discover useful open-source AI agent projects. Projects are eligible only when a public repository on GitHub, GitLab.com, or Codeberg can be verified and its default branch has at least one substantive, non-automated commit within the six months before review. No particular license or minimum star count is required. Hosted products without their own qualifying repository are not eligible.
+
+## Recommend a project
+
+Open a [project submission issue](https://github.com/slavakurilyak/awesome-ai-agents/issues/new?template=project-submission.yml). Issues are the preferred path for founders because they let the maintainer review the project before changing the dataset. Include:
+
+- Project name and a concise description of what it does.
+- The direct URL of the project's public repository on GitHub, GitLab.com, or Codeberg. A website, organization profile, integration, or client library alone does not qualify.
+- Evidence that the repository's default branch has received a substantive, non-automated commit within the last six months. Maintainers verify this from commit history; repository profile updates, stars, and bot-only dependency or metadata changes do not count.
+- How people use or interact with it, and what agent behavior it provides.
+- Suggested existing category or categories, if known.
+- A clear note when the project is new or has little usage history; stars are not an eligibility requirement.
+
+The optional [Awesome AI Agents Curation skill](skills/awesome-ai-agents-curation/SKILL.md) helps founders prepare evidence-backed submissions and helps maintainers review issues and pull requests. It does not approve or publish entries.
+
+## Submit a pull request
+
+Pull requests are welcome for direct edits. `awesome-agents.json` is the canonical project dataset. Edit that file directly; do not use a separate YAML project list. Keep the existing JSON structure and add a project object with:
+
+```json
+{
+  "id": "project-name-a1b2c3d4",
+  "project": "Project name",
+  "project_description": "A concise, evidence-backed description of the agent and its useful behavior.",
+  "has_public_repository": true,
+  "categories": ["AI Agents"],
+  "sources": [
+    {
+      "source": "github",
+      "source_url": "https://github.com/example/project",
+      "repository_status": "active",
+      "repository_checked_at": "<set by forge verifier>",
+      "stars_last_updated": null
+    }
+  ]
+}
+```
+
+Use an existing category from `awesome-categories.yaml`. Describe observable capabilities accurately; do not infer features from marketing claims alone. The `has_public_repository` value is derived from a successful forge metadata check, not from the contributor's assertion. For a single-project change, run these targeted commands from the repository root before opening a pull request, replacing the placeholder with the exact `project` value:
+
+```sh
+go run ./cmd/contributions assign-ids
+go run ./cmd/verify-forge-repositories --project "Project name"
+go run ./cmd/validate-data --project "Project name"
+go run ./cmd/contributions record-direct-pr --project "Project name" --pr <pull-request-number>
+go run ./cmd/contributions validate --project "Project name"
+go run ./cmd/contributions validate
+go run ./cmd/generate-readme
+```
+
+Only the named project's forge metadata is checked live; the validator also checks the catalog's local structure. These commands do not make live forge requests for unrelated projects. Only public repositories qualify, and no license field or license allowlist is used. GitHub, GitLab.com, and Codeberg are supported. A check failure or inaccessible repository is unverified and does not qualify. Keep star counts and repository health metadata to the existing automated workflow. To run a full-catalog audit, explicitly pass `--all` to either forge command; full-catalog live checks are not part of routine per-PR validation.
+
+Maintainers make the final inclusion and categorization decision after reviewing fit, evidence, duplicates, and presentation. A submission or skill recommendation is not a promise of acceptance, placement, audience reach, or project growth.
+
+## Contribution credit
+
+Every new listing needs a `submitted_by` record in `contributions.json` before merge. For a direct-addition PR with no earlier issue or PR submission, the PR author is the submitter. The maintainer records that credit from GitHub's PR author metadata; contributors do not need to type or guess their own GitHub username or numeric account ID. From a checkout containing the project, run `go run ./cmd/contributions record-direct-pr --project "Project name" --pr <pull-request-number>`; this fetches the open PR's author and account ID and records the PR as both submission and acceptance evidence. Then run `go run ./cmd/contributions validate --project "Project name"`. Do not use this command for a follow-up catalog PR when an earlier issue or PR is the original submission: credit that original submitter instead, using the reviewed backfill/import workflow. A direct addition PR must not be merged while its submitter is missing.
+
+Every listing shows **Submitted by** and **Maintained by**. Where a role has not yet been established, the README says so explicitly; that does not mean the project has no submitter or maintainer. Founder/team relationships reported by the submitter are labeled self-reported. Maintainer credit needs an explicit claim in a public project source, such as a maintainer roster or direct maintainer statement; claims without independent evidence are labeled self-reported. Repository ownership is read from verified forge metadata when available and does not establish maintainer status. Keep project IDs unchanged when project names or repository owners change. Historical candidates come from `go run ./cmd/contributions backfill`; review them before editing `contributions.json`.
+
+## Maintainer review
+
+For an individual submission, run `go run ./cmd/verify-forge-repositories --project "Project name"` and `go run ./cmd/validate-data --project "Project name"`; do not make live checks for unrelated catalog entries. Require a successful public-repository result on GitHub, GitLab.com, or Codeberg. No specific license is required. Check the repository's default-branch commit history and require at least one substantive, non-automated commit dated within the six months before review. Do not rely on the forge profile's `updated_at` timestamp, stars, or bot-only dependency/metadata changes. If the submission has no direct qualifying repository, the forge check fails, the repository is private or inaccessible, or the activity window is exceeded, it does not meet the contribution rules and may be closed. Then review project behavior, category fit, duplicates, and presentation. Run full-catalog live audits only when specifically requested, using `--all`.
+
+The list is curated to help readers discover projects. Listings provide an opportunity for discovery, not a guaranteed outcome. For consulting on building or deploying AI agents, see [Hire Me](https://cal.com/slavakurilyak/discovery-call).

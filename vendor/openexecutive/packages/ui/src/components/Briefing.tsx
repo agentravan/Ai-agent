@@ -1,0 +1,1200 @@
+"use client";
+
+import Link from "next/link";
+import { useCallback, useEffect, useRef, useState } from "react";
+
+import {
+  ackAlert,
+  approveAlert,
+  approveDecision,
+  bulkAckAlerts,
+  dismissTodayPoint,
+  getDelegation,
+  getToday,
+  markTodaySeen,
+  rejectDecision,
+  reopenAlert,
+  rerunWorkflowRun,
+  reviewAlerts,
+  snoozeAlert,
+  type ProposalItem,
+  type Today,
+} from "@/lib/api";
+import type { AlertApproval } from "@/lib/approvals";
+import { briefingSummary, greeting, type SummaryPart } from "@/lib/briefingSummary";
+import { FIRST_RUN_LINKS } from "@/lib/firstRun";
+import { principalIdOf } from "@/lib/dueSoon";
+import { goalTotals, realDepartments } from "@/lib/glance";
+import { groupHandled } from "@/lib/handled";
+import {
+  BRIEFING_REFRESH_INTERVAL_MS,
+  narrativeRepollDelay,
+  narrativeUpdatedLabel,
+  shouldRefreshOnFocus,
+} from "@/lib/narrativeFreshness";
+import { checkedLabel, seenBaseline, type TimedPoint } from "@/lib/rightNow";
+import { reviewRanLabel } from "@/lib/rhythmCards";
+import type { SnoozeChoice } from "@/lib/snooze";
+import InfoTip from "./InfoTip";
+import HeldBack from "./briefing/HeldBack";
+import { ACTION_CARDS_TIP, ActionCardItem, useActionCards } from "./ActionCards";
+import { INVITE_CARDS_TIP, InviteCardItem, useInviteCards } from "./InviteCards";
+import { REPLIES_WAITING_TIP, ReplyCardItem, useReplyCards } from "./RepliesWaiting";
+import Icon from "./Icon";
+import {
+  HandledPanelBody,
+  InFlightPanelBody,
+  MonitoringPanelBody,
+  PracticeClientsPanelBody,
+  inFlightNext,
+} from "./briefing/AwarenessPanels";
+import ApprovedRow from "./briefing/ApprovedRow";
+import FirstWeekCard from "./briefing/FirstWeekCard";
+import { useGlance } from "./briefing/Glance";
+import { RightNowBody, RightNowCard } from "./briefing/RightNow";
+import { isHeldAction } from "./briefing/HeldActionCard";
+import { isLeadTraining } from "./briefing/LeadTrainingCard";
+import ProposalCard from "./briefing/ProposalCard";
+import {
+  NEEDS_YOU_DISMISS_OLDER_THAN_DAYS,
+  TONE_TEXT,
+  olderThan,
+  type ContinueHandler,
+} from "./briefing/shared";
+import {
+  DueSoonPanelBody,
+  ProjectsPanelBody,
+  TopThreeList,
+  WeeklyReviewPanelBody,
+  useActiveProjects,
+  useOpenLoops,
+  useWeeklyReview,
+} from "./briefing/SoloPanels";
+import { DepartmentsPanelBody, PeoplePanelBody, peopleSummary } from "./briefing/TeamPanels";
+import { buttonClass } from "./ui/Button";
+import OverflowMenu from "./ui/OverflowMenu";
+import SidePanel from "./ui/SidePanel";
+import { useWorkspace } from "./workspace/WorkspaceContext";
+
+// The card pieces stay importable from here for pages that show them alone.
+export { ProposalCard };
+export { DeptCard } from "./briefing/TeamPanels";
+
+// Home, the briefing: a greeting and one summary line, the Ask box, the
+// "Needs you" queue as large cards, then "At a glance": a row of count tiles —
+// one per section with something in it — each opening its full list in a
+// side panel or its page. Today's written brief ("What's going on") opens in a panel too.
+
+// "Needs you" shows this many cards before a "Show N more" toggle.
+const NEEDS_YOU_VISIBLE = 3;
+
+const NEEDS_YOU_ID = "sec-needs-you";
+
+type PanelKey =
+  | "brief"
+  | "departments"
+  | "people"
+  | "inFlight"
+  | "handled"
+  | "monitoring"
+  | "team"
+  | "clients"
+  | "projects"
+  | "dueSoon"
+  | "weeklyReview";
+
+interface Tile {
+  key: string;
+  // A tile opens its side panel, or else goes to its page.
+  panel?: PanelKey;
+  href?: string;
+  // The small heading over the number.
+  kicker: string;
+  value: string;
+  label: string;
+  sub: string;
+  subTone?: keyof typeof TONE_TEXT;
+}
+
+interface ApprovalRow {
+  approval: AlertApproval;
+  headline: string;
+}
+
+interface BriefingProps {
+  // Called when the user clicks a briefing item to continue the thread
+  // in chat. The parent (the root page) switches its main view from
+  // briefing → chat and seeds the input with `prompt`. When omitted, items
+  // render as plain navigation links.
+  onContinue?: ContinueHandler;
+  // Set to true when this Briefing is the root landing surface — adds the
+  // greeting header.
+  showHeader?: boolean;
+  // Personalises the greeting when showHeader is true.
+  firstName?: string;
+  // Home's one banner slot: the most important notice the page has (paused,
+  // no profile, a brief that wasn't sent). When empty, the quiet-day note
+  // takes the slot.
+  banner?: React.ReactNode;
+}
+
+export default function Briefing({ onContinue, showHeader = false, firstName, banner }: BriefingProps) {
+  // Solo (one person, just for themselves): no departments, roster or
+  // cross-team lanes — see the `solo` branches below.
+  const { mode } = useWorkspace();
+  const solo = mode === "solo";
+  const [today, setToday] = useState<Today | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  // Alerts the user has acted on this session. We optimistically drop
+  // them from the rendered lists so the click feels instant; the canonical
+  // state is picked up by the next /today fetch.
+  const [actedAlertIds, setActedAlertIds] = useState<Set<number>>(new Set());
+  // "Needs you" shows NEEDS_YOU_VISIBLE cards; the rest sit behind one toggle.
+  const [showAllNeedsYou, setShowAllNeedsYou] = useState(false);
+  // "Re-check relevance" runs the Executive's review on demand.
+  const [recheckBusy, setRecheckBusy] = useState(false);
+  // The card just snoozed, for the "Snoozed until …" notice and its Undo.
+  const [snoozed, setSnoozed] = useState<{ alertId: number; short: string } | null>(null);
+  // Handled-rail rows undone this session (keyed per row, see handledKey).
+  const [undoneRows, setUndoneRows] = useState<Set<string>>(new Set());
+  // Which tile's side panel (or the brief) is open.
+  const [openPanel, setOpenPanel] = useState<PanelKey | null>(null);
+  const [askText, setAskText] = useState("");
+  // Cards approved on this page whose work runs on the server, newest first,
+  // one row per card (a retry replaces its row).
+  const [approvalRows, setApprovalRows] = useState<ApprovalRow[]>([]);
+  const trackApproval = useCallback((approval: AlertApproval, headline: string) => {
+    setApprovalRows((rows) => [
+      { approval, headline },
+      ...rows.filter((r) => r.approval.alert_id !== approval.alert_id),
+    ]);
+  }, []);
+
+  // Re-pull /today after a server-side mutation (e.g. a decision approve/reject)
+  // so derived data — the narrative, per-person and department counts —
+  // re-syncs. The optimistic actedAlertIds set already hides the card; this
+  // refreshes everything computed from it. Best-effort: a failed refresh leaves
+  // the stale-but-still-usable view rather than erroring the briefing.
+  const [mountedAt] = useState(() => Date.now());
+  const lastFetchRef = useRef(mountedAt);
+  const refreshToday = useCallback(() => {
+    lastFetchRef.current = Date.now();
+    getToday().then(setToday).catch(() => { /* keep current view on failure */ });
+  }, []);
+
+  // Keep "What's going on" current. /today serves the cached header and
+  // rewrites it in the background when the picture moved (narrative_stale);
+  // re-poll a few times so the new one lands without a reload.
+  // Keyed on the whole response: a poll that comes back still stale is a new
+  // object with the same fields, and must schedule the next attempt.
+  const repollAttemptRef = useRef(0);
+  useEffect(() => {
+    if (!today?.narrative_stale) {
+      repollAttemptRef.current = 0;
+      return;
+    }
+    const delay = narrativeRepollDelay(repollAttemptRef.current);
+    if (delay === null) return;
+    const timer = setTimeout(() => {
+      repollAttemptRef.current += 1;
+      refreshToday();
+    }, delay);
+    return () => clearTimeout(timer);
+  }, [today, refreshToday]);
+
+  // …and when the tab comes back, and every few minutes while it is open.
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState === "visible" && shouldRefreshOnFocus(lastFetchRef.current, Date.now())) {
+        repollAttemptRef.current = 0;
+        refreshToday();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    const interval = setInterval(() => {
+      if (document.visibilityState === "visible") refreshToday();
+    }, BRIEFING_REFRESH_INTERVAL_MS);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible);
+      clearInterval(interval);
+    };
+  }, [refreshToday]);
+
+  // Approve carries the card out on the server. Decision-backed cards
+  // (gated calendar bookings, held actions) go through /decisions, which
+  // books or sends and clears the companion alert. Every other proposal goes
+  // through /alerts/{id}/approve, which records who approved it, then queues
+  // the action it held or runs the work as a chat on the server; a row in
+  // Needs you follows that work until it is done.
+  const handleApprove = useCallback(async (proposal: ProposalItem) => {
+    const prev = actedAlertIds;
+    setActedAlertIds(new Set(prev).add(proposal.alert_id));
+    try {
+      if (proposal.decision_instance_id != null) {
+        await approveDecision(proposal.decision_instance_id);
+        refreshToday();  // re-sync narrative + counts (no chat nav to trigger it)
+        return;
+      }
+      const approval = await approveAlert(proposal.alert_id);
+      trackApproval(approval, proposal.headline);
+      refreshToday();
+    } catch (e) {
+      // Revert the optimistic removal on failure so the user can retry.
+      setActedAlertIds(prev);
+      console.error("Approve failed", e);
+    }
+  }, [actedAlertIds, refreshToday, trackApproval]);
+
+  // Dismiss is a record-and-forget decision: the card disappears
+  // immediately, the backend marks the alert ``dismissed`` (so the
+  // Executive stops re-surfacing the same thread), and the user stays on
+  // the briefing — no chat turn is seeded. On failure we revert the
+  // optimistic removal so the user can see the card came back and retry.
+  const handleDismiss = useCallback(async (proposal: ProposalItem) => {
+    const prev = actedAlertIds;
+    setActedAlertIds(new Set(prev).add(proposal.alert_id));
+    try {
+      // A roster request, a Take the lead training card or a held chat
+      // action was already answered on its own card (which also clears the
+      // companion alert): only hide it and re-sync.
+      if (proposal.roster_request || isLeadTraining(proposal) || isHeldAction(proposal)) {
+        refreshToday();
+        return;
+      }
+      // Decision-backed cards reject server-side (which also clears the
+      // companion alert); ordinary alerts just get acked "dismissed".
+      if (proposal.decision_instance_id != null) {
+        await rejectDecision(proposal.decision_instance_id);
+        refreshToday();  // re-sync narrative + counts (no chat nav to trigger it)
+        return;
+      }
+      await ackAlert(proposal.alert_id, "dismissed");
+    } catch (e) {
+      setActedAlertIds(prev);
+      console.error("Dismiss failed", e);
+    }
+  }, [actedAlertIds, refreshToday]);
+
+  // Snooze: the card leaves now and the server brings it back at `until`.
+  // Undo clears the snooze and shows the card again.
+  const handleSnooze = useCallback(async (proposal: ProposalItem, choice: SnoozeChoice) => {
+    const prev = actedAlertIds;
+    setActedAlertIds(new Set(prev).add(proposal.alert_id));
+    try {
+      await snoozeAlert(proposal.alert_id, choice.until);
+      setSnoozed({ alertId: proposal.alert_id, short: choice.short });
+    } catch (e) {
+      setActedAlertIds(prev);
+      console.error("Snooze failed", e);
+    }
+  }, [actedAlertIds]);
+
+  const handleUnsnooze = useCallback(async () => {
+    if (!snoozed) return;
+    try {
+      await snoozeAlert(snoozed.alertId, null);
+      setActedAlertIds((prev) => {
+        const next = new Set(prev);
+        next.delete(snoozed.alertId);
+        return next;
+      });
+      setSnoozed(null);
+      refreshToday();
+    } catch (e) {
+      console.error("Undo snooze failed", e);
+    }
+  }, [snoozed, refreshToday]);
+
+  // Run again on a failed scheduled run: the server queues it and closes the
+  // card, so the card leaves at once and comes back only if it fails again.
+  const [rerunNotice, setRerunNotice] = useState<string | null>(null);
+  const handleRerun = useCallback(async (proposal: ProposalItem) => {
+    if (!proposal.failed_run_id) return;
+    const prev = actedAlertIds;
+    setActedAlertIds(new Set(prev).add(proposal.alert_id));
+    try {
+      await rerunWorkflowRun(proposal.failed_run_id);
+      setRerunNotice("Running it again now. The result goes where it normally would.");
+      refreshToday();
+    } catch (e) {
+      setActedAlertIds(prev);
+      setRerunNotice(e instanceof Error ? e.message : "Couldn't run it again.");
+    }
+  }, [actedAlertIds, refreshToday]);
+
+  // Bulk dismiss: sends explicit ids (the cards the caller can see), never a
+  // server-side age sweep. Same optimistic-removal + rollback pattern as the
+  // single-card handlers.
+  const handleBulkDismiss = useCallback(async (ids: number[]) => {
+    if (ids.length === 0) return;
+    const prev = actedAlertIds;
+    const next = new Set(prev);
+    ids.forEach((id) => next.add(id));
+    setActedAlertIds(next);
+    try {
+      await bulkAckAlerts({ status: "dismissed", alert_ids: ids });
+      refreshToday();
+    } catch (e) {
+      setActedAlertIds(prev);
+      console.error("Bulk dismiss failed", e);
+    }
+  }, [actedAlertIds, refreshToday]);
+
+  // Re-check relevance: ask the Executive to review every open alert now
+  // (route / escalate / draft / merge / resolve within authority), then
+  // re-pull /today so the verdicts, chips and "handled" rail refresh.
+  const handleRecheck = useCallback(async () => {
+    setRecheckBusy(true);
+    try {
+      await reviewAlerts();
+      refreshToday();
+    } catch (e) {
+      console.error("Alert review failed", e);
+    } finally {
+      setRecheckBusy(false);
+    }
+  }, [refreshToday]);
+
+  // Undo an autonomous close from the Handled panel. The rail is rebuilt
+  // from the audit log on every fetch (the "closed" row persists after a
+  // reopen), so a 409 "already open" after a reload counts as done.
+  const handleReopen = useCallback(async (rowKey: string, alertId: number) => {
+    try {
+      await reopenAlert(alertId);
+      setUndoneRows((prev) => new Set(prev).add(rowKey));
+      refreshToday();
+    } catch (e) {
+      if (e instanceof Error && /409|already/i.test(e.message)) {
+        setUndoneRows((prev) => new Set(prev).add(rowKey));
+        return;
+      }
+      console.error("Reopen failed", e);
+    }
+  }, [refreshToday]);
+
+  // Approve-with-edits: the user tweaked the draft and wants exactly what
+  // they wrote sent (no rephrasing). Same server-side approval as Approve,
+  // with the edited text carried verbatim.
+  const handleApproveWithEdits = useCallback(async (proposal: ProposalItem, editedBody: string) => {
+    const prev = actedAlertIds;
+    setActedAlertIds(new Set(prev).add(proposal.alert_id));
+    try {
+      const approval = await approveAlert(proposal.alert_id, editedBody);
+      trackApproval(approval, proposal.headline);
+      refreshToday();
+    } catch (e) {
+      setActedAlertIds(prev);
+      console.error("Approve-with-edits failed", e);
+    }
+  }, [actedAlertIds, refreshToday, trackApproval]);
+
+  // Try again on an approval that didn't work: the server lets a card whose
+  // last approval failed be approved again, with the same edits.
+  const handleRetryApproval = useCallback(async (row: ApprovalRow) => {
+    try {
+      const approval = await approveAlert(row.approval.alert_id, row.approval.edited_body ?? undefined);
+      trackApproval(approval, row.headline);
+    } catch (e) {
+      console.error("Retry approval failed", e);
+    }
+  }, [trackApproval]);
+
+  useEffect(() => {
+    let cancelled = false;
+    getToday()
+      .then((t) => { if (!cancelled) setToday(t); })
+      .catch((e) => { if (!cancelled) setError(e instanceof Error ? e.message : "Failed to load"); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, []);
+
+  // Replies the Executive drafted in the owner's own mailbox (Act as me):
+  // cards in Needs you. Empty for everyone else.
+  const replies = useReplyCards();
+  // Actions it suggested from the caller's email, to approve (Act as me).
+  const actionCards = useActionCards();
+  // Meeting invites from people the caller knows, to accept or decline (Act as me).
+  const inviteCards = useInviteCards();
+  // Solo's own sections load on their own, so their tiles can count them.
+  const principalId = solo ? principalIdOf(today?.people ?? []) : null;
+  const projects = useActiveProjects(solo);
+  // Due soon is the caller's own (the owner's, in solo).
+  const loopOwnerId = solo ? principalId : (today?.caller_person_id ?? null);
+  const openLoops = useOpenLoops(loopOwnerId);
+  const glance = useGlance(today !== null);
+  const weeklyReview = useWeeklyReview(solo);
+
+  // Hand an Ask-box question to chat as the user's own words.
+  const submitAsk = () => {
+    const text = askText.trim();
+    if (!text || !onContinue) return;
+    onContinue(text);
+  };
+
+  // Jump from the Handled panel to the alert's card; when it is folded
+  // behind "Show more" open the queue first, and land on the queue when the
+  // card isn't on the page at all.
+  const jumpToAlert = (alertId: number) => {
+    setOpenPanel(null);
+    setShowAllNeedsYou(true);
+    setTimeout(() => {
+      const target = document.getElementById(`alert-${alertId}`) ?? document.getElementById(NEEDS_YOU_ID);
+      target?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }, 120);
+  };
+
+  // What Right now's points open: the email (and its reply card, shared
+  // with Needs you) or the card in Needs you.
+  // ✕ on a point clears it at once; the server keeps it out for the day.
+  const onDismissPoint = useCallback((point: TimedPoint) => {
+    setToday((t) => t && { ...t, narrative_points: (t.narrative_points ?? []).filter((p) => p.text !== point.text) });
+    dismissTodayPoint(point.text)
+      .then((kept) => {
+        if (!kept) return getToday().then(setToday);
+      })
+      .catch((e) => console.error("Dismissing a Right now point failed", e));
+  }, []);
+  const rightNowActions = { replies, onShowAlert: jumpToAlert, onContinue, onDismiss: onDismissPoint };
+
+  const dateLabel = new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" });
+
+  const departments = today?.departments ?? [];
+  const activeDepts = departments.filter((d) => d.goal_count > 0 || d.awaiting_count > 0);
+  // Only the departments with a problem (at risk / off track / awaiting)
+  // count as needing attention; healthy ones fold into a quiet toggle in
+  // the panel.
+  const attentionDepts = activeDepts.filter(
+    (d) => d.at_risk_count > 0 || d.off_track_count > 0 || d.awaiting_count > 0,
+  );
+  // The Departments tile counts only real departments, not the row that holds
+  // the goals with no department.
+  const activeRealDepts = realDepartments(activeDepts);
+  const attentionRealDepts = realDepartments(attentionDepts);
+  const goals = goalTotals(departments);
+
+  const isQuiet =
+    today !== null &&
+    today.proposals.length === 0 &&
+    replies.cards.length === 0 &&
+    actionCards.cards.length === 0 &&
+    inviteCards.cards.length === 0 &&
+    activeDepts.every((d) => d.at_risk_count === 0 && d.off_track_count === 0 && d.awaiting_count === 0) &&
+    today.people.every((p) => p.awaiting_count === 0);
+
+  const showPeople = !solo && (today?.people.length ?? 0) > 1;
+
+  // Bucket proposals once so the summary line, the queue and the tiles work
+  // off the same split. "Needs you" = action proposals routed to the caller,
+  // plus unrouted catch-all items when the caller is the principal. When the
+  // caller can't be resolved (caller_person_id null — e.g. a direct curl),
+  // fall back to the legacy single bucket so the queue still renders.
+  // Optimistically-acted alerts are dropped first so counts reflect the click.
+  const callerId = today?.caller_person_id ?? null;
+  const isPrincipalCaller =
+    callerId == null ? false : today?.people.find((p) => p.id === callerId)?.is_principal ?? false;
+  const liveProposals = (today?.proposals ?? []).filter((p) => !actedAlertIds.has(p.alert_id));
+  const monitoringProposals = liveProposals.filter((p) => p.category === "monitoring");
+  const actionProposals = liveProposals.filter((p) => p.category !== "monitoring");
+  // Solo: everything is yours, so nothing goes to an "Across the team" lane.
+  const mineProposals =
+    callerId == null || solo
+      ? actionProposals
+      : actionProposals.filter(
+          (p) => p.routed_to_person_id === callerId || (p.routed_to_person_id == null && isPrincipalCaller),
+        );
+  const mineIds = new Set(mineProposals.map((p) => p.alert_id));
+  const otherProposals =
+    callerId == null || solo ? [] : actionProposals.filter((p) => !mineIds.has(p.alert_id));
+  // A roster request is answered on its card, never swept (the server skips
+  // it too), so it is not counted here.
+  const staleNeedsYouIds = olderThan(
+    mineProposals.filter((p) => !p.roster_request),
+    NEEDS_YOU_DISMISS_OLDER_THAN_DAYS,
+  );
+  const handledOvernight = today?.handled_overnight ?? [];
+  const handledRows = groupHandled(handledOvernight);
+  const inFlight = today?.in_flight ?? [];
+  const practiceClients = today?.practice_clients ?? [];
+
+  // Summary-line inputs. Solo has no Departments or People tiles, so it says
+  // how many goals need attention instead, linking to /goals. A team counts
+  // its departments at risk, and the goals with no department on their own.
+  const deptAtRiskCount = solo
+    ? 0
+    : attentionRealDepts.filter((d) => d.at_risk_count > 0 || d.off_track_count > 0).length;
+  const peopleNeedReply = solo ? 0 : (today?.people ?? []).filter((p) => p.status === "needs_reply").length;
+  const peopleOverdue = solo ? 0 : (today?.people ?? []).filter((p) => p.overdue).length;
+  const goalsAtRisk = solo
+    ? goals.atRisk
+    : goalTotals(departments.filter((d) => d.slug === "")).atRisk;
+  // The top three words a commitment as the owner's ("you").
+  const principalName =
+    (principalId != null && today?.people.find((p) => p.id === principalId)?.full_name) || "";
+  const needsYouCount =
+    mineProposals.length + replies.cards.length + inviteCards.cards.length + actionCards.cards.length;
+  const summary: SummaryPart[] = today
+    ? briefingSummary({
+        needsYou: needsYouCount,
+        handledOvernight: handledRows.length,
+        peopleOverdue,
+        peopleNeedReply,
+        deptAtRisk: deptAtRiskCount,
+        goalsAtRisk,
+        inFlight: inFlight.length,
+        monitoring: monitoringProposals.length,
+      })
+    : [];
+
+  // At a glance — only the tiles with something to show, what's yours first.
+  const tiles: Tile[] = [];
+  if (today) {
+    if (glance.actAsMe)
+      tiles.push({
+        key: "actAsMe",
+        href: "/settings/act-as-me",
+        kicker: "Act as me",
+        value: String(glance.actAsMe),
+        label: "handled for you",
+        sub: "this week",
+        subTone: "emerald",
+      });
+    const view = openLoops.view;
+    if (loopOwnerId != null && (openLoops.error || (view && (view.items.length > 0 || view.later > 0)))) {
+      const overdue = view?.items.filter((i) => i.overdue).length ?? 0;
+      tiles.push({
+        key: "dueSoon",
+        panel: "dueSoon",
+        kicker: "Due soon",
+        value: String(view?.items.length ?? "–"),
+        label: "open loops",
+        sub: overdue > 0 ? `${overdue} overdue` : view && view.items.length > 0 ? "this week" : `${view?.later ?? 0} later`,
+        subTone: overdue > 0 ? "amber" : undefined,
+      });
+    }
+    if (goals.goals > 0)
+      tiles.push({
+        key: "goals",
+        href: "/goals",
+        kicker: "Goals",
+        value: String(goals.goals),
+        label: goals.goals === 1 ? "goal" : "goals",
+        sub: goals.atRisk > 0 ? `${goals.atRisk} at risk` : "on track",
+        subTone: goals.atRisk > 0 ? "amber" : "emerald",
+      });
+    if (glance.workflows && glance.workflows.scheduled > 0) {
+      const runs = glance.workflows.runsThisWeek;
+      tiles.push({
+        key: "workflows",
+        href: "/jobs",
+        kicker: "Workflows",
+        value: String(glance.workflows.scheduled),
+        label: "on a schedule",
+        sub: runs > 0 ? `${runs} ${runs === 1 ? "run" : "runs"} this week` : "no runs yet this week",
+      });
+    }
+    // Watching: what's on the watchlist, with the signals waiting to be read.
+    const signals = monitoringProposals.length;
+    if ((glance.watching && glance.watching.watched > 0) || signals > 0) {
+      const fired = glance.watching?.firedThisWeek ?? 0;
+      tiles.push({
+        key: "watching",
+        ...(signals > 0 ? { panel: "monitoring" as const } : { href: "/watchlist" }),
+        kicker: "Watching",
+        value: String(glance.watching?.watched || signals),
+        label: glance.watching?.watched ? "things" : signals === 1 ? "signal" : "signals",
+        sub:
+          signals > 0
+            ? `${signals} new ${signals === 1 ? "signal" : "signals"}`
+            : fired > 0
+              ? `${fired} spoke up this week`
+              : "quiet",
+        subTone: signals > 0 ? "amber" : undefined,
+      });
+    }
+    if (handledRows.length > 0)
+      tiles.push({
+        key: "handled",
+        panel: "handled",
+        kicker: "Handled",
+        value: String(handledRows.length),
+        label: "by the Executive",
+        sub: "since your last brief",
+        subTone: "emerald",
+      });
+    if (solo) {
+      if (projects.error || (projects.projects && projects.projects.length > 0)) {
+        tiles.push({
+          key: "projects",
+          panel: "projects",
+          kicker: "Your projects",
+          value: String(projects.projects?.length ?? "–"),
+          label: "active",
+          sub: "",
+        });
+      }
+      if (weeklyReview) {
+        tiles.push({
+          key: "weeklyReview",
+          panel: "weeklyReview",
+          kicker: "This week's review",
+          value: "Ready",
+          label: "next week's top three",
+          sub: reviewRanLabel(weeklyReview.completed_at) || weeklyReview.period || "",
+        });
+      }
+    } else {
+      // Only once departments are set up: the goals with no department are on
+      // the Goals tile.
+      if (activeRealDepts.length > 0)
+        tiles.push({
+          key: "departments",
+          panel: "departments",
+          kicker: "Departments",
+          value: String(attentionRealDepts.length > 0 ? attentionRealDepts.length : activeRealDepts.length),
+          label: "departments",
+          sub:
+            attentionRealDepts.length > 0 ? (deptAtRiskCount > 0 ? "at risk" : "need attention") : "on track",
+          subTone: attentionRealDepts.length > 0 ? "amber" : "emerald",
+        });
+      if (showPeople && today) {
+        const people = today.people;
+        const busy = people.filter((p) => p.status === "needs_reply" || p.status === "awaiting").length;
+        const s = peopleSummary(people);
+        tiles.push({
+          key: "people",
+          panel: "people",
+          kicker: "People",
+          value: String(busy > 0 ? busy : people.length),
+          label: busy > 0 ? "to follow up" : "people",
+          sub: busy > 0 ? s.text : "all clear",
+          subTone: s.hasOverdue ? "rose" : busy > 0 ? "amber" : "emerald",
+        });
+      }
+    }
+    if (otherProposals.length > 0)
+      tiles.push({
+        key: "team",
+        panel: "team",
+        kicker: "Across the team",
+        value: String(otherProposals.length),
+        label: "with teammates",
+        sub: "waiting on someone else",
+      });
+    if (inFlight.length > 0)
+      tiles.push({
+        key: "inFlight",
+        panel: "inFlight",
+        kicker: "Under way",
+        value: String(inFlight.length),
+        label: "in progress",
+        sub: inFlightNext(inFlight),
+        subTone: inFlight.some((f) => f.overdue) ? "amber" : undefined,
+      });
+    if (practiceClients.length > 0)
+      tiles.push({
+        key: "clients",
+        panel: "clients",
+        kicker: "Across your clients",
+        value: String(practiceClients.length),
+        label: "parked clients",
+        sub: "",
+      });
+  }
+
+  // The Needs you queue: replies waiting first (they came in first, as their
+  // own section did), then the proposals in score order.
+  type QueueItem = { key: string; render: (emphasized: boolean) => React.ReactNode };
+  const queue: QueueItem[] = [
+    ...replies.cards.map((card) => ({
+      key: `reply-${card.decision_id}`,
+      render: (emphasized: boolean) => (
+        <ReplyCardItem
+          card={card}
+          onGone={replies.gone}
+          onRefresh={replies.refresh}
+          onChanged={replies.replace}
+          emphasized={emphasized}
+        />
+      ),
+    })),
+    ...inviteCards.cards.map((card) => ({
+      key: `invite-${card.decision_id}`,
+      render: (emphasized: boolean) => (
+        <InviteCardItem card={card} onGone={inviteCards.gone} emphasized={emphasized} />
+      ),
+    })),
+    ...actionCards.cards.map((card) => ({
+      key: `actions-${card.decision_id}`,
+      render: (emphasized: boolean) => (
+        <ActionCardItem card={card} onGone={actionCards.gone} emphasized={emphasized} />
+      ),
+    })),
+    ...mineProposals.map((p) => ({
+      key: `alert-${p.alert_id}`,
+      render: (emphasized: boolean) => (
+        <ProposalCard
+          proposal={p}
+          people={today?.people ?? []}
+          onContinue={onContinue}
+          onApprove={handleApprove}
+          onDismiss={handleDismiss}
+          onSnooze={handleSnooze}
+          onRerun={handleRerun}
+          onApproveWithEdits={handleApproveWithEdits}
+          defaultBodyExpanded={emphasized}
+          emphasized={emphasized}
+        />
+      ),
+    })),
+  ];
+  const visibleQueue = showAllNeedsYou ? queue : queue.slice(0, NEEDS_YOU_VISIBLE);
+  const hiddenCount = queue.length - visibleQueue.length;
+
+  const needsYouMenu = [
+    ...(staleNeedsYouIds.length > 0
+      ? [
+          {
+            label: `Dismiss ${staleNeedsYouIds.length} older than ${NEEDS_YOU_DISMISS_OLDER_THAN_DAYS} days`,
+            onSelect: () => void handleBulkDismiss(staleNeedsYouIds),
+          },
+        ]
+      : []),
+    {
+      label: recheckBusy ? "Re-checking…" : "Re-check relevance",
+      onSelect: () => void handleRecheck(),
+      disabled: recheckBusy,
+    },
+  ];
+  const showNeedsYouMenu = staleNeedsYouIds.length > 0 || mineProposals.length > 0;
+
+  const hasBrief = Boolean(today && (today.narrative || today.narrative_stale));
+  // What counts as new on Right now: the reader's last look earlier today,
+  // taken from the first header this visit shows and held for the visit, so
+  // the dots don't vanish when the page records this look.
+  const [rightNowBaseline, setRightNowBaseline] = useState<{ at: Date | null } | null>(null);
+  const seenWrittenRef = useRef<string | null>(null);
+  const shownWrittenAt = today?.narrative ? today.narrative_generated_at ?? null : null;
+  // A header that lands while the tab is in the background isn't a look:
+  // it's recorded once the page is in view again.
+  const [pageVisible, setPageVisible] = useState(true);
+  useEffect(() => {
+    const onChange = () => setPageVisible(document.visibilityState === "visible");
+    onChange();
+    document.addEventListener("visibilitychange", onChange);
+    return () => document.removeEventListener("visibilitychange", onChange);
+  }, []);
+  useEffect(() => {
+    if (!pageVisible || !today || !shownWrittenAt || seenWrittenRef.current === shownWrittenAt) return;
+    setRightNowBaseline((b) => b ?? { at: seenBaseline(today.narrative_seen_at, new Date()) });
+    seenWrittenRef.current = shownWrittenAt;
+    void markTodaySeen().catch(() => { /* best-effort */ });
+  }, [today, shownWrittenAt, pageVisible]);
+  // The first week: the first-week card takes the page's top slot, so the
+  // day isn't called quiet and the summary line points at it.
+  const firstWeekCard = today?.first_week_card ?? null;
+  const firstWeek = Boolean(today?.first_week);
+  // The first week's empty Needs you points at the own-mailbox step only
+  // while that mailbox isn't connected (null until known, so no flash).
+  const [ownMailboxConnected, setOwnMailboxConnected] = useState<boolean | null>(null);
+  useEffect(() => {
+    if (!firstWeek) return;
+    const ctrl = new AbortController();
+    getDelegation(ctrl.signal)
+      .then((d) => setOwnMailboxConnected(d ? d.gmail.status === "connected" : null))
+      .catch(() => undefined);
+    return () => ctrl.abort();
+  }, [firstWeek]);
+  const briefFreshness = today
+    ? today.narrative_stale
+      ? "Updating…"
+      : checkedLabel(today.narrative_checked_at) ?? narrativeUpdatedLabel(today.narrative_generated_at, new Date())
+    : null;
+
+  // In the first week the first-week card says what to start on, so the day
+  // isn't "quiet" even with nothing on the board yet.
+  const quietBanner =
+    isQuiet && activeDepts.length > 0 && !firstWeekCard ? (
+      <div className="flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-emerald-500/25 bg-emerald-500/5 px-4 py-3">
+        <span className={`text-[15px] ${TONE_TEXT.emerald}`}>Quiet day — nothing needs your attention.</span>
+        {!solo && (
+          <Link href="/departments" className="text-sm font-medium text-accent hover:underline">
+            Set up a check-in →
+          </Link>
+        )}
+      </div>
+    ) : null;
+  const bannerSlot = banner ?? quietBanner;
+
+  const onSummaryPart = (part: SummaryPart) => {
+    if (part.target.kind === "needsYou") {
+      document.getElementById(NEEDS_YOU_ID)?.scrollIntoView({ behavior: "smooth", block: "start" });
+    } else if (part.target.kind === "panel") {
+      setOpenPanel(part.target.panel);
+    }
+  };
+
+  const panelFooterLink = (href: string, label: string) => (
+    <Link href={href} className={buttonClass("secondary", "md", "w-full sm:w-auto")}>
+      {label}
+    </Link>
+  );
+
+  return (
+    <div className="flex flex-col h-full bg-surface">
+      <main className="flex-1 overflow-y-auto">
+        <div className="max-w-3xl mx-auto px-4 sm:px-6 py-6 sm:py-10">
+          <header className="mb-6">
+            <p className="text-sm font-medium text-fg-muted">{dateLabel}</p>
+            <h1 className="mt-1 text-2xl sm:text-3xl font-bold tracking-tight text-fg">
+              {showHeader ? greeting(firstName) : "Today"}
+            </h1>
+            {today && (
+              <p className="mt-2 text-base sm:text-lg text-fg-muted leading-snug">
+                {summary.length === 0
+                  ? firstWeekCard
+                    ? "Your first week. Start below."
+                    : "All clear — nothing needs you right now."
+                  : summary.map((part, i) => (
+                      <span key={part.text}>
+                        {part.target.kind === "href" ? (
+                          <Link href={part.target.href} className="hover:text-fg hover:underline underline-offset-4">
+                            {part.text}
+                          </Link>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => onSummaryPart(part)}
+                            className="cursor-pointer text-left hover:text-fg hover:underline underline-offset-4"
+                          >
+                            {part.text}
+                          </button>
+                        )}
+                        {i < summary.length - 1 ? ". " : "."}
+                      </span>
+                    ))}
+              </p>
+            )}
+          </header>
+
+          {onContinue && (
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                submitAsk();
+              }}
+              className="mb-6 flex items-center gap-2 rounded-2xl border border-line bg-surface-elevated p-2 pl-4 shadow-sm focus-within:border-accent/60 focus-within:ring-2 focus-within:ring-accent/20"
+            >
+              <input
+                type="text"
+                value={askText}
+                onChange={(e) => setAskText(e.target.value)}
+                placeholder="Ask your Executive anything…"
+                aria-label="Ask your Executive"
+                className="min-w-0 flex-1 bg-transparent py-2 text-base text-fg placeholder:text-fg-muted focus:outline-none"
+              />
+              <button
+                type="submit"
+                disabled={!askText.trim()}
+                aria-label="Ask"
+                className="flex h-11 w-11 flex-shrink-0 items-center justify-center rounded-xl bg-accent-strong text-white transition-colors hover:bg-accent-strong/90 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                <Icon name="arrow-send" size="w-4 h-4" />
+              </button>
+            </form>
+          )}
+
+          {loading && <p className="text-fg-muted text-[15px]">Loading…</p>}
+          {error && (
+            <div className="mb-4 rounded-xl border border-rose-500/30 bg-rose-500/10 p-3 text-[15px] text-rose-700 dark:text-rose-300">
+              {error}
+            </div>
+          )}
+
+          {firstWeekCard && <FirstWeekCard card={firstWeekCard} />}
+
+          {bannerSlot && <div className="mb-6">{bannerSlot}</div>}
+
+          {today && (
+            <>
+              {hasBrief && (
+                <RightNowCard
+                  today={today}
+                  baseline={rightNowBaseline?.at ?? null}
+                  updatedLabel={briefFreshness}
+                  onOpen={() => setOpenPanel("brief")}
+                  actions={rightNowActions}
+                />
+              )}
+
+              {/* Needs you — decisions routed to the caller, and replies
+                  waiting to be sent. */}
+              <section id={NEEDS_YOU_ID} className="mb-8 scroll-mt-4">
+                <div className="mb-3 flex items-center gap-2">
+                  <h2 className="text-lg font-semibold text-fg">
+                    Needs you
+                    {needsYouCount > 0 && <span className="ml-1.5 font-normal text-fg-muted">({needsYouCount})</span>}
+                  </h2>
+                  {replies.cards.length > 0 && <InfoTip align="left">{REPLIES_WAITING_TIP}</InfoTip>}
+                  {inviteCards.cards.length > 0 && <InfoTip align="left">{INVITE_CARDS_TIP}</InfoTip>}
+                  {actionCards.cards.length > 0 && <InfoTip align="left">{ACTION_CARDS_TIP}</InfoTip>}
+                  <div className="ml-auto flex items-center gap-1">
+                    {showNeedsYouMenu && <OverflowMenu size="sm" label="Needs you options" items={needsYouMenu} />}
+                  </div>
+                </div>
+                {snoozed && (
+                  <p className="mb-3 flex flex-wrap items-center gap-x-3 text-sm text-fg-muted" role="status">
+                    Snoozed until {snoozed.short}.
+                    <button
+                      type="button"
+                      onClick={handleUnsnooze}
+                      className="font-medium text-accent hover:underline"
+                    >
+                      Undo
+                    </button>
+                  </p>
+                )}
+                {rerunNotice && (
+                  <p className="mb-3 text-sm text-fg-muted" role="status">
+                    {rerunNotice}
+                  </p>
+                )}
+                {replies.notice && (
+                  <p className={`mb-3 text-sm ${TONE_TEXT.emerald}`} role="status">
+                    {replies.notice}
+                  </p>
+                )}
+                {approvalRows.length > 0 && (
+                  <div className="mb-4 space-y-2">
+                    {approvalRows.map((row) => (
+                      <ApprovedRow
+                        key={row.approval.id}
+                        approval={row.approval}
+                        headline={row.headline}
+                        onRetry={() => void handleRetryApproval(row)}
+                        onClose={() =>
+                          setApprovalRows((rows) => rows.filter((r) => r.approval.id !== row.approval.id))
+                        }
+                      />
+                    ))}
+                  </div>
+                )}
+                {queue.length > 0 ? (
+                  <div className="space-y-4">
+                    {visibleQueue.map((item, i) => (
+                      <div key={item.key}>{item.render(i === 0)}</div>
+                    ))}
+                    {(hiddenCount > 0 || (showAllNeedsYou && queue.length > NEEDS_YOU_VISIBLE)) && (
+                      <div className="flex justify-center">
+                        <button
+                          type="button"
+                          onClick={() => setShowAllNeedsYou((v) => !v)}
+                          className={buttonClass("secondary", "md")}
+                        >
+                          {showAllNeedsYou ? "Show fewer" : `Show ${hiddenCount} more`}
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                ) : firstWeek ? (
+                  <p className="rounded-2xl border border-dashed border-line px-4 py-5 text-[15px] text-fg-muted">
+                    Nothing waiting on you yet. Decisions and replies to send land here.
+                    {ownMailboxConnected === false && (
+                      <>
+                        {" "}
+                        <Link href={FIRST_RUN_LINKS.ownMailbox} className="font-medium text-accent hover:underline">
+                          Let it read your mailbox
+                        </Link>{" "}
+                        to get draft replies here.
+                      </>
+                    )}
+                  </p>
+                ) : !isQuiet ? (
+                  <p className="rounded-2xl border border-dashed border-line px-4 py-5 text-[15px] text-fg-muted">
+                    Nothing waiting on you. Decisions and replies to send land here.
+                  </p>
+                ) : null}
+              </section>
+
+              {(today.held_back?.length ?? 0) > 0 && <HeldBack items={today.held_back ?? []} />}
+
+              {solo && (
+                <div className="mb-8">
+                  <TopThreeList ownerName={principalName} id="sec-top-three" />
+                </div>
+              )}
+
+              {tiles.length > 0 && (
+                <section aria-labelledby="sec-at-a-glance" className="mb-8">
+                  <h2 id="sec-at-a-glance" className="mb-3 text-lg font-semibold text-fg">
+                    At a glance
+                  </h2>
+                  <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
+                    {tiles.map((t) => {
+                      const body = (
+                        <>
+                          <span className="text-sm text-fg-muted">{t.kicker}</span>
+                          <span className="mt-1 text-2xl sm:text-3xl font-bold tracking-tight text-fg tabular-nums">
+                            {t.value}
+                          </span>
+                          <span className="mt-1 text-[15px] font-medium text-fg">{t.label}</span>
+                          {t.sub && (
+                            <span className={`mt-0.5 text-sm ${t.subTone ? TONE_TEXT[t.subTone] : "text-fg-muted"}`}>
+                              {t.sub}
+                            </span>
+                          )}
+                        </>
+                      );
+                      const cls =
+                        "flex min-h-[7.5rem] flex-col items-start rounded-2xl border border-line bg-surface-elevated p-4 text-left transition-colors hover:border-line-strong hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/50";
+                      const panel = t.panel;
+                      return panel ? (
+                        <button
+                          key={t.key}
+                          type="button"
+                          onClick={() => setOpenPanel(panel)}
+                          aria-haspopup="dialog"
+                          className={cls}
+                        >
+                          {body}
+                        </button>
+                      ) : (
+                        <Link key={t.key} href={t.href ?? "/"} className={cls}>
+                          {body}
+                        </Link>
+                      );
+                    })}
+                  </div>
+                </section>
+              )}
+
+              <SidePanel
+                open={openPanel === "brief"}
+                onClose={() => setOpenPanel(null)}
+                title="Right now"
+                subtitle={
+                  <span aria-live="polite">
+                    {briefFreshness ? `${briefFreshness} · rewritten as things change` : dateLabel}
+                  </span>
+                }
+                width="lg"
+              >
+                <RightNowBody
+                  today={today}
+                  baseline={rightNowBaseline?.at ?? null}
+                  onContinue={onContinue}
+                  actions={rightNowActions}
+                />
+              </SidePanel>
+              <SidePanel
+                open={openPanel === "departments"}
+                onClose={() => setOpenPanel(null)}
+                title="Departments"
+                width="lg"
+                footer={panelFooterLink("/departments", "View all departments")}
+              >
+                <DepartmentsPanelBody departments={departments} onContinue={onContinue} />
+              </SidePanel>
+              <SidePanel
+                open={openPanel === "people"}
+                onClose={() => setOpenPanel(null)}
+                title="People"
+                width="lg"
+                footer={panelFooterLink("/people", "View all people")}
+              >
+                <PeoplePanelBody people={today.people} />
+              </SidePanel>
+              <SidePanel
+                open={openPanel === "team"}
+                onClose={() => setOpenPanel(null)}
+                title="Across the team"
+                subtitle="Waiting on someone else"
+                width="lg"
+              >
+                <div className="space-y-4">
+                  {otherProposals.map((p) => (
+                    <ProposalCard
+                      key={p.alert_id}
+                      proposal={p}
+                      people={today.people}
+                      onContinue={onContinue}
+                      // Someone else's card is theirs (or the principal's)
+                      // to approve; the server refuses anyone else.
+                      onApprove={isPrincipalCaller ? handleApprove : undefined}
+                      onDismiss={handleDismiss}
+                      onSnooze={handleSnooze}
+                      onRerun={handleRerun}
+                      onApproveWithEdits={isPrincipalCaller ? handleApproveWithEdits : undefined}
+                    />
+                  ))}
+                  {otherProposals.length === 0 && (
+                    <p className="text-[15px] text-fg-muted">
+                      Nothing waiting on anyone else.
+                      {today.people.length <= 1 && " Add your team on People to see their work here."}
+                    </p>
+                  )}
+                </div>
+              </SidePanel>
+              <SidePanel open={openPanel === "inFlight"} onClose={() => setOpenPanel(null)} title="Under way">
+                <InFlightPanelBody inFlight={inFlight} />
+              </SidePanel>
+              <SidePanel open={openPanel === "handled"} onClose={() => setOpenPanel(null)} title="Handled">
+                <HandledPanelBody
+                  items={handledOvernight}
+                  onReopen={handleReopen}
+                  undone={undoneRows}
+                  onJumpToAlert={jumpToAlert}
+                />
+              </SidePanel>
+              <SidePanel open={openPanel === "monitoring"} onClose={() => setOpenPanel(null)} title="Monitoring">
+                <MonitoringPanelBody
+                  proposals={monitoringProposals}
+                  onContinue={onContinue}
+                  onDismiss={handleDismiss}
+                  onBulkDismiss={handleBulkDismiss}
+                />
+              </SidePanel>
+              <SidePanel
+                open={openPanel === "clients"}
+                onClose={() => setOpenPanel(null)}
+                title="Across your clients"
+                footer={panelFooterLink("/clients", "Manage clients")}
+              >
+                <PracticeClientsPanelBody clients={practiceClients} />
+              </SidePanel>
+              <SidePanel
+                open={openPanel === "dueSoon"}
+                onClose={() => setOpenPanel(null)}
+                title="Due soon"
+                footer={loopOwnerId != null ? panelFooterLink(`/people/${loopOwnerId}`, "All open items") : undefined}
+              >
+                <DueSoonPanelBody state={openLoops} />
+              </SidePanel>
+              {solo && (
+                <>
+                  <SidePanel
+                    open={openPanel === "projects"}
+                    onClose={() => setOpenPanel(null)}
+                    title="Your projects"
+                    footer={panelFooterLink("/goals", "Goals")}
+                  >
+                    <ProjectsPanelBody state={projects} />
+                  </SidePanel>
+                  {weeklyReview && (
+                    <SidePanel
+                      open={openPanel === "weeklyReview"}
+                      onClose={() => setOpenPanel(null)}
+                      title="This week's review"
+                    >
+                      <WeeklyReviewPanelBody review={weeklyReview} />
+                    </SidePanel>
+                  )}
+                </>
+              )}
+            </>
+          )}
+        </div>
+      </main>
+    </div>
+  );
+}

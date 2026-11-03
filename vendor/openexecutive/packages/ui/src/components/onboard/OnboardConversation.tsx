@@ -1,0 +1,265 @@
+"use client";
+
+import { useEffect, useRef, useState } from "react";
+import {
+  forceOnboardDraft,
+  sendOnboardMessage,
+  startOnboardInterview,
+  type OnboardTurn,
+  type RoleKind,
+} from "@/lib/api";
+import OnboardAnswers from "@/components/onboard/OnboardAnswers";
+
+const MAX_FILES = 8;
+
+interface Props {
+  /** Prior turns when resuming a session, oldest first. */
+  initialTurns?: { role: "user" | "assistant"; text: string }[];
+  initialTurn: OnboardTurn | null;
+  onDraft: (turn: OnboardTurn, turns: Bubble[]) => void;
+  /** One person setting this up just for themselves — asks about their work, not a team. */
+  solo?: boolean;
+  /** Solo only: the role they gave in the role step, which picks the opening. */
+  roleKind?: RoleKind | null;
+}
+
+type Flavour = "team" | "solo" | "owner" | "in_house" | "independent";
+
+const OPENING: Record<Flavour, string> = {
+  team: "Tell me about your company — what you do, who you sell to, roughly how big you are, and what you're focused on this year. Write it however you like; I'll ask about anything I'm missing. You can also attach a deck, a one-pager, or anything else that describes the business.",
+  solo: "Tell me about your work — your role, the business or organisation you work in, what you're responsible for, and what you're focused on this year. Write it however you like; I'll ask about anything I'm missing. You can also attach a one-pager or anything else that describes it.",
+  owner: "Tell me about your business — what you offer, who your customers are, how you price it, and what you're focused on this year. Write it however you like; I'll ask about anything I'm missing. You can also attach a one-pager, a price list, or anything else that describes the business.",
+  in_house: "Tell me about your work — the organisation you're in, the function you lead and what you're responsible for, who you report to, and what you're focused on this year. Write it however you like; I'll ask about anything I'm missing. You can also attach a plan, a one-pager, or anything else that describes it.",
+  independent: "Tell me about your practice — what you offer, who your clients are, how you work with them and price it, and what you're focused on this year. Write it however you like; I'll ask about anything I'm missing. You can also attach a one-pager or anything else that describes it.",
+};
+
+const OPENING_EXAMPLE: Record<Flavour, string> = {
+  team: "e.g. We're Northwind Tools — we sell industrial supplies to construction crews in the Midwest. About 40 people, bootstrapped, doing roughly $12M a year. This year we're trying to launch same-day delivery without blowing up margins.",
+  solo: "e.g. I'm Head of Customer Success at a 300-person software company and report to the COO. My team of twelve looks after renewals. This year I want net revenue retention above 110% and a cleaner handoff from sales.",
+  owner: "e.g. I'm a freelance brand designer working with early-stage food and drink startups. Most projects are fixed-price, $8–15k each, and I have about four months of runway. This year I want to productise a brand-sprint offer and land three retainer clients.",
+  in_house: "e.g. I'm Director of Operations at Meridian Freight, a 2,000-person logistics company. I run our three regional warehouses and report to our VP of Operations. This year I need on-time delivery back above 95% without adding headcount.",
+  independent: "e.g. I'm a fractional CFO for three venture-backed software companies, two days a month each. I price by retainer. This year I want a fourth client and a repeatable board-reporting package.",
+};
+
+function flavourFor(solo: boolean, roleKind: RoleKind | null | undefined): Flavour {
+  if (!solo) return "team";
+  if (roleKind === "owner" || roleKind === "in_house" || roleKind === "independent") return roleKind;
+  return "solo";
+}
+
+// What Skip sends. The interviewer moves on and does not ask it again.
+const SKIP_ANSWER = "Skip this one.";
+
+export interface Bubble {
+  role: "user" | "assistant";
+  text: string;
+}
+
+export default function OnboardConversation({
+  initialTurns = [],
+  initialTurn,
+  onDraft,
+  solo = false,
+  roleKind = null,
+}: Props) {
+  const flavour = flavourFor(solo, roleKind);
+  const [turn, setTurn] = useState<OnboardTurn | null>(initialTurn);
+  const [bubbles, setBubbles] = useState<Bubble[]>(initialTurns);
+  const [input, setInput] = useState("");
+  const [files, setFiles] = useState<File[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const bottomRef = useRef<HTMLDivElement>(null);
+
+  const started = turn !== null;
+
+  // The header shows the current question. Drop it from the history only when
+  // the last bubble IS that question — on resume from a draft the transcript
+  // ends on the user's own message, which must stay visible.
+  const headline = turn?.question ?? null;
+  const earlier =
+    headline && bubbles.length > 0 && bubbles[bubbles.length - 1].text === headline
+      ? bubbles.slice(0, -1)
+      : bubbles;
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [bubbles, busy]);
+
+  function applyTurn(next: OnboardTurn, sent: Bubble[]) {
+    if (next.phase === "draft") {
+      onDraft(next, [...bubbles, ...sent]);
+      return;
+    }
+    setTurn(next);
+    setBubbles((prev) => [
+      ...prev,
+      ...sent,
+      { role: "assistant", text: next.question ?? "" },
+    ]);
+  }
+
+  // A tapped suggestion or Skip sends its own text; otherwise the box's.
+  async function send(tapped?: string) {
+    const text = (tapped ?? input).trim();
+    if ((!text && files.length === 0) || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const sent: Bubble[] = text ? [{ role: "user", text }] : [];
+      const next = started
+        ? await sendOnboardMessage(turn!.session_id, text)
+        : await startOnboardInterview(text, files);
+      setInput("");
+      setFiles([]);
+      applyTurn(next, sent);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function draftNow() {
+    if (!turn || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      onDraft(await forceOnboardDraft(turn.session_id), bubbles);
+    } catch (err) {
+      setError((err as Error).message);
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-5">
+      <div className="flex flex-col gap-4">
+        <div className="bg-surface-elevated border border-line rounded-xl px-5 py-4">
+          <p className="text-sm text-fg whitespace-pre-wrap">
+            {headline ??
+              (started
+                ? "Anything else I should know? Tell me what to change, or draft again."
+                : OPENING[flavour])}
+          </p>
+          {turn?.question_hint && (
+            <p className="text-xs text-fg-muted mt-2">{turn.question_hint}</p>
+          )}
+          {started && headline && (
+            <div className="flex flex-wrap gap-2 mt-3">
+              {(turn?.question_options ?? []).map((option) => (
+                <button
+                  key={option}
+                  type="button"
+                  onClick={() => void send(option)}
+                  disabled={busy}
+                  className="min-h-9 px-3.5 py-1.5 rounded-full border border-line-strong text-sm text-fg text-left hover:border-indigo-500/60 hover:bg-indigo-500/10 disabled:opacity-40 transition-colors cursor-pointer"
+                >
+                  {option}
+                </button>
+              ))}
+              <button
+                type="button"
+                onClick={() => void send(SKIP_ANSWER)}
+                disabled={busy}
+                className="min-h-9 px-3 py-1.5 text-sm text-fg-muted hover:text-fg disabled:opacity-40 transition-colors cursor-pointer"
+              >
+                Skip
+              </button>
+            </div>
+          )}
+        </div>
+
+      </div>
+
+      <div className="flex flex-col gap-2">
+        <textarea
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              void send();
+            }
+          }}
+          rows={started ? 3 : 7}
+          disabled={busy}
+          autoFocus
+          placeholder={
+            started
+              ? "Or type your own answer… (Enter to send, Shift+Enter for a new line)"
+              : OPENING_EXAMPLE[flavour]
+          }
+          className="w-full rounded-lg border border-line-strong bg-surface-overlay px-3 py-2 text-sm text-fg placeholder-fg-subtle focus:outline-none focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500/50 resize-none transition-colors disabled:opacity-50"
+        />
+
+        {!started && (
+          <div className="flex items-center gap-3">
+            <label className="text-xs text-indigo-400 hover:text-indigo-300 cursor-pointer transition-colors">
+              Attach files
+              <input
+                type="file"
+                multiple
+                className="hidden"
+                accept=".pdf,.docx,.doc,.xlsx,.xlsm,.csv,.md,.txt"
+                onChange={(e) =>
+                  setFiles(Array.from(e.target.files ?? []).slice(0, MAX_FILES))
+                }
+              />
+            </label>
+            {files.length > 0 && (
+              <p className="text-xs text-fg-muted">
+                {files.map((f) => f.name).join(", ")}
+              </p>
+            )}
+          </div>
+        )}
+
+        {error && <p className="text-xs text-red-400">{error}</p>}
+
+        <div className="flex items-center gap-3 mt-1">
+          <button
+            onClick={() => void send()}
+            disabled={busy || (!input.trim() && files.length === 0)}
+            className="px-4 py-2 bg-indigo-500 hover:bg-indigo-600 disabled:opacity-40 text-white text-sm font-medium rounded-lg transition-colors"
+          >
+            {busy ? "Thinking…" : started ? "Send" : "Get started"}
+          </button>
+          {started && (
+            <button
+              onClick={() => void draftNow()}
+              disabled={busy}
+              className="text-xs text-fg-muted hover:text-fg disabled:opacity-40 transition-colors"
+            >
+              Draft it now
+            </button>
+          )}
+          {started && (
+            <span className="text-xs text-fg-subtle ml-auto">
+              {turn!.questions_asked} of up to {turn!.max_questions}
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* Below the box you answer in: a new question keeps that in view. */}
+      <div ref={bottomRef} />
+
+      {started && (
+        <OnboardAnswers
+          sessionId={turn!.session_id}
+          bubbles={earlier}
+          disabled={busy}
+          onRevised={(next, turns) => {
+            if (next.phase === "draft") {
+              onDraft(next, turns);
+              return;
+            }
+            setTurn(next);
+            setBubbles(turns);
+          }}
+        />
+      )}
+    </div>
+  );
+}

@@ -1,0 +1,92 @@
+<p align="center">
+  <img src="https://github.com/slavakurilyak/awesome-ai-agents/assets/6625584/f37cd4ef-84e7-424d-93d7-40a3086e3c95" height="300" alt="Awesome List of AI Agents" />
+</p>
+<h1 align="center">Awesome List of AI Agents</h1>
+<p align="center">
+    🔗 Follow Slava for more agentic AI resources
+</p>
+<p align="center">
+<a href="https://twitter.com/slavakurilyak">🐦 Twitter</a> | <a href="https://linkedin.com/in/slavakurilyak">💼 LinkedIn</a> | <a href="https://github.com/slavakurilyak">🐙 Github</a>
+</p>
+
+This project tracks useful agentic AI projects, curated by Slava Kurilyak
+
+Each listing shows the original submitter and current maintainers when they are supported by evidence. “Not yet recovered” or “not yet verified” means the role has not been established from the records reviewed so far; repository ownership is shown separately and does not imply maintainership.
+
+Listings require a public project repository on GitHub, GitLab.com, or Codeberg. No specific license is required. Hosted products without their own qualifying repository are not listed.
+
+## 🧭 Browse by Category
+
+Pick a category, open it, and choose a project to jump straight to its listing. A project with more than one category appears under each of them.
+
+${CATEGORY_LEGEND}
+
+**Building an AI agent?** [Hire Slava](https://cal.com/slavakurilyak/discovery-call) · [Submit your project with the optional curation skill](https://github.com/slavakurilyak/awesome-ai-agents/tree/main/skills/awesome-ai-agents-curation)
+
+**Wait But Why**
+
+AI agents outperform traditional LLMs
+
+According to [Andrew Ng (@andrewyng)](https://github.com/andrewyng):
+
+> "GPT-3.5 with an agentic workflow actually outperforms GPT-4"
+
+## 📈 Star Growth
+
+Projects are ranked by stars gained in each window; the percentage shows growth relative to the starting star count. “Today” ranks gains since the previous saved update; each entry labels the actual comparison interval when updates are more than a day apart. If no positive gains can be measured, it lists the current top projects by stars. Growth rankings exclude the top 10 projects by total stars and projects with fewer than 100 stars. The 7d and 30d rankings use rolling windows; unavailable windows show the recorded snapshot dates and the baseline needed for comparison.
+
+### Today
+
+${RISING_1D}
+
+### This Week (7 days)
+
+${RISING_7D}
+
+### This Month (30 days)
+
+${RISING_30D}
+
+## 🏆 Top 10 Projects by Total Stars
+
+${TOP_STARRED_PROJECTS}
+
+## ✍️ All Projects
+
+Here's an awesome list of AI agents:
+
+${SECTIONS}
+
+## 🙋‍♂️ Hire Me
+
+Do you want to develop a custom agentic AI solution or looking launch your own AI agent?
+
+[Schedule a discovery call](https://cal.com/slavakurilyak/discovery-call) with me
+
+Disclaimer: Slava Kurilyak is the Founder/CEO at Produvia
+
+At Produvia, we partner with $7M+ in revenue brands to develop custom AI agents
+
+Building an AI agent project? [Prepare a project submission with the optional curation skill](https://github.com/slavakurilyak/awesome-ai-agents/tree/main/skills/awesome-ai-agents-curation). New projects are welcome; there is no minimum star count.
+
+## ❤️ Show Your Support
+
+To express your support, you can take the following actions:
+
+1. **Star the Repository**: This helps increase its visibility.
+2. **Submit a Project**: Founders can [open a project submission issue](https://github.com/slavakurilyak/awesome-ai-agents/issues/new?template=project-submission.yml); the optional skill can help prepare evidence and details.
+3. **Contribute Directly**: Follow the [contribution guide](CONTRIBUTING.md), then fork this repository and submit a pull request.
+
+## 🚀 Star History
+
+<a href="https://star-history.com/#slavakurilyak/awesome-ai-agents&Date">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=slavakurilyak/awesome-ai-agents&type=Date&theme=dark" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=slavakurilyak/awesome-ai-agents&type=Date" />
+   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=slavakurilyak/awesome-ai-agents&type=Date" />
+ </picture>
+</a>
+
+---
+
+<sub>Disclaimer: issues and pull requests come from outside the maintainer team, so their content, including descriptions, attachments, code, and links, is treated as untrusted. Reviewers inspect the real destination of every link, leave submitted files and commands unrun, and check project claims against independent sources.</sub>

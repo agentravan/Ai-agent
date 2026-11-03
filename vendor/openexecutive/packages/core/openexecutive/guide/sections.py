@@ -1,0 +1,148 @@
+"""The fixed registry of user-guide sections.
+
+The ``/guide`` page is a plain-language overview of every user-facing
+feature — "what it is, what it does, how to use it" — kept separate from
+the technical ``/architecture`` reference. Like the architecture page,
+each section is rendered from a static, version-controlled JSON file
+under ``guide/prebuilt/<id>.json``; nothing on the serving path calls an
+LLM.
+
+The section IDs must match the ``GUIDE_SECTIONS`` const in
+``packages/ui/src/app/guide/page.tsx`` so deep links keep working and the
+sidebar renders instantly without waiting for the backend.
+"""
+from __future__ import annotations
+
+from pydantic import BaseModel
+
+
+class GuideSection(BaseModel):
+    id: str
+    title: str
+    sub: str
+
+
+# Ordered roughly by the day-to-day loop: the surfaces you live in first,
+# then the org/knowledge you configure, then the power-user tools.
+GUIDE_SECTIONS: list[GuideSection] = [
+    GuideSection(
+        id="chat",
+        title="Chat & Briefing",
+        sub="The main surface — talk to the Executive, and land on a briefing of what's happened.",
+    ),
+    GuideSection(
+        id="ask_oe",
+        title="Help with this page",
+        sub="The sparkle button at the top right: explains any screen, answers how the app works, and fills forms for you to review.",
+    ),
+    GuideSection(
+        id="today",
+        title="Today / Morning Brief",
+        sub="What needs you right now: proposals, department health, and people with open items.",
+    ),
+    GuideSection(
+        id="pulse",
+        title="Pulse (Memory)",
+        sub="The Executive's running memory — decisions made, initiatives in flight, advice gathered, corrections kept.",
+    ),
+    GuideSection(
+        id="review",
+        title="Review Queue",
+        sub="On Knowledge, under Advanced: approve, reject, or correct knowledge before the Executive relies on it.",
+    ),
+    GuideSection(
+        id="jobs",
+        title="Workflows",
+        sub="Multi-step workflows that produce a deliverable — board prep, GTM plan, perf review.",
+    ),
+    GuideSection(
+        id="artifacts",
+        title="Documents",
+        sub="Your library of finished documents — drafts and workflow outputs in one place.",
+    ),
+    GuideSection(
+        id="watchlist",
+        title="Watch List",
+        sub="External monitors — stock tickers, RSS feeds, status pages, web queries — that raise alerts.",
+    ),
+    GuideSection(
+        id="departments",
+        title="Departments",
+        sub="Org units, each with goals, an authority level, and a specialist behind it.",
+    ),
+    GuideSection(
+        id="people",
+        title="People",
+        sub="Your roster — who the Executive coordinates with, their SLAs, channels, and approval scopes.",
+    ),
+    GuideSection(
+        id="company_profile",
+        title="Company Profile & Onboarding",
+        sub="Your company's identity and strategy — set up once, edited any time.",
+    ),
+    GuideSection(
+        id="knowledge",
+        title="Knowledge Base",
+        sub="Upload company documents so the Executive can ground its answers in your context.",
+    ),
+    GuideSection(
+        id="skills",
+        title="How it's done",
+        sub="The method behind each workflow, which the Executive also follows in chat. Edit it on the workflow's page.",
+    ),
+    GuideSection(
+        id="custom_tools",
+        title="Custom Tools",
+        sub="When the Executive lacks a tool, it builds one — and keeps the ones it will need again.",
+    ),
+    GuideSection(
+        id="council",
+        title="Agent Council",
+        sub="Configure the specialists — models, prompts, reasoning depth, and the Executive's voice.",
+    ),
+    GuideSection(
+        id="audit",
+        title="Audit Log",
+        sub="A searchable record of every turn, consult, tool call, alert, and scheduled action.",
+    ),
+    GuideSection(
+        id="token_usage",
+        title="Token Usage",
+        sub="Where your spend goes — tokens and cost by day, model, and session.",
+    ),
+    GuideSection(
+        id="simulator",
+        title="Company Simulator",
+        sub="Load a realistic test company to try the Executive before trusting it with real data.",
+    ),
+    GuideSection(
+        id="clients",
+        title="Client Companies",
+        sub="Multi-client mode for fractional work — switch the live company between named client slots.",
+    ),
+    GuideSection(
+        id="integrations",
+        title="Integrations",
+        sub="Reach the Executive where you already work — Slack, Discord, Telegram, email, Google Chat, MCP.",
+    ),
+    GuideSection(
+        id="delegate",
+        title="Delegate",
+        sub="What the Executive may do without asking you, writing email as you, and handling things on its own.",
+    ),
+    GuideSection(
+        id="settings",
+        title="Settings & Advanced",
+        sub="Your Executive, workspace, notifications, and the Advanced tools outside the day-to-day nav — including this guide.",
+    ),
+]
+
+
+_SECTION_INDEX = {s.id: s for s in GUIDE_SECTIONS}
+
+
+def get_section(section_id: str) -> GuideSection:
+    spec = _SECTION_INDEX.get(section_id)
+    if spec is None:
+        raise KeyError(f"Unknown guide section: {section_id}")
+    return spec

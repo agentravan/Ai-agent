@@ -1,0 +1,611 @@
+"""Render current department state into a compact Markdown block for the
+5m-TTL system prompt cache slot.
+
+Called by `prompts.cache_manager.build_system_blocks` on every turn. The
+result is appended after the company-profile block; the 1h persona and
+knowledge blocks are never touched.
+
+Key invariants:
+- Output must be deterministic for the same DB state (no timestamps, UUIDs,
+  or non-deterministic ordering). Determinism keeps the 5m cache warm.
+- Output is capped at _ORG_BLOCK_CHAR_CAP characters so a department with
+  many Goals never inflates the system prompt.
+- An empty departments table (fresh install, test env) returns "" so no block
+  is appended — the function must never raise.
+- Phase 3 extended this to include a compact People roster below the
+  departments section. The People section is omitted when no People are seeded.
+- Solo mode (one person — the principal — uses Open Executive;
+  ``render_org_block(mode="solo")``) renders a different, smaller block: the
+  principal's own line and their goals grouped by *area* (a department row is
+  an area there). No authority levels, heads, cadences, channels or roster —
+  the principal decides, and the people in their world are contacts, not a
+  team the Executive routes to. Same determinism, sanitizing and cap. When
+  the workspace holds the principal's role (``memory.workspace_settings.
+  PrincipalRole``: kind, title, reports to, remit, measured on), its lines
+  follow the principal's own line — the context the solo persona reads the
+  principal's role from. Set once per install, so the 5m cache stays warm.
+- Goals with no department (``Goal.department_slug`` None) render after the
+  departments in their own section, team and solo alike, each with its
+  goal_id and, when the goal names one, its owner. A department goal with an
+  owner of its own (not the department's lead) shows that owner too.
+- The principal's contacts (people outside the team) get their own short
+  "## Contacts" section after the team or solo block — name, role/company and
+  whether an email is on file, nothing about authority — but only when
+  ``include_contacts`` is set, i.e. on the principal's own verified turn:
+  contacts are private to the principal. Every other turn gets the block
+  byte-identical to one with no contacts at all, so per mode the 5m cache
+  holds at most two stable variants, never a per-request one.
+
+Security note: Goal text fields (key_result, current, target, mission) are
+user-controlled strings that land inside the system prompt. All values are
+sanitized via _safe() before rendering to prevent prompt-injection via
+embedded newlines, Markdown headings, or instruction-like text.
+"""
+from __future__ import annotations
+
+import logging
+import re
+from typing import TYPE_CHECKING
+
+from openexecutive.departments.models import DepartmentState, Goal
+
+if TYPE_CHECKING:
+    from openexecutive.memory.workspace_settings import PrincipalRole
+
+logger = logging.getLogger(__name__)
+
+# Hard cap on total block size. A 4000-char block at ~4 bytes/char averages
+# ~1000 tokens — well within the 5m-TTL cache slot budget.
+_ORG_BLOCK_CHAR_CAP = 4000
+
+# Per-field length caps to prevent any single Goal from dominating the block.
+_MISSION_CHAR_CAP = 120
+_KEY_RESULT_CHAR_CAP = 300
+_CURRENT_CHAR_CAP = 100
+_PERIOD_VALUE_CHAR_CAP = 64  # matches the API GoalCreate.period_value max_length
+
+# Header string for the org block — constant so Phase 3 can reliably locate it.
+_ORG_BLOCK_HEADER = "## Departments You Manage"
+
+# Contacts section: header, the one-line rule the Executive needs, and a cap
+# on how many are listed (the rest are a list_people call away).
+_CONTACTS_HEADER = "## Contacts"
+_CONTACTS_NOTE = (
+    "The principal's contacts, private to them. You may email, invite or "
+    "message a contact only when the principal asks you to directly; they "
+    "cannot sign in, message you, or approve anything. Call list_people for "
+    "their person_id."
+)
+_MAX_CONTACTS_IN_BLOCK = 25
+
+# Solo-mode headers (see `_render_solo_block`). "You" in this prompt is the
+# Executive, so both name the principal from its side — never "## You", which
+# the Executive could read as its own identity.
+_SOLO_PRINCIPAL_HEADER = "## Your Principal"
+_SOLO_GOALS_HEADER = "## Your Principal's Goals"
+# Goals that belong to no department, in both modes.
+_UNASSIGNED_GOALS_HEADER = "## Goals With No Department"
+_SOLO_UNASSIGNED_HEADING = "### No area"
+
+# Opens the principal's role lines. Block 1 goes out on every turn, whoever
+# sent it, and the role says who the principal reports to and what they are
+# judged on — so it is marked as theirs. A constant: nothing is interpolated.
+_SOLO_ROLE_LEAD_IN = (
+    "Their role — private to them: use it to tailor your advice and drafts, "
+    "and don't share it with anyone else."
+)
+
+# Goal status → words for the solo block, which has room to be plain.
+_SOLO_STATUS_LABEL: dict[str, str] = {
+    "on_track": "on track",
+    "at_risk": "at risk",
+    "off_track": "off track",
+}
+_TARGET_CHAR_CAP = 100
+
+# Goal status → short display label so the block stays scannable.
+_STATUS_LABEL: dict[str, str] = {
+    "on_track": "✓",
+    "at_risk": "⚠",
+    "off_track": "✗",
+}
+
+# Characters that could start a Markdown heading or break the prompt structure.
+_UNSAFE_PATTERN = re.compile(r"[\n\r\x0b\x0c]|^#+\s*", re.MULTILINE)
+
+
+def _safe(value: str, max_len: int) -> str:
+    """Sanitize a user-supplied string for safe embedding in a system prompt.
+
+    Strips embedded newlines (which could introduce new Markdown sections or
+    instruction-like text) and caps length. Any text that looks like a
+    Markdown heading at the start of the value is also stripped.
+    """
+    cleaned = _UNSAFE_PATTERN.sub(" ", value).strip()
+    if len(cleaned) > max_len:
+        cleaned = cleaned[: max_len - 1] + "…"
+    return cleaned
+
+
+def _status(s: str) -> str:
+    return _STATUS_LABEL.get(s, s)
+
+
+def _owner_note(goal: Goal, owner_names: dict[int, str] | None) -> str:
+    """`` — owner: Name`` for a goal that names its own owner, else ""."""
+    if goal.owner_person_id is None or not owner_names:
+        return ""
+    name = owner_names.get(goal.owner_person_id)
+    return f" — owner: {_safe(name, 80)}" if name else ""
+
+
+def _unassigned_goals() -> list[Goal]:
+    """Goals with no department, by (period, id). Never raises."""
+    from openexecutive.departments import store
+
+    try:
+        goals = store.list_goals(None)
+    except Exception:
+        logger.warning("render_org_block: unassigned goals unreadable", exc_info=True)
+        return []
+    return sorted(goals, key=lambda g: (g.period_type, g.period_value, g.id or 0))
+
+
+def _render_unassigned_section(goals: list[Goal], owner_names: dict[int, str]) -> str:
+    """The team block's ``## Goals With No Department``, or "" when none."""
+    if not goals:
+        return ""
+    lines = [
+        f"{_UNASSIGNED_GOALS_HEADER}\n",
+        "Owned by the named person, else the principal. Tools name these by "
+        "goal_id alone, with no department_slug.",
+    ]
+    for goal in goals:
+        current_note = (
+            f"  (now: {_safe(goal.current, _CURRENT_CHAR_CAP)})" if goal.current else ""
+        )
+        lines.append(
+            f"  [{_status(goal.status)}] {_period_label(goal.period_type, goal.period_value)}: "
+            f"{_safe(goal.key_result, _KEY_RESULT_CHAR_CAP)}{current_note}"
+            f"{_owner_note(goal, owner_names)} (goal_id {goal.id})"
+        )
+    return "\n".join(lines)
+
+
+def _render_department_section(
+    state: DepartmentState,
+    head_name: str | None = None,
+    owner_names: dict[int, str] | None = None,
+) -> str:
+    """Render one department section: heading + mission + Goals."""
+    config = state.config
+    goals = state.goals
+
+    authority_label = config.authority_level.value.replace("_", " ")
+    specialist_label = (
+        config.specialist_key.upper() if config.specialist_key else "INFORMATIONAL"
+    )
+    heading = (
+        f"### {config.title} "
+        f"({specialist_label}) — {authority_label}"
+    )
+    if head_name:
+        heading += f" — head: {_safe(head_name, 60)}"
+
+    if not goals and not config.charter.mission:
+        return heading
+
+    lines: list[str] = [heading]
+
+    if config.charter.mission:
+        lines.append(f"Mission: {_safe(config.charter.mission, _MISSION_CHAR_CAP)}")
+
+    if goals:
+        # Group by (period_type, period_value); sort the bucket keys lexically
+        # so output is deterministic across runs against the same DB.
+        by_period: dict[tuple[str, str], list[Goal]] = {}
+        for goal in goals:
+            by_period.setdefault((goal.period_type, goal.period_value), []).append(goal)
+
+        for (period_type, period_value) in sorted(by_period):
+            # period_type is constrained to the enum so it's safe to render raw;
+            # period_value is free-text from the user so it must go through _safe()
+            # before landing in the cached system prompt (otherwise a malicious
+            # value like "Q2\n\n## OVERRIDE" could inject a new section).
+            safe_value = _safe(period_value, _PERIOD_VALUE_CHAR_CAP)
+            header_label = (
+                safe_value if period_type == "ongoing"
+                else f"{period_type.capitalize()} {safe_value}"
+            )
+            lines.append(f"{header_label} Goals:")
+            # Secondary sort by id for determinism within a period when two
+            # Goals were inserted in the same transaction.
+            for goal in sorted(by_period[(period_type, period_value)], key=lambda g: (g.id or 0)):
+                current_note = (
+                    f"  (now: {_safe(goal.current, _CURRENT_CHAR_CAP)})"
+                    if goal.current
+                    else ""
+                )
+                lines.append(
+                    f"  [{_status(goal.status)}]"
+                    f" {_safe(goal.key_result, _KEY_RESULT_CHAR_CAP)}{current_note}"
+                    f"{_owner_note(goal, owner_names)}"
+                )
+
+    return "\n".join(lines)
+
+
+def _render_people_section(people: list | None = None) -> str:
+    """Render a compact ## People You Coordinate With section.
+
+    Returns "" when the people table is empty or unavailable. Each person
+    is one line; full_name and role are sanitized via _safe().
+
+    Accepts an optional pre-fetched people list to avoid a second DB call
+    when render_org_block() has already loaded people for head-name lookup.
+    """
+    try:
+        if people is None:
+            from openexecutive.people.registry import list_people as _list_people
+            people = _list_people()
+
+        if not people:
+            return ""
+
+        # id → name map for reports-to lookup; sanitized once so we don't
+        # re-_safe() per row.
+        name_by_id: dict[int, str] = {
+            p.id: _safe(p.full_name, 80) for p in people if p.id is not None
+        }
+
+        lines = ["## People You Coordinate With\n"]
+        for person in people:
+            scope_tokens = ", ".join(
+                s.value for s in person.authority_scope
+            ) if person.authority_scope else "none"
+            name = _safe(person.full_name, 80)
+            role = _safe(person.role, 80) if person.role else "—"
+            channel = person.preferred_channel
+            sla = person.response_sla_hours
+            principal_tag = " (principal)" if person.is_principal else ""
+
+            # Contact channels and org placement: only render fields that are
+            # set, so the Executive can see them when answering "what do you
+            # know about me". All values are sanitized — they originate from
+            # user input via the API and land in the cached system prompt.
+            extras: list[str] = []
+            if person.email:
+                extras.append(f"email: {_safe(person.email, 120)}")
+            if person.slack_user_id:
+                extras.append(f"slack: {_safe(person.slack_user_id, 64)}")
+            if person.telegram_chat_id:
+                extras.append(f"telegram: {_safe(person.telegram_chat_id, 64)}")
+            if person.discord_user_id:
+                extras.append(f"discord: {_safe(person.discord_user_id, 64)}")
+            if person.department_slugs:
+                slugs = ", ".join(_safe(s, 40) for s in person.department_slugs)
+                extras.append(f"depts: {slugs}")
+            if person.reports_to_person_id is not None:
+                manager = name_by_id.get(person.reports_to_person_id)
+                if manager:
+                    extras.append(f"reports to: {manager}")
+            extras_tail = (" — " + " — ".join(extras)) if extras else ""
+
+            lines.append(
+                f"- {name} — {role}{principal_tag}"
+                f" — {channel} — approves: {scope_tokens} — SLA {sla}h"
+                f"{extras_tail}"
+            )
+        return "\n".join(lines)
+    except Exception:
+        # Same broad catch as the departments section — must never crash a turn.
+        logger.warning("render_people_section failed — omitting People context", exc_info=True)
+        return ""
+
+
+def _render_contacts_section(contacts: list) -> str:
+    """Render the compact ## Contacts section, or "" when there are none.
+
+    One line each: name, role/company, and whether an email is on file (the
+    address itself is not needed to decide anything; list_people has it).
+    Capped at ``_MAX_CONTACTS_IN_BLOCK`` lines plus a count of the rest.
+    """
+    try:
+        if not contacts:
+            return ""
+        lines = [f"{_CONTACTS_HEADER}\n", _CONTACTS_NOTE]
+        for person in contacts[:_MAX_CONTACTS_IN_BLOCK]:
+            name = _safe(person.full_name, 80)
+            role = _safe(person.role, 80) if person.role else "—"
+            email = "email on file" if person.email else "no email"
+            lines.append(f"- {name} — {role} — {email}")
+        extra = len(contacts) - _MAX_CONTACTS_IN_BLOCK
+        if extra > 0:
+            lines.append(f"- …and {extra} more (list_people)")
+        return "\n".join(lines)
+    except Exception:
+        logger.warning("render_contacts_section failed — omitting contacts", exc_info=True)
+        return ""
+
+
+def _period_label(period_type: str, period_value: str) -> str:
+    """A goal's period, e.g. ``Quarter Q3 2026`` — the same rule as the team
+    block's period headers. period_value is user text, so it is sanitized."""
+    safe_value = _safe(period_value, _PERIOD_VALUE_CHAR_CAP)
+    if period_type == "ongoing":
+        return safe_value or "Ongoing"
+    return f"{period_type.capitalize()} {safe_value}".strip()
+
+
+def _render_solo_goal(goal: Goal, owner_names: dict[int, str] | None = None) -> str:
+    status = _SOLO_STATUS_LABEL.get(goal.status, _safe(goal.status, 20))
+    line = (
+        f"- [{status}] {_period_label(goal.period_type, goal.period_value)}: "
+        f"{_safe(goal.key_result, _KEY_RESULT_CHAR_CAP)}"
+    )
+    if goal.target:
+        line += f" — target: {_safe(goal.target, _TARGET_CHAR_CAP)}"
+    if goal.current:
+        line += f" — now: {_safe(goal.current, _CURRENT_CHAR_CAP)}"
+    line += _owner_note(goal, owner_names)
+    if goal.id is not None:
+        line += f" (goal_id {goal.id})"
+    return line
+
+
+def _render_solo_role(role: PrincipalRole | None) -> list[str]:
+    """The principal's role as lines under ``## Your Principal``: what kind
+    of principal they are (in plain words) and their title, who they report
+    to, what they are responsible for and what they are measured on — each
+    only when set, after the static ``_SOLO_ROLE_LEAD_IN`` marking them
+    private. User text, so every value is sanitized and capped."""
+    if role is None or role.is_empty():
+        return []
+    from openexecutive.memory.workspace_settings import ROLE_KIND_PHRASE, ROLE_TEXT_MAX
+
+    lines: list[str] = []
+    title = _safe(role.role_title, ROLE_TEXT_MAX["role_title"]) if role.role_title else ""
+    kind = ROLE_KIND_PHRASE.get(role.role_kind or "", "")
+    if title and kind:
+        lines.append(f"- Role: {title} — {kind}")
+    elif title:
+        lines.append(f"- Role: {title}")
+    elif kind:
+        lines.append(f"- Role: {kind[:1].upper()}{kind[1:]}")
+    for field, label in (
+        ("reports_to", "Reports to"),
+        ("remit", "Responsible for"),
+        ("measured_on", "Measured on"),
+    ):
+        value = getattr(role, field)
+        if value:
+            lines.append(f"- {label}: {_safe(value, ROLE_TEXT_MAX[field])}")
+    return [_SOLO_ROLE_LEAD_IN, *lines] if lines else []
+
+
+def _render_solo_principal(role: PrincipalRole | None = None) -> str:
+    """The principal's own line: name and the channels they can be reached on,
+    then their role lines (``_render_solo_role``) when a role is set.
+
+    The principal is ``people.store.find_principal_person`` — the oldest
+    non-archived principal, the same rule every solo check uses (the
+    principal-only messaging guard, follow-ups, the meeting gate) — so the
+    person this block names is the person those checks let through. The
+    identifiers are there so a follow-up to the principal can name its
+    channel_ref without a lookup. Contacts are not part of this line — they
+    get their own section on the principal's own verified turn only
+    (``_render_contacts_section``), and list_people has their ids.
+    """
+    from openexecutive.people.store import find_principal_person
+
+    role_lines = _render_solo_role(role)
+    try:
+        principal = find_principal_person()
+    except Exception:
+        logger.warning("render_org_block: principal lookup failed — omitting the principal", exc_info=True)
+        principal = None
+    if principal is None:
+        # No one to name yet (setup still running, or a failed lookup): the
+        # role still says who the Executive works for.
+        if not role_lines:
+            return ""
+        return f"{_SOLO_PRINCIPAL_HEADER}\n\n" + "\n".join(role_lines)
+    reach: list[str] = []
+    if principal.email:
+        reach.append(f"email {_safe(principal.email, 120)}")
+    if principal.slack_user_id:
+        reach.append(f"slack {_safe(principal.slack_user_id, 64)}")
+    if principal.telegram_chat_id:
+        reach.append(f"telegram {_safe(principal.telegram_chat_id, 64)}")
+    if principal.discord_user_id:
+        reach.append(f"discord {_safe(principal.discord_user_id, 64)}")
+    line = f"- {_safe(principal.full_name, 80)} (principal)"
+    if principal.id is not None:
+        line += f" — person_id {principal.id}"
+    if reach:
+        line += " — reachable on: " + ", ".join(reach)
+    if principal.preferred_channel and principal.preferred_channel != "any":
+        line += f" — prefers {principal.preferred_channel}"
+    return f"{_SOLO_PRINCIPAL_HEADER}\n\n" + "\n".join([line, *role_lines])
+
+
+def _render_solo_goals(
+    states: list[DepartmentState],
+    unassigned: list[Goal] | None = None,
+    owner_names: dict[int, str] | None = None,
+) -> str:
+    """Goals grouped by area (a department row), areas with no goals skipped,
+    then the goals with no area under ``### No area``.
+
+    Areas keep the registry's order; goals sort by (period, id) like the team
+    block, so the output is deterministic for the same DB state. The owner
+    shows only on a goal that names someone (a teammate's, in solo).
+    """
+    sections: list[str] = []
+    for state in states:
+        if not state.goals:
+            continue
+        lines = [f"### {_safe(state.config.title, 80)} (area slug: {_safe(state.config.slug, 40)})"]
+        for goal in sorted(
+            state.goals, key=lambda g: (g.period_type, g.period_value, g.id or 0)
+        ):
+            lines.append(_render_solo_goal(goal, owner_names))
+        sections.append("\n".join(lines))
+    if unassigned:
+        sections.append("\n".join(
+            [_SOLO_UNASSIGNED_HEADING, *(_render_solo_goal(g, owner_names) for g in unassigned)]
+        ))
+    if not sections:
+        return ""
+    return "\n\n".join([
+        f"{_SOLO_GOALS_HEADER}\n\n"
+        "Grouped by area. Tools take the area slug as `department_slug`; "
+        "a goal with no area is named by its goal_id alone.",
+        *sections,
+    ])
+
+
+def _render_solo_block(
+    states: list[DepartmentState],
+    role: PrincipalRole | None,
+    unassigned: list[Goal] | None = None,
+    owner_names: dict[int, str] | None = None,
+) -> str:
+    return "\n\n".join(
+        part
+        for part in (
+            _render_solo_principal(role),
+            _render_solo_goals(states, unassigned, owner_names),
+        )
+        if part
+    )
+
+
+def _workspace_role() -> PrincipalRole | None:
+    """The install's principal role (``get_workspace`` never raises)."""
+    from openexecutive.memory.workspace_settings import get_workspace
+
+    return get_workspace().principal_role()
+
+
+def _cap(body: str) -> str:
+    """Hold the block to _ORG_BLOCK_CHAR_CAP, cutting at a section boundary."""
+    if len(body) > _ORG_BLOCK_CHAR_CAP:
+        # Truncate at the nearest preceding section boundary ("\n\n") to
+        # avoid cutting mid-Goal and producing malformed Markdown.
+        truncated = body[: _ORG_BLOCK_CHAR_CAP - 3]
+        last_boundary = truncated.rfind("\n\n")
+        body = (
+            truncated[:last_boundary] + "\n\n…"
+            if last_boundary > 0
+            else truncated + "…"
+        )
+    return body
+
+
+def render_org_block(
+    mode: str = "team",
+    principal_role: PrincipalRole | None = None,
+    *,
+    include_contacts: bool = False,
+) -> str:
+    """Return a Markdown block of all department states + People roster.
+
+    Capped at 4000 chars total. Returns "" only when both departments and
+    people are absent (fresh install / test env). ``include_contacts`` adds
+    the principal's private ``## Contacts`` section — pass it only for the
+    principal's own verified turn.
+
+    ``mode="solo"`` renders the solo block instead (see the module docstring);
+    any other value renders the team block, unchanged. ``principal_role`` is
+    the role the solo block renders — the chat turn passes the one it
+    resolved (``workspace_settings.effective_principal_role``); None reads
+    the workspace's. The team block never reads or renders it.
+
+    Any unexpected error is logged and "" is returned — this function must
+    never crash a chat turn.
+    """
+    try:
+        from openexecutive.departments.registry import list_states
+        from openexecutive.people.registry import list_people
+
+        states = list_states()
+
+        # Fetch people once — used both for the head-name lookup per
+        # department and for the People section below. Team only; contacts
+        # get their own section and never head a department.
+        try:
+            everyone = list_people(include_contacts=include_contacts)
+        except Exception:
+            everyone = []
+        people = [p for p in everyone if p.kind == "team"]
+        contacts = [p for p in everyone if p.kind != "team"] if include_contacts else []
+
+        # The principal's private contacts: only on their own verified turn
+        # (the caller decides), after the team or solo block. Without it the
+        # block is byte-identical to one with no contacts at all.
+        contacts_section = _render_contacts_section(contacts)
+        unassigned = _unassigned_goals()
+
+        # A quick id→name map for head-person and goal-owner lookups.
+        head_name_by_id: dict[int, str] = {
+            p.id: p.full_name for p in people if p.id is not None
+        }
+
+        if mode == "solo":
+            role = principal_role if principal_role is not None else _workspace_role()
+            return _cap("\n\n".join(
+                part
+                for part in (
+                    _render_solo_block(states, role, unassigned, head_name_by_id).strip(),
+                    contacts_section,
+                )
+                if part
+            ).strip())
+
+        # Build departments section.
+        dept_sections: list[str] = []
+        if states:
+            dept_sections = [_ORG_BLOCK_HEADER + "\n"]
+            for state in states:
+                head_name = (
+                    head_name_by_id.get(state.config.head_person_id)
+                    if state.config.head_person_id is not None
+                    else None
+                )
+                dept_sections.append(
+                    _render_department_section(
+                        state, head_name=head_name, owner_names=head_name_by_id
+                    )
+                )
+        unassigned_section = _render_unassigned_section(unassigned, head_name_by_id)
+
+        # Build people section — pass the already-fetched list to avoid a
+        # second DB call.
+        people_section = _render_people_section(people)
+
+        if (
+            not dept_sections
+            and not unassigned_section
+            and not people_section
+            and not contacts_section
+        ):
+            return ""
+
+        parts: list[str] = []
+        if dept_sections:
+            parts.append("\n\n".join(dept_sections))
+        if unassigned_section:
+            parts.append(unassigned_section)
+        if people_section:
+            parts.append(people_section)
+        if contacts_section:
+            parts.append(contacts_section)
+
+        return _cap("\n\n".join(parts).strip())
+
+    except Exception:
+        # Broad catch: this is a prompt-building path that must never crash a
+        # chat turn. Real errors are logged with exc_info for diagnostics.
+        logger.warning("render_org_block failed — org context omitted", exc_info=True)
+        return ""
