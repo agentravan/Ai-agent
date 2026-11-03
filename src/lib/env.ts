@@ -45,6 +45,8 @@ const schema = z.object({
   MAIL_FROM_NAME: z.string().trim().max(80).default("AI Empire"),
   // Required by US CAN-SPAM for commercial email: a physical postal address in every pitch.
   BUSINESS_ADDRESS: optional,
+  // A live example site the team built (e.g. a gym template). Website pitches link to it so prospects see real quality.
+  DEMO_WEBSITE_URL: z.url().optional().catch(undefined),
   // Protects your mailbox reputation: max outreach emails per day.
   OUTREACH_DAILY_LIMIT: intIn(1, 200, 20),
   REPORT_EMAIL: z.email().optional().catch(undefined),
