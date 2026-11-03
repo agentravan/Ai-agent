@@ -19,14 +19,24 @@ const time = (unix: number | null) => (unix ? new Intl.DateTimeFormat("en-IN", {
 function Connection({ s }: { s: DeskState }) {
   if (!s.configured) {
     return (
-      <Card title="Connect your WhatsApp" description="Free, no Meta setup — your own number, logged in by QR like WhatsApp Web.">
+      <>
+      <Card title="Use it from your phone right now" description="No gateway, no laptop, ₹0 — works today." className="mb-4">
         <ol className="list-decimal space-y-1.5 pl-5 text-sm text-zinc-300">
-          <li>Run the free WhatsApp gateway (WAHA) on a computer that stays on — an office PC or a free Oracle Cloud server. One command; the guide is in <code>docs/WHATSAPP_SETUP.md</code>.</li>
+          <li>A client messages you on WhatsApp → copy their message.</li>
+          <li>Open <b>My Desk → WhatsApp reply assistant</b>, paste it (add their number if they&apos;re new).</li>
+          <li>Iris writes the reply and updates the lead → tap <b>Send on WhatsApp</b> → WhatsApp opens with the reply filled in → Send.</li>
+        </ol>
+        <Link href="/desk#whatsapp" className="btn-gold mt-3 inline-flex"><MessageCircle className="h-4 w-4" />Open the WhatsApp reply assistant</Link>
+      </Card>
+      <Card title="Later: fully automatic chats (optional)" description="Free, no Meta setup — your own number, logged in by QR like WhatsApp Web.">
+        <ol className="list-decimal space-y-1.5 pl-5 text-sm text-zinc-300">
+          <li>Run the free WhatsApp gateway (WAHA) on a server that stays on — a free Oracle Cloud server works, set up from a phone browser via Cloud Shell. Guide: <code>docs/WHATSAPP_SETUP.md</code>.</li>
           <li>Add <code>WAHA_URL</code> and <code>WAHA_API_KEY</code> in Vercel → Settings → Environment Variables, then redeploy.</li>
           <li>Come back here and scan the QR with WhatsApp Business → Linked devices.</li>
         </ol>
         <p className="mt-3 text-xs text-amber-300">This uses WhatsApp Web, not Meta&apos;s official API. Keep it to real conversations (the desk caps new contacts per day) so WhatsApp doesn&apos;t restrict the number.</p>
       </Card>
+      </>
     );
   }
   if (s.status === "UNREACHABLE") return <Card title="WhatsApp gateway offline"><p className="text-sm text-rose-300">{s.error}</p><AutoRefresh seconds={30} /></Card>;

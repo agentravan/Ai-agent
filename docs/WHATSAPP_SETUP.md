@@ -13,6 +13,15 @@ The team chats with clients on **your own WhatsApp number**. A small free progra
 
 Vercel cannot run WAHA: the WhatsApp connection has to stay open all the time.
 
+**No laptop? Do it from a phone (Oracle, ~20 min, ₹0):**
+1. Sign up at cloud.oracle.com (Always Free; card only to verify). Choose the region nearest you (e.g. Mumbai).
+2. Menu → Compute → Instances → **Create instance** → image **Ubuntu**, shape **VM.Standard.A1.Flex** (Always Free, 1 OCPU / 6 GB) → Create. Copy its **public IP**.
+3. Top bar → **Cloud Shell** (a terminal in the browser) → `ssh ubuntu@PUBLIC_IP` (Cloud Shell can use the key you downloaded/created in step 2).
+4. On the VM: `curl -fsSL https://get.docker.com | sudo sh`, then the `docker run` command below (with `sudo`), then the Cloudflare quick tunnel
+   from step 3 below (`sudo docker run -d --network host cloudflare/cloudflared tunnel --url http://localhost:3000`, read the https URL with `sudo docker logs`).
+
+Until then, use **phone mode**: My Desk → WhatsApp reply assistant (paste the client's message → Iris replies → tap Send on WhatsApp).
+
 ## 2. Start WAHA (one command)
 Pick a long random key first (e.g. from a password manager) — it protects your WhatsApp.
 

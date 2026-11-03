@@ -103,6 +103,7 @@ export default async function DeskPage({ searchParams }: { searchParams: SearchP
         <Stat label="Tasks done by AI team" value={aiDone.count ?? 0} />
       </div>
 
+      <div id="whatsapp" className="scroll-mt-20" />
       <Card title="WhatsApp reply assistant" description="A client messaged you on WhatsApp? Paste it here — Iris writes the reply, updates the lead and puts a call on your desk. Then tap Send on WhatsApp." className="mb-6">
         <form action={whatsappAssistAction} className="grid gap-3 md:grid-cols-6">
           <Field label="Who" className="md:col-span-2"><Select name="lead_id" options={waContacts.map((c) => ({ value: c.id, label: `${c.name}${c.phone ? ` · ${c.phone}` : ""}` }))} placeholder="New contact (enter number →)" /></Field>
