@@ -1,4 +1,5 @@
 import "server-only";
+import { env } from "@/lib/env";
 import { discoverGooglePlaces, googlePlacesConfigured } from "@/lib/integrations/google-places";
 import { discoverBusinesses, LEAD_CATEGORIES, type DiscoveredLead, type LeadCategory } from "@/lib/integrations/osm";
 import { agentHas } from "@/lib/permissions";
@@ -25,7 +26,9 @@ const OFFER_TEXT = {
 
 /** How to pitch each offer — discovery first, never pushy. */
 const PITCH_STYLE = {
-  website: "Offer a FREE demo website built for them before they pay anything; mention we can also run their social media. Ask one easy question (e.g. do you get bookings from Google?).",
+  website: "Offer a FREE demo website built for them before they pay anything; mention we can also run their social media. Ask one easy question (e.g. do you get bookings from Google?)."
+    + (env.DEMO_WEBSITE_URL ? ` In the EMAIL (not WhatsApp) include one line with an example site we built so they can see the quality: ${env.DEMO_WEBSITE_URL}` : "")
+    + " For US/UK businesses write natural local English (US or UK spelling), no Indian terms, and never state a price.",
   hr_services: "Do NOT hard-sell. Ask whether they currently need HR help and which kind (hiring staff, payroll, HR compliance/policies, HR software, day-to-day HR operations). Offer a free 15-minute HR check-up call.",
   ecommerce: "Offer to set up a simple online store; ask what they sell most.",
 } as const;
