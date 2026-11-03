@@ -32,6 +32,13 @@ const ViewLink = ({ href, children }: { href: string; children: ReactNode }) => 
   <Link href={href} className="text-xs font-medium text-zinc-400 transition hover:text-zinc-100">{children} →</Link>
 );
 
+/** "3 h ago" — so old failures (from before a fix) are not mistaken for a problem right now. */
+function ago(iso: string | null): string {
+  if (!iso) return "—";
+  const min = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 60_000));
+  return min < 60 ? `${min} min ago` : `${Math.round(min / 60)} h ago`;
+}
+
 export default async function CockpitPage({ searchParams }: { searchParams: SearchParams }) {
   const ctx = await requireContext();
   const [params, ai, c] = await Promise.all([searchParams, aiStatus(), loadCockpit(ctx)]);
@@ -64,7 +71,8 @@ export default async function CockpitPage({ searchParams }: { searchParams: Sear
           )}>
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
             <Stat icon={CheckCircle2} label="Tasks completed" value={d.tasksDone} hint={`${d.tasksCreated} created`} />
-            <Stat icon={Cpu} label="Agent runs" value={d.runsOk} hint={`${d.runsFailed} failed`} />
+            <Stat icon={Cpu} label="Agent runs succeeded" value={d.runsOk}
+              hint={d.runsFailed ? `${d.runsFailed} failed · last failure ${ago(d.lastFailureAt)}${d.lastSuccessAt && d.lastFailureAt && d.lastSuccessAt > d.lastFailureAt ? " · working since" : ""}` : "no failures"} />
             <Stat icon={BadgeCheck} label="Awaiting you" value={c.approvals.length} hint={`${d.decisions} decided in 24h`} />
           </div>
           {c.latestBriefing?.output ? (
