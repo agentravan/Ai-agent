@@ -1,0 +1,12 @@
+{
+  "name": "ai-empire-whatsapp-phone-gateway",
+  "private": true,
+  "type": "module",
+  "description": "Runs in Termux on the Founder's phone: links WhatsApp as a device and relays messages to AI Empire OS (outgoing, signed requests only).",
+  "engines": { "node": ">=18" },
+  "scripts": { "start": "node index.mjs" },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.16",
+    "pino": "^9.5.0"
+  }
+}

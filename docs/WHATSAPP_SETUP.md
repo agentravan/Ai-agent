@@ -1,6 +1,28 @@
 # WhatsApp Desk — setup (free, no Meta)
 
-## No card, no laptop: free Hugging Face Space (≈10 min, phone or laptop browser)
+## ⭐ Easiest, ₹0, no card, no laptop: your own phone (Termux)
+The gateway runs in **Termux** on the business phone and links WhatsApp as a *linked device*. It only makes
+outgoing, signed requests to the app — no server, no open port, no tunnel. Session keys stay on the phone.
+
+1. Vercel (Production): add `WHATSAPP_WEBHOOK_SECRET` (a long random string, type Sensitive) and `WHATSAPP_AUTO_REPLY=safe`
+   → Redeploy. (Leave `WAHA_URL` empty — that selects phone mode.)
+2. Install **Termux from F-Droid** (f-droid.org/packages/com.termux — the Play Store build is outdated). Also install
+   **Termux:API** if you want the screen-off wake lock.
+3. In Termux:
+   ```bash
+   pkg update -y && pkg install -y nodejs git
+   git clone --depth 1 -b feat/ai-empire-os-foundation https://github.com/agentravan/Ai-agent ~/ai-empire
+   bash ~/ai-empire/gateway/phone/start.sh
+   ```
+   It asks your WhatsApp number (with 91) and the secret, then prints an 8-character **pairing code**
+   (also shown on the app's WhatsApp Desk).
+4. WhatsApp → ⋮ → **Linked devices** → **Link a device** → **Link with phone number instead** → enter the code.
+5. Android settings → Apps → Termux → Battery → **Unrestricted**. Keep internet on. If the phone restarts,
+   open Termux and run `bash ~/ai-empire/gateway/phone/start.sh` again.
+
+While the phone is offline, replies wait in a queue and go out when it's back (the desk shows "offline").
+
+## (Paid now) Hugging Face Space (≈10 min, phone or laptop browser)
 1. Sign up at huggingface.co (email only, free).
 2. **New → Space** → name `ai-empire-whatsapp` → SDK **Docker** → **Blank** → hardware **CPU basic (free)** → Create.
 3. **Files → Add file → Create new file**: copy `deploy/whatsapp-hf-space/Dockerfile` and `deploy/whatsapp-hf-space/README.md`
@@ -10,7 +32,7 @@
 6. Vercel (Production): `WAHA_URL` = that URL, `WAHA_API_KEY` (same), `WHATSAPP_WEBHOOK_SECRET` (= WHATSAPP_HOOK_HMAC_KEY),
    `WHATSAPP_AUTO_REPLY=safe` → Redeploy → WhatsApp Desk → scan the QR.
 
-Free-tier limits: the Space sleeps after 48 h without requests (the app's daily jobs ping it), and a restart may log
+Note (Nov 2026): Hugging Face now requires a paid plan for Docker Spaces. Free-tier limits that applied: the Space sleeps after 48 h without requests (the app's daily jobs ping it), and a restart may log
 WhatsApp out — the desk then shows a new QR to scan. For no restarts, use the Oracle path below.
 
 ## Fastest path with a card: one command on an Oracle Always Free server

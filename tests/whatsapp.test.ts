@@ -1,6 +1,7 @@
 import { createHmac } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { parseChats, parseMessages, parseStatus, parseWebhook, verifyWebhook } from "@/lib/integrations/waha";
+import { chatsFromHistory, mergeHistory, phoneLink } from "@/modules/whatsapp/transport-logic";
 import { autoDecision, chatIdFor, checkSend, cleanDraft, draftPrompt, isWaOptOut, lastInboundAt, needsCare, phoneOf, sendKind } from "@/modules/whatsapp/logic";
 
 describe("WhatsApp Desk rules", () => {
@@ -105,5 +106,31 @@ describe("WhatsApp automation (Founder's 'safe' auto-reply policy)", () => {
     expect(autoDecision({ ...base, hasMedia: true }).action).toBe("approval");
     expect(autoDecision({ ...base, autoSentLastHour: 4 }).action).toBe("approval");
     expect(autoDecision({ ...base, policy: "off" })).toEqual({ action: "approval", reasons: ["auto-reply is off"] });
+  });
+});
+
+describe("phone gateway (Termux on the Founder's phone)", () => {
+  const now = Date.parse("2026-11-03T12:00:00Z");
+  it("is online only if the phone checked in during the last 3 minutes", () => {
+    expect(phoneLink(null, now).status).toBe("OFFLINE");
+    expect(phoneLink({ status: "connected", pairing_code: null, me: "919", last_seen: "2026-11-03T11:59:00Z" }, now).status).toBe("WORKING");
+    expect(phoneLink({ status: "connected", pairing_code: null, me: "919", last_seen: "2026-11-03T11:50:00Z" }, now).status).toBe("OFFLINE");
+    expect(phoneLink({ status: "pairing", pairing_code: "ABCD-1234", me: null, last_seen: "2026-11-03T11:59:30Z" }, now)).toMatchObject({ status: "PAIRING", pairingCode: "ABCD-1234" });
+    expect(phoneLink({ status: "logged_out", pairing_code: null, me: null, last_seen: "2026-11-03T11:59:30Z" }, now).status).toBe("LOGGED_OUT");
+  });
+  const inbound = [{ wa_message_id: "w1", chat_id: "919876543210@c.us", body: "Hi", created_at: "2026-11-03T10:00:00Z" }, { wa_message_id: "w2", chat_id: "919111111111@c.us", body: null, created_at: "2026-11-03T09:00:00Z" }];
+  const outbound = [{ id: "o1", chat_id: "919876543210@c.us", body: "Namaste!", status: "pending", created_at: "2026-11-03T10:01:00Z" }];
+  it("rebuilds the conversation from what the app recorded", () => {
+    const h = mergeHistory(inbound.filter((m) => m.chat_id.startsWith("9198")), outbound);
+    expect(h.map((m) => `${m.fromMe ? "us" : "them"}:${m.body}`)).toEqual(["them:Hi", "us:Namaste!  ⏳"]);
+    const chats = chatsFromHistory(inbound, outbound);
+    expect(chats.map((c) => c.id)).toEqual(["919876543210@c.us", "919111111111@c.us"]);
+    expect(chats[0]).toMatchObject({ lastText: "Namaste!", lastFromMe: true });
+    expect(chats[1]!.lastText).toBe("📎 media");
+  });
+  it("treats Baileys and WAHA ids as the same person", () => {
+    const p = { event: "message", payload: { id: "X1", from: "919876543210@s.whatsapp.net", fromMe: false, body: "Hello", timestamp: 1 } };
+    expect(parseWebhook(p)?.chatId).toBe("919876543210@c.us");
+    expect(parseWebhook({ ...p, payload: { ...p.payload, from: "1234567890123@lid" } })).toBeNull();
   });
 });

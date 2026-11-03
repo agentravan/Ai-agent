@@ -114,6 +114,15 @@ begin
     insert into public.whatsapp_inbound (organisation_id, wa_message_id, chat_id) values (private.auth_org_id(), 'x', '919876543210@c.us');
     raise exception 'users can forge incoming WhatsApp messages';
   exception when insufficient_privilege then null; end;
+  insert into public.whatsapp_outbox (organisation_id, chat_id, body, created_by) values (private.auth_org_id(), '919876543210@c.us', 'Hello', auth.uid());
+  begin
+    insert into public.whatsapp_outbox (organisation_id, chat_id, body, status, created_by) values (private.auth_org_id(), '919876543210@c.us', 'x', 'sent', auth.uid());
+    raise exception 'users can mark messages as sent';
+  exception when insufficient_privilege then null; end;
+  begin
+    insert into public.whatsapp_gateway (organisation_id, status) values (private.auth_org_id(), 'connected');
+    raise exception 'users can fake the gateway status';
+  exception when insufficient_privilege then null; end;
   -- Board meetings; the INR North Star follows the Founder's USD target and rate.
   insert into public.board_meetings (organisation_id, topic, created_by) values (private.auth_org_id(), 'Phase 0 revenue', auth.uid()) returning id into t1;
   insert into public.board_messages (organisation_id, meeting_id, seq, speaker, body) values (private.auth_org_id(), t1, 0, 'Atlas', 'Start with websites');
@@ -198,6 +207,10 @@ do $$ declare l uuid; begin
   begin
     insert into public.whatsapp_sends (organisation_id, chat_id, body, kind, sent_by) values (private.auth_org_id(), '919876543211@c.us', 'Hi', 'reply', auth.uid());
     raise exception 'member sent a WhatsApp message';
+  exception when insufficient_privilege then null; end;
+  begin
+    insert into public.whatsapp_outbox (organisation_id, chat_id, body, created_by) values (private.auth_org_id(), '919876543211@c.us', 'Hi', auth.uid());
+    raise exception 'member queued a WhatsApp message';
   exception when insufficient_privilege then null; end;
 end $$;
 
