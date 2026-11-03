@@ -2,8 +2,8 @@ import Link from "next/link";
 import { BookOpen, Radar, Search, ShieldCheck } from "lucide-react";
 import { Badge, Card, Empty, PageHeader, Select, type SearchParams } from "@/components/ui";
 import { requireContext } from "@/modules/auth/session";
-import { PLAYBOOKS } from "@/modules/knowledge/catalog";
-import { DOMAIN_LABEL, KIND_LABEL, searchPlaybooks, type PlaybookKind } from "@/modules/knowledge/logic";
+import { PLAYBOOKS, SPECIALIST_RULES } from "@/modules/knowledge/catalog";
+import { COMPANY_STAGE, DOMAIN_LABEL, KIND_LABEL, searchPlaybooks, type PlaybookKind } from "@/modules/knowledge/logic";
 
 export const metadata = { title: "Executive Playbooks" };
 
@@ -53,6 +53,19 @@ export default async function PlaybooksPage({ searchParams }: { searchParams: Se
             ))}
           </ul>
         ) : <Empty icon={BookOpen}>Nothing matches. Try one simple word like &quot;pricing&quot; or &quot;hiring&quot;.</Empty>}
+      </Card>
+
+      <Card title="Expert rules your executives follow" description={`How an experienced specialist decides in each field — used by every agent of that field. ${COMPANY_STAGE}`} className="mt-6">
+        <ul className="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
+          {Object.entries(SPECIALIST_RULES.rules).map(([field, text]) => (
+            <li key={field} className="rounded-lg border border-line bg-panel-2/30 p-3 text-sm">
+              <details>
+                <summary className="cursor-pointer font-medium text-zinc-100">{DOMAIN_LABEL[field] ?? field}</summary>
+                <p className="mt-2 max-h-80 overflow-y-auto whitespace-pre-wrap text-xs leading-relaxed text-zinc-400">{text}</p>
+              </details>
+            </li>
+          ))}
+        </ul>
       </Card>
 
       <p className="mt-6 flex items-start gap-2 text-xs text-zinc-500">

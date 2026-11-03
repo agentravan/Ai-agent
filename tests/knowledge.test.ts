@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import playbookData from "@/data/playbooks.json";
 import radarData from "@/data/agent-radar.json";
-import { domainsFor, pickPassages, playbookBlock, safeRepoUrl, searchPlaybooks, searchRadar, type Playbook, type RadarEntry } from "@/modules/knowledge/logic";
+import rulesData from "@/data/specialist-rules.json";
+import { COMPANY_STAGE, domainsFor, pickPassages, specialistBlock, playbookBlock, safeRepoUrl, searchPlaybooks, searchRadar, type Playbook, type RadarEntry } from "@/modules/knowledge/logic";
 
 const books = (playbookData as unknown as { playbooks: Playbook[] }).playbooks;
 const radar = (radarData as unknown as { agents: RadarEntry[] }).agents;
@@ -52,5 +53,25 @@ describe("each agent reads its own shelf", () => {
     expect(searchPlaybooks(books, "okr", "", "skill")[0]?.slug).toMatch(/okr/);
     expect(searchPlaybooks(books, "", "legal", "").every((b) => b.domain === "legal")).toBe(true);
     expect(searchRadar(radar, "memory", "").length).toBeGreaterThan(0);
+  });
+});
+
+
+describe("specialist rules (Open Executive's nine specialists)", () => {
+  const rules = (rulesData as unknown as { rules: Record<string, string> }).rules;
+  it("covers all nine fields, cleaned and adapted", () => {
+    expect(Object.keys(rules).sort()).toEqual(["board", "finance", "hr", "legal", "marketing", "operations", "product", "sales", "strategy"]);
+    const all = Object.values(rules).join("\n");
+    expect(/https?:\/\/|<[a-z_]+>|failure_cases|system prompt/i.test(all)).toBe(false);
+    expect(Object.values(rules).every((r) => r.startsWith("Think like an experienced"))).toBe(true);
+    expect(rules.finance).toMatch(/bootstrapped/);
+  });
+  it("gives each agent its main field's rules plus our real company stage", () => {
+    const block = specialistBlock(rules, ["finance"]);
+    expect(block).toContain(COMPANY_STAGE);
+    expect(block).toMatch(/Chief Financial Officer/);
+    expect(block).toMatch(/approvals above still come first/);
+    expect(specialistBlock(rules, ["nothing"])).toBe("");
+    expect(specialistBlock(rules, ["strategy", "board"])).toMatch(/Chief Strategy Officer/);
   });
 });

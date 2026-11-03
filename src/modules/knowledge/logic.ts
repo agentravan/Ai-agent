@@ -94,3 +94,15 @@ export function searchRadar(entries: readonly RadarEntry[], q: string, category:
   return entries.filter((e) => (!category || e.categories.includes(category))
     && (!words.length || words.some((w) => `${e.name} ${e.description}`.toLowerCase().includes(w))));
 }
+
+/* ───────────── Specialist rules (Open Executive's nine specialists, Apache-2.0) ───────────── */
+
+/** Our real stage, so the rules pick their bootstrapped guidance (no VC benchmarks, work from cash). */
+export const COMPANY_STAGE = "Company stage: bootstrapped and self-funded, run by a solo founder with AI employees, ₹0 infrastructure budget, selling to small businesses in India first.";
+
+/** The decision rules of the agent's main field: how an experienced specialist thinks, not who the agent is. */
+export function specialistBlock(rules: Readonly<Record<string, string>>, domains: readonly string[], maxChars = 3400): string {
+  const field = domains.find((d) => rules[d]);
+  if (!field) return "";
+  return `\n${COMPANY_STAGE}\nExpert rules for your field (${DOMAIN_LABEL[field] ?? field}) — use them to decide well; your own role, company rules and approvals above still come first:\n${rules[field]!.slice(0, maxChars)}\n(end of expert rules)`;
+}
