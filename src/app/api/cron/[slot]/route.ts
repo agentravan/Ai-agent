@@ -7,6 +7,7 @@ import type { AppContext } from "@/modules/auth/session";
 import { runAutopilot } from "@/modules/autopilot/service";
 import { runDueStandup } from "@/modules/board/service";
 import { activeProvider } from "@/lib/ai/registry";
+import { sessionStatus, wahaConfigured } from "@/lib/integrations/waha";
 import { buildDailyReport, type Slot } from "@/modules/reports/daily";
 import type { Organisation, Profile } from "@/types/domain";
 
@@ -37,6 +38,9 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ slot
   if (!authorised(req)) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   const { slot } = await params;
   if (slot !== "morning" && slot !== "evening" && slot !== "autopilot") return NextResponse.json({ error: "unknown slot" }, { status: 404 });
+
+  // Keep-alive for a free-hosted WhatsApp gateway (e.g. a Hugging Face Space sleeps after 48 h without requests).
+  if (wahaConfigured()) await sessionStatus().catch(() => null);
 
   const db = createServiceDb();
   if (!db) return NextResponse.json({ status: "pending", reason: "SUPABASE_SERVICE_ROLE_KEY not configured" }, { status: 503 });
