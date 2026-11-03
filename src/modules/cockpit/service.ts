@@ -20,7 +20,7 @@ export interface UnitOverview {
 
 export interface Cockpit {
   agents: AgentWithPermissions[];
-  last24h: { tasksDone: number; tasksCreated: number; runsOk: number; runsFailed: number; decisions: number; opportunities: number };
+  last24h: { tasksDone: number; tasksCreated: number; runsOk: number; runsFailed: number; lastFailureAt: string | null; lastSuccessAt: string | null; decisions: number; opportunities: number };
   units: UnitOverview[];
   finance: FinanceSummary;
   desk: { agent: AgentWithPermissions; entry: DeskEntry; pendingFinanceApprovals?: number }[];
@@ -137,6 +137,9 @@ export async function loadCockpit(ctx: AppContext): Promise<Cockpit> {
       tasksCreated: T.filter((t) => withinHours(t.created_at, 24)).length,
       runsOk: (runs.data ?? []).filter((r) => r.status === "succeeded").length,
       runsFailed: (runs.data ?? []).filter((r) => r.status === "failed").length,
+      // When the failures happened matters: old ones (before a fix) are not today's problem.
+      lastFailureAt: (runs.data ?? []).filter((r) => r.status === "failed").map((r) => r.created_at).sort().at(-1) ?? null,
+      lastSuccessAt: (runs.data ?? []).filter((r) => r.status === "succeeded").map((r) => r.created_at).sort().at(-1) ?? null,
       decisions: audit.filter((a) => a.action === "approval.approved" || a.action === "approval.rejected").length,
       opportunities: audit.filter((a) => a.entity === "opportunities" && a.action === "insert").length,
     },
