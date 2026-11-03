@@ -1,7 +1,8 @@
 import "server-only";
 import { env } from "@/lib/env";
 import { activeProvider } from "@/lib/ai/registry";
-import { sendText, type InboundMessage } from "@/lib/integrations/waha";
+import type { InboundMessage } from "@/lib/integrations/waha";
+import { send } from "./transport";
 import { UserFacingError } from "@/lib/utilities/action";
 import { logEvent } from "@/modules/audit/service";
 import type { AppContext } from "@/modules/auth/session";
@@ -53,7 +54,7 @@ export async function handleInbound(ctx: AppContext, msg: InboundMessage): Promi
     const check = checkSend({ text: draft.draft, optedOut: false, kind: "reply", newToday: 0, dailyNewLimit: env.WHATSAPP_DAILY_NEW_LIMIT });
     if (!check.ok) return mark("failed", check.reason);
     try {
-      const waId = await sendText(msg.chatId, draft.draft);
+      const waId = await send(ctx, msg.chatId, draft.draft);
       await ctx.db.from("whatsapp_sends").insert({ organisation_id: org, chat_id: msg.chatId, body: draft.draft, kind: "reply", drafted_by: draft.agentId, sent_by: null, wa_message_id: waId });
       await logEvent(ctx, { action: "whatsapp.auto_sent", entity: "whatsapp_sends", actorType: "agent", metadata: { chat: msg.chatId.slice(-4), policy: "safe" } });
       return mark("auto_sent");
@@ -82,7 +83,7 @@ export async function sendApprovedReply(ctx: AppContext, payload: Record<string,
   const { data: contact } = await ctx.db.from("whatsapp_contacts").select("opted_out").eq("organisation_id", ctx.organisation.id).eq("chat_id", chatId).maybeSingle<{ opted_out: boolean }>();
   const check = checkSend({ text, optedOut: contact?.opted_out ?? false, kind: "reply", newToday: 0, dailyNewLimit: env.WHATSAPP_DAILY_NEW_LIMIT });
   if (!check.ok) throw new UserFacingError(check.reason);
-  const waId = await sendText(chatId, text).catch(() => { throw new UserFacingError("The WhatsApp gateway did not accept the message — is it online?"); });
+  const waId = await send(ctx, chatId, text).catch(() => { throw new UserFacingError("The WhatsApp gateway did not accept the message — is it online?"); });
   await ctx.db.from("whatsapp_sends").insert({
     organisation_id: ctx.organisation.id, chat_id: chatId, body: text.slice(0, 4000), kind: "reply", sent_by: ctx.userId, wa_message_id: waId,
     drafted_by: null,

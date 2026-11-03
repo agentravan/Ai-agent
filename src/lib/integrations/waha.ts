@@ -134,8 +134,9 @@ export function parseWebhook(raw: unknown): InboundMessage | null {
   if (e?.event !== "message" || !e.payload) return null;
   const p = e.payload;
   if (p.fromMe === true) return null;
-  const chatId = idOf(p.from);
-  if (!/^\d{8,15}@(c\.us|s\.whatsapp\.net)$/.test(chatId)) return null;
+  // One id per person: phone-gateway (Baileys) ids end in @s.whatsapp.net, WAHA's in @c.us.
+  const chatId = idOf(p.from).replace(/@s\.whatsapp\.net$/, "@c.us");
+  if (!/^\d{8,15}@c\.us$/.test(chatId)) return null;
   const id = idOf(p.id);
   const body = typeof p.body === "string" ? p.body.trim().slice(0, 4000) : "";
   if (!id || (!body && p.hasMedia !== true)) return null;

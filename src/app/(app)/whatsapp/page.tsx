@@ -30,14 +30,32 @@ function Connection({ s }: { s: DeskState }) {
       </Card>
       <Card title="Later: fully automatic chats (optional)" description="Free, no Meta setup — your own number, logged in by QR like WhatsApp Web.">
         <ol className="list-decimal space-y-1.5 pl-5 text-sm text-zinc-300">
-          <li>Run the free WhatsApp gateway (WAHA) on a server that stays on — a free Oracle Cloud server works, set up from a phone browser via Cloud Shell. Guide: <code>docs/WHATSAPP_SETUP.md</code>.</li>
-          <li>Add <code>WAHA_URL</code> and <code>WAHA_API_KEY</code> in Vercel → Settings → Environment Variables, then redeploy.</li>
-          <li>Come back here and scan the QR with WhatsApp Business → Linked devices.</li>
+          <li>Easiest, ₹0: run the phone gateway in <b>Termux</b> on your own phone (no card, no laptop) — or a WAHA server. Guide: <code>docs/WHATSAPP_SETUP.md</code>.</li>
+          <li>Add <code>WHATSAPP_WEBHOOK_SECRET</code> in Vercel (phone gateway) — or <code>WAHA_URL</code> + <code>WAHA_API_KEY</code> for a WAHA server — then redeploy.</li>
+          <li>Link WhatsApp: the code shown here (phone gateway) or the QR (WAHA) → WhatsApp → Linked devices.</li>
         </ol>
         <p className="mt-3 text-xs text-amber-300">This uses WhatsApp Web, not Meta&apos;s official API. Keep it to real conversations (the desk caps new contacts per day) so WhatsApp doesn&apos;t restrict the number.</p>
       </Card>
       </>
     );
+  }
+  if (s.mode === "phone") {
+    if (s.status === "PAIRING" && s.pairingCode) {
+      return (
+        <Card title="Link your WhatsApp" description="On the business phone: WhatsApp → ⋮ → Linked devices → Link a device → Link with phone number instead → enter this code.">
+          <p className="text-center font-mono text-4xl font-bold tracking-[0.3em] text-emerald-300">{s.pairingCode}</p>
+          <AutoRefresh seconds={8} />
+        </Card>
+      );
+    }
+    if (s.status === "OFFLINE" || s.status === "LOGGED_OUT" || s.status === "STARTING") {
+      const title = s.status === "LOGGED_OUT" ? "WhatsApp was unlinked" : s.status === "STARTING" ? "Phone gateway is connecting…" : "Your phone gateway is offline";
+      const hint = s.status === "LOGGED_OUT" ? "Open Termux and run the gateway again — it will show a new code to link."
+        : s.status === "STARTING" ? "This page refreshes by itself."
+          : `Open Termux on the phone (keep it running, internet on). ${s.lastSeen ? `Last seen ${new Intl.DateTimeFormat("en-IN", { timeZone: "Asia/Kolkata", day: "numeric", month: "short", hour: "numeric", minute: "2-digit" }).format(new Date(s.lastSeen))}.` : "It has not connected yet — see docs/WHATSAPP_SETUP.md (phone gateway)."} Replies wait in the queue and go out when it's back.`;
+      return <Card title={title} className="mb-4"><p className="text-sm text-amber-200">{hint}</p><AutoRefresh seconds={20} /></Card>;
+    }
+    return null;
   }
   if (s.status === "UNREACHABLE") return <Card title="WhatsApp gateway offline"><p className="text-sm text-rose-300">{s.error}</p><AutoRefresh seconds={30} /></Card>;
   if (s.status === "SCAN_QR_CODE") {
@@ -57,7 +75,7 @@ export default async function WhatsappPage({ searchParams }: { searchParams: Sea
   const params = await searchParams;
   const s = await deskState(ctx);
   const selected = typeof params.chat === "string" && /^\d{8,15}@(c\.us|s\.whatsapp\.net)$/.test(params.chat) ? params.chat : null;
-  const chat = selected && s.status === "WORKING" ? await openChat(ctx, selected) : null;
+  const chat = selected && (s.status === "WORKING" || s.mode === "phone") ? await openChat(ctx, selected) : null;
   const current = selected ? s.chats.find((c) => c.id === selected) : undefined;
   const canOperate = can(ctx.profile.role, "operate");
   const canSend = can(ctx.profile.role, "govern");
@@ -66,11 +84,11 @@ export default async function WhatsappPage({ searchParams }: { searchParams: Sea
     <>
       <PageHeader eyebrow="Operations · Client chat" title="WhatsApp Desk"
         subtitle="Your team answers clients on your own WhatsApp number. Iris drafts every reply; nothing is sent until you press Send."
-        action={s.status === "WORKING" ? <Badge tone="good">{`Connected${s.me ? ` · +${s.me}` : ""}`}</Badge> : undefined} />
+        action={s.status === "WORKING" ? <Badge tone="good">{`Connected${s.me ? ` · +${s.me}` : ""}${s.mode === "phone" ? " · phone" : ""}`}</Badge> : undefined} />
       <Flash params={params} />
       <Connection s={s} />
 
-      {s.status === "WORKING" && (
+      {(s.status === "WORKING" || s.mode === "phone") && (
         <div className="grid gap-4 lg:grid-cols-[20rem_1fr]">
           <Card title="Chats" description={`New people today: ${s.newToday}/${s.dailyNewLimit}`} flush>
             {canOperate && (

@@ -1,6 +1,7 @@
 import "server-only";
 import { env } from "@/lib/env";
-import { chatMessages, listChats, qrDataUrl, sendText, sessionStatus, startSession, wahaConfigured, WahaError, type WaChat, type WaMessage, type WahaStatus } from "@/lib/integrations/waha";
+import { WahaError, type WaChat, type WaMessage } from "@/lib/integrations/waha";
+import * as transport from "./transport";
 import { UserFacingError } from "@/lib/utilities/action";
 import { logEvent } from "@/modules/audit/service";
 import type { AppContext } from "@/modules/auth/session";
@@ -10,10 +11,13 @@ import { chatIdFor, checkSend, cleanDraft, draftPrompt, isWaOptOut, needsCare, s
 
 export interface DeskState {
   configured: boolean;
-  status: WahaStatus | "NOT_CONFIGURED" | "UNREACHABLE";
+  mode: transport.Mode;
+  status: transport.LinkStatus | "NOT_CONFIGURED" | "UNREACHABLE";
   error: string | null;
   me: string | null;
   qr: string | null;
+  pairingCode: string | null;
+  lastSeen: string | null;
   chats: (WaChat & { optedOut: boolean; leadName: string | null })[];
   newToday: number;
   dailyNewLimit: number;
@@ -45,15 +49,15 @@ const friendly = (err: unknown) => (err instanceof WahaError ? err.message : "Th
 
 /** Everything the WhatsApp Desk shows: connection, QR when logging in, recent chats. */
 export async function deskState(ctx: AppContext): Promise<DeskState> {
-  const base: DeskState = { configured: wahaConfigured(), status: "NOT_CONFIGURED", error: null, me: null, qr: null, chats: [], newToday: 0, dailyNewLimit: env.WHATSAPP_DAILY_NEW_LIMIT };
-  if (!base.configured) return base;
+  const m = transport.mode();
+  const base: DeskState = { configured: m !== "none", mode: m, status: "NOT_CONFIGURED", error: null, me: null, qr: null, pairingCode: null, lastSeen: null, chats: [], newToday: 0, dailyNewLimit: env.WHATSAPP_DAILY_NEW_LIMIT };
+  if (m === "none") return base;
   try {
-    let { status, me } = await sessionStatus();
-    if (status === "STOPPED") { await startSession(); status = "STARTING"; }
-    const state: DeskState = { ...base, status, me, newToday: await newContactsToday(ctx) };
-    if (status === "SCAN_QR_CODE") state.qr = await qrDataUrl().catch(() => null);
-    if (status === "WORKING") {
-      const [chats, leads, out] = await Promise.all([listChats(30), leadsByChat(ctx), optedOutSet(ctx)]);
+    const l = await transport.link(ctx);
+    const state: DeskState = { ...base, status: l.status, me: l.me, qr: l.qr, pairingCode: l.pairingCode, lastSeen: l.lastSeen, newToday: await newContactsToday(ctx) };
+    // Phone mode: past chats stay readable even while the phone is offline (replies wait in the queue).
+    if (l.status === "WORKING" || m === "phone") {
+      const [chats, leads, out] = await Promise.all([transport.listChats(ctx, 30), leadsByChat(ctx), optedOutSet(ctx)]);
       state.chats = chats.map((c) => ({ ...c, optedOut: out.has(c.id), leadName: leads.get(c.id)?.name ?? null }));
     }
     return state;
@@ -67,7 +71,7 @@ export async function openChat(ctx: AppContext, chatId: string): Promise<{ messa
   const [leads, out] = await Promise.all([leadsByChat(ctx), optedOutSet(ctx)]);
   const lead = leads.get(chatId) ?? null;
   try {
-    const messages = await chatMessages(chatId, 40);
+    const messages = await transport.chatMessages(ctx, chatId, 40);
     let optedOut = out.has(chatId);
     if (!optedOut && messages.some((m) => !m.fromMe && isWaOptOut(m.body))) {
       await ctx.db.from("whatsapp_contacts").upsert({ organisation_id: ctx.organisation.id, chat_id: chatId, lead_id: lead?.id ?? null, opted_out: true, opted_out_at: new Date().toISOString() }, { onConflict: "organisation_id,chat_id" });
@@ -111,7 +115,7 @@ export async function sendMessage(ctx: AppContext, chatId: string, text: string,
   const check = checkSend({ text, optedOut: chat.optedOut, kind, newToday: kind === "first_contact" ? await newContactsToday(ctx) : 0, dailyNewLimit: env.WHATSAPP_DAILY_NEW_LIMIT });
   if (!check.ok) throw new UserFacingError(check.reason);
   let waId: string | null;
-  try { waId = await sendText(chatId, text.trim()); } catch (err) { throw new UserFacingError(friendly(err)); }
+  try { waId = await transport.send(ctx, chatId, text.trim()); } catch (err) { throw new UserFacingError(friendly(err)); }
   const { error } = await ctx.db.from("whatsapp_sends").insert({
     organisation_id: ctx.organisation.id, chat_id: chatId, body: text.trim().slice(0, 4000), kind, drafted_by: draftedBy, sent_by: ctx.userId, wa_message_id: waId,
   });
@@ -123,7 +127,8 @@ export async function sendMessage(ctx: AppContext, chatId: string, text: string,
     await ctx.db.from("leads").update({ status: "contacted", contacted_at: new Date().toISOString(), contact_channel: "whatsapp" }).eq("id", chat.lead.id).eq("organisation_id", ctx.organisation.id);
   }
   await logEvent(ctx, { action: "whatsapp.sent", entity: "whatsapp_sends", metadata: { kind, chat: chatId.slice(-4) } });
-  return kind === "first_contact" ? "Sent — first message to a new contact" : "Sent";
+  const queued = transport.mode() === "phone" ? " (your phone sends it within seconds)" : "";
+  return `${kind === "first_contact" ? "Sent — first message to a new contact" : "Sent"}${queued}`;
 }
 
 /** Opens (or starts) a chat from a phone number. */
