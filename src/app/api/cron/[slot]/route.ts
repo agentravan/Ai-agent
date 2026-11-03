@@ -5,6 +5,8 @@ import { env } from "@/lib/env";
 import { emailConfigured, sendEmail } from "@/lib/integrations/email";
 import type { AppContext } from "@/modules/auth/session";
 import { runAutopilot } from "@/modules/autopilot/service";
+import { runDueStandup } from "@/modules/board/service";
+import { activeProvider } from "@/lib/ai/registry";
 import { buildDailyReport, type Slot } from "@/modules/reports/daily";
 import type { Organisation, Profile } from "@/types/domain";
 
@@ -26,7 +28,8 @@ type Founder = Profile & { organisations: Organisation | null };
 
 /**
  * Scheduled jobs (CRON_SECRET-protected):
- *  - morning / evening: Vercel Cron, 09:00 IST briefing (+ prospecting) and 19:00 IST wrap-up, emailed to the Founder.
+ *  - morning / evening: Vercel Cron, 09:00 IST briefing (+ prospecting) and 19:00 IST wrap-up, emailed to the Founder;
+ *    each also holds the daily stand-up meeting if it has not happened yet.
  *  - autopilot: every 30 min (GitHub Actions; daily Vercel Cron as backup). Agents work ready tasks and the system
  *    heals itself. The response holds counts only: it can end up in public CI logs.
  */
@@ -70,15 +73,21 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ slot
     return NextResponse.json({ status: totals.failedOrgs ? "partial" : "ok", slot, ...totals }, { status: totals.failedOrgs && totals.failedOrgs === totals.orgs ? 500 : 200 });
   }
 
-  const results: { org: string; ok: boolean; error?: string }[] = [];
+  const results: { org: string; ok: boolean; standup?: string | null; error?: string }[] = [];
   for (const ctx of contexts) {
+    // The 09:00 / 19:00 IST crons also hold the daily stand-up, so it never depends on the 30-minute autopilot
+    // (GitHub only runs scheduled workflows from the default branch). Once per day each — the DB enforces it.
+    let standup: string | null = null;
+    if (activeProvider()) {
+      standup = await runDueStandup(ctx).catch((err: Error) => { console.error("[cron] stand-up failed", slot, err.message); return null; });
+    }
     try {
       const report = await buildDailyReport(ctx, slot as Slot, { prospect: slot === "morning" });
       await sendEmail({ to: env.REPORT_EMAIL ?? ctx.email, subject: report.subject, text: report.text, html: report.html });
-      results.push({ org: ctx.organisation.id, ok: true });
+      results.push({ org: ctx.organisation.id, ok: true, standup });
     } catch (err) {
       console.error("[cron]", slot, ctx.organisation.id, err);
-      results.push({ org: ctx.organisation.id, ok: false, error: (err as Error).message.slice(0, 200) });
+      results.push({ org: ctx.organisation.id, ok: false, standup, error: (err as Error).message.slice(0, 200) });
     }
   }
   return NextResponse.json({ status: "ok", slot, results });
