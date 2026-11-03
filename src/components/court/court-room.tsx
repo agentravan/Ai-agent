@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Gavel, Play, RotateCcw, Scale, Volume2, VolumeX } from "lucide-react";
 import { advanceTrialAction } from "@/modules/court/actions";
-import { JURY, tally, VERDICT_LABEL, type Vote } from "@/modules/court/logic";
+import { JURY, RISK_LABEL, tally, VERDICT_LABEL, type Vote } from "@/modules/court/logic";
 import type { Trial } from "@/modules/court/service";
 import { hasNaturalVoice, speakLine, type VoiceGender } from "@/components/board/voices";
 
@@ -16,25 +16,35 @@ const CAST: Record<Who, { name: string; role: string; color: string; gender: Voi
 };
 const VOTE_STYLE: Record<Vote, string> = { build: "bg-emerald-500 text-white", fix: "bg-amber-400 text-zinc-900", kill: "bg-rose-600 text-white" };
 
-interface Line { who: Who; text: string; show: "exhibit" | `q${number}` | `a${number}` | "jury" | "verdict" | "none" }
+interface Line { who: Who; text: string; show: "exhibit" | "weak" | `q${number}` | `a${number}` | "team" | "jury" | "verdict" | "none" }
 
 /** The trial as a script, built from whatever stages are ready. */
 function script(t: Trial): Line[] {
   const lines: Line[] = [{ who: "judge", text: `Court is in session. Exhibit A${t.proposed_by ? `, from ${t.proposed_by}` : ""}: ${t.idea}`, show: "exhibit" }];
   if (!t.prosecution) return lines;
   lines.push({ who: "prosecutor", text: t.prosecution.opening, show: "none" });
+  const weak = t.prosecution.weaknesses ?? [];
+  if (weak.length) {
+    lines.push({ who: "prosecutor", text: `Maine ${weak.length} weak points nikaale hain. Sabse bade: ${weak.slice(0, 3).map((w) => w.point).join(". ")}.`, show: "weak" });
+  }
   t.prosecution.questions.forEach((q, i) => {
     lines.push({ who: "prosecutor", text: q.q, show: `q${i}` });
     if (t.defence?.answers[i]) lines.push({ who: "defence", text: t.defence.answers[i]!, show: `a${i}` });
   });
   if (!t.defence) return lines;
+  for (const m of (t.defence.team ?? []).slice(0, 6)) {
+    lines.push({ who: "defence", text: `${m.who.split(" (")[0]} ki taraf se: ${m.do}${m.dont ? `. Lekin ${m.dont} nahi.` : ""}`, show: "team" });
+  }
   lines.push({ who: "defence", text: t.defence.closing, show: "none" });
   if (!t.jury || !t.ruling || !t.verdict) return lines;
   const n = tally(t.jury);
   lines.push({ who: "judge", text: `The jury has voted: ${n.build} build, ${n.fix} fix, ${n.kill} kill.`, show: "jury" });
   lines.push({ who: "judge", text: `${VERDICT_LABEL[t.verdict]}. ${t.ruling.summary}`, show: "verdict" });
   if (t.ruling.fix) lines.push({ who: "judge", text: `What to fix: ${t.ruling.fix}`, show: "verdict" });
+  const ups = t.ruling.upgrades ?? [];
+  if (ups.length) lines.push({ who: "judge", text: `Har weak point ka upgrade — kul ${ups.length}. ${ups.slice(0, 3).map((u) => u.upgrade).join(". ")}.`, show: "verdict" });
   lines.push({ who: "judge", text: `Your next test: ${t.ruling.next_test}`, show: "verdict" });
+  if (t.ruling.failure_risk) lines.push({ who: "judge", text: `${RISK_LABEL[t.ruling.failure_risk]}. ${t.ruling.risk_reason ?? ""}${t.ruling.stop_if ? ` Ruk jaana agar: ${t.ruling.stop_if}` : ""}`, show: "verdict" });
   lines.push({ who: "judge", text: t.ruling.vision, show: "verdict" });
   return lines;
 }
@@ -80,12 +90,13 @@ export function CourtRoom({ initial, canRun }: { initial: Trial; canRun: boolean
 
   // Fetch the next stage of the trial in the background, before the script runs out.
   useEffect(() => {
-    if (!playing || !canRun || loading || trial.stage === "decided" || step < lines.length - 2) return;
+    // Prepare the next stage as soon as possible, while the current one is being heard.
+    if (!playing || !canRun || loading || trial.stage === "decided" || error) return;
     setLoading(true);
     advanceTrialAction(trial.id)
       .then((r) => { if (r.ok) { setTrial(r.trial); setError(null); } else { setError(r.error); setPlaying(false); } })
       .finally(() => setLoading(false));
-  }, [playing, canRun, loading, trial.id, trial.stage, step, lines.length]);
+  }, [playing, canRun, loading, trial.id, trial.stage, error]);
 
   // Speak the current line; when it ends, move on (or wait for the next stage to arrive).
   useEffect(() => {
@@ -148,19 +159,52 @@ export function CourtRoom({ initial, canRun }: { initial: Trial; canRun: boolean
         <div className="min-h-56 space-y-2 rounded-lg bg-[#fdf6e3] p-3 text-zinc-800 shadow-inner">
           <p className="text-[10px] font-bold tracking-widest text-[#9f1d2b] uppercase">Exhibit A{trial.proposed_by ? ` · ${trial.proposed_by}` : ""}</p>
           <p className="font-serif text-base leading-snug">{trial.idea}</p>
+          {see("weak") && (trial.prosecution?.weaknesses?.length ?? 0) > 0 && (
+            <div className="rounded border border-rose-200 bg-white p-2 text-sm">
+              <p className="text-[10px] font-bold tracking-widest text-rose-700 uppercase">Weak points{see("verdict") && trial.ruling?.upgrades?.length ? " → upgrades" : ""}</p>
+              <ol className="mt-1 list-decimal space-y-1 pl-5">
+                {trial.prosecution!.weaknesses!.map((w, i) => {
+                  const up = see("verdict") ? trial.ruling?.upgrades?.[i] : undefined;
+                  return (
+                    <li key={i}>
+                      <span className="text-rose-800">{w.point}</span>
+                      {up && <span className="block text-emerald-800">↳ {up.upgrade} <span className="text-xs text-zinc-500">[{up.owner}]</span></span>}
+                    </li>
+                  );
+                })}
+              </ol>
+            </div>
+          )}
           {trial.prosecution?.questions.map((q, i) => see(`q${i}`) && (
             <div key={i} className="rounded border border-rose-200 bg-white p-2 text-sm">
               <p className="font-medium text-rose-700">Q{i + 1}. {q.q}</p>
               {see(`a${i}`) && trial.defence?.answers[i] && <p className="mt-1 border-l-2 border-blue-400 pl-2 text-blue-800">{trial.defence.answers[i]}</p>}
             </div>
           ))}
+          {see("team") && (trial.defence?.team?.length ?? 0) > 0 && (
+            <div className="rounded border border-blue-200 bg-white p-2 text-sm">
+              <p className="text-[10px] font-bold tracking-widest text-blue-800 uppercase">Defence, for the team</p>
+              <ul className="mt-1 space-y-1">
+                {trial.defence!.team!.map((m, i) => (
+                  <li key={i}><span className="font-medium">{m.who}:</span> <span className="text-emerald-800">do {m.do}</span>{m.dont && <span className="text-rose-700"> · don&apos;t {m.dont}</span>}</li>
+                ))}
+              </ul>
+            </div>
+          )}
           {see("verdict") && trial.verdict && trial.ruling && (
             <div className="rounded-lg border-2 border-dashed border-zinc-300 bg-white p-3 text-center">
               <p className="text-[10px] font-bold tracking-widest text-zinc-500 uppercase">Verdict</p>
               <p className={`mx-auto mt-1 inline-block -rotate-3 rounded-full px-5 py-1 text-xl font-black tracking-wide ring-4 ring-offset-2 ${VOTE_STYLE[trial.verdict]}`}>{VERDICT_LABEL[trial.verdict]}</p>
               <p className="mt-2 text-sm">{trial.ruling.summary}</p>
               {trial.ruling.fix && <p className="mt-2 text-sm"><span className="font-semibold">Fix: </span>{trial.ruling.fix}</p>}
+              {trial.ruling.plan?.length ? (
+                <ol className="mx-auto mt-2 max-w-md list-decimal pl-5 text-left text-sm">{trial.ruling.plan.map((p, i) => <li key={i}>{p}</li>)}</ol>
+              ) : null}
               <p className="mt-1 text-sm"><span className="font-semibold">Next test (7 days, ₹0): </span>{trial.ruling.next_test}</p>
+              {trial.ruling.failure_risk && (
+                <p className="mt-1 text-sm"><span className={`rounded px-1.5 text-xs font-bold ${trial.ruling.failure_risk === "low" ? "bg-emerald-100 text-emerald-800" : trial.ruling.failure_risk === "medium" ? "bg-amber-100 text-amber-900" : "bg-rose-100 text-rose-800"}`}>{RISK_LABEL[trial.ruling.failure_risk]}</span> {trial.ruling.risk_reason}</p>
+              )}
+              {trial.ruling.stop_if && <p className="mt-1 text-sm"><span className="font-semibold">Stop if: </span>{trial.ruling.stop_if}</p>}
               <p className="mt-2 font-serif text-base italic text-[#9f1d2b]">“{trial.ruling.vision}”</p>
             </div>
           )}
