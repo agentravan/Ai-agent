@@ -4,6 +4,7 @@
  * Unofficial: WhatsApp may restrict numbers that spam; the WhatsApp Desk keeps volumes small and human-approved.
  * The API key is server-only (X-Api-Key header). Nothing here runs unless WAHA_URL and WAHA_API_KEY are set.
  */
+import { createHmac, timingSafeEqual } from "node:crypto";
 import { env } from "@/lib/env";
 
 export type WahaStatus = "WORKING" | "SCAN_QR_CODE" | "STARTING" | "STOPPED" | "FAILED" | "UNKNOWN";
@@ -112,4 +113,31 @@ export async function chatMessages(chatId: string, limit = 30): Promise<WaMessag
 export async function sendText(chatId: string, text: string): Promise<string | null> {
   const r = await call<Record<string, unknown>>("/api/sendText", { method: "POST", body: JSON.stringify({ session: env.WAHA_SESSION, chatId, text }) });
   return idOf(r?.id) || null;
+}
+
+/* ───────────── Webhook (WAHA → AI Empire) ───────────── */
+
+
+/** WAHA signs the raw body with HMAC-SHA512 (hex) in X-Webhook-Hmac. Constant-time compare. */
+export function verifyWebhook(rawBody: string, signature: string | null, secret: string | undefined): boolean {
+  if (!secret || !signature) return false;
+  const want = Buffer.from(createHmac("sha512", secret).update(rawBody).digest("hex"));
+  const got = Buffer.from(signature.trim().toLowerCase());
+  return got.length === want.length && timingSafeEqual(got, want);
+}
+
+export interface InboundMessage { id: string; chatId: string; body: string; hasMedia: boolean; at: number }
+
+/** A real incoming 1:1 text from a client — or null (our own messages, groups, status, reactions, etc.). */
+export function parseWebhook(raw: unknown): InboundMessage | null {
+  const e = raw as { event?: unknown; payload?: Record<string, unknown> };
+  if (e?.event !== "message" || !e.payload) return null;
+  const p = e.payload;
+  if (p.fromMe === true) return null;
+  const chatId = idOf(p.from);
+  if (!/^\d{8,15}@(c\.us|s\.whatsapp\.net)$/.test(chatId)) return null;
+  const id = idOf(p.id);
+  const body = typeof p.body === "string" ? p.body.trim().slice(0, 4000) : "";
+  if (!id || (!body && p.hasMedia !== true)) return null;
+  return { id: id.slice(0, 200), chatId, body, hasMedia: p.hasMedia === true, at: num(p.timestamp) ?? Math.floor(Date.now() / 1000) };
 }

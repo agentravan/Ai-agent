@@ -37,6 +37,13 @@ export default async function ApprovalsPage({ searchParams }: { searchParams: Se
                 <Badge>{a.risk}</Badge><Badge tone="neutral">{a.action_type}</Badge>
                 <span className="ml-auto text-xs text-muted">{names.get(a.requested_by_agent_id ?? "") ?? "Founder team"} · {formatDateTime(a.created_at)}</span>
               </div>
+              {a.action_type === "external.whatsapp_reply" && (
+                <div className="mt-2 space-y-1.5 text-sm">
+                  <p className="rounded-md bg-zinc-800 px-3 py-2 text-zinc-200"><span className="text-xs text-zinc-500">Client said: </span>{String((a.payload as { client_said?: unknown }).client_said ?? "")}</p>
+                  <p className="rounded-md bg-emerald-900/50 px-3 py-2 text-emerald-50"><span className="text-xs text-emerald-300">Iris will send: </span>{String((a.payload as { text?: unknown }).text ?? "")}</p>
+                  <p className="text-xs text-amber-300">Check: {((a.payload as { why_review?: unknown }).why_review as string[] | undefined)?.join("; ") ?? "needs review"}. Approve sends it on WhatsApp now.</p>
+                </div>
+              )}
               <details className="mt-2 text-sm">
                 <summary className="cursor-pointer text-xs text-gold">Action details</summary>
                 <pre className="mt-2 max-h-72 overflow-auto rounded-lg bg-panel-2/60 p-3 text-xs text-zinc-300">{JSON.stringify(a.payload, null, 2)}</pre>

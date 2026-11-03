@@ -76,3 +76,20 @@ Reply with ONLY the message text.`;
 export function cleanDraft(text: string): string {
   return text.replace(/```[a-z]*\n?|```/gi, "").replace(/^\s*(us|reply|message)\s*:\s*/i, "").replace(/\*\*(.+?)\*\*/g, "*$1*").trim().slice(0, 1500);
 }
+
+export type AutoDecision = { action: "send" } | { action: "approval"; reasons: string[] };
+
+/**
+ * The Founder's auto-reply policy ("safe"): Iris may answer on her own only when neither the client's message nor
+ * her draft touches price, money, legal or dates, the chat isn't being flooded, and policy is on.
+ */
+export function autoDecision(input: { policy: "off" | "safe"; inbound: string; draft: string; autoSentLastHour: number; hasMedia: boolean }): AutoDecision {
+  const reasons: string[] = [];
+  if (input.policy !== "safe") reasons.push("auto-reply is off");
+  const care = [...new Set([...needsCare(input.inbound), ...needsCare(input.draft)])];
+  if (care.length) reasons.push(`mentions ${care.join(", ")}`);
+  if (input.hasMedia) reasons.push("the client sent a photo/file — needs a human look");
+  if (input.autoSentLastHour >= 4) reasons.push("many automatic replies in this chat in the last hour");
+  if (!input.draft.trim()) reasons.push("no draft");
+  return reasons.length ? { action: "approval", reasons } : { action: "send" };
+}

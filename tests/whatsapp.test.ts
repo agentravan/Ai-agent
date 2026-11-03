@@ -1,6 +1,7 @@
+import { createHmac } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { parseChats, parseMessages, parseStatus } from "@/lib/integrations/waha";
-import { chatIdFor, checkSend, cleanDraft, draftPrompt, isWaOptOut, lastInboundAt, needsCare, phoneOf, sendKind } from "@/modules/whatsapp/logic";
+import { parseChats, parseMessages, parseStatus, parseWebhook, verifyWebhook } from "@/lib/integrations/waha";
+import { autoDecision, chatIdFor, checkSend, cleanDraft, draftPrompt, isWaOptOut, lastInboundAt, needsCare, phoneOf, sendKind } from "@/modules/whatsapp/logic";
 
 describe("WhatsApp Desk rules", () => {
   it("turns phone numbers into WhatsApp chat ids", () => {
@@ -72,5 +73,37 @@ describe("WAHA gateway parsing (tolerant of engine differences)", () => {
     ]);
     expect(m.map((x) => x.id)).toEqual(["a", "b", "d"]);
     expect(m[2]!.hasMedia).toBe(true);
+  });
+});
+
+
+describe("WhatsApp automation (Founder's 'safe' auto-reply policy)", () => {
+  const secret = "s".repeat(32);
+  const body = JSON.stringify({ event: "message", session: "default", payload: { id: "false_919876543210@c.us_ABC", from: "919876543210@c.us", fromMe: false, body: "Timing kya hai?", timestamp: 1700000000 } });
+  const sig = createHmac("sha512", secret).update(body).digest("hex");
+  it("accepts only correctly signed webhooks", () => {
+    expect(verifyWebhook(body, sig, secret)).toBe(true);
+    expect(verifyWebhook(body, sig.toUpperCase(), secret)).toBe(true);
+    expect(verifyWebhook(body + " ", sig, secret)).toBe(false);
+    expect(verifyWebhook(body, sig, undefined)).toBe(false);
+    expect(verifyWebhook(body, null, secret)).toBe(false);
+  });
+  it("reads real client messages, ignores ours, groups and other events", () => {
+    expect(parseWebhook(JSON.parse(body))).toMatchObject({ chatId: "919876543210@c.us", body: "Timing kya hai?", hasMedia: false });
+    const p = JSON.parse(body);
+    expect(parseWebhook({ ...p, payload: { ...p.payload, fromMe: true } })).toBeNull();
+    expect(parseWebhook({ ...p, payload: { ...p.payload, from: "1203630@g.us" } })).toBeNull();
+    expect(parseWebhook({ ...p, event: "message.ack" })).toBeNull();
+    expect(parseWebhook({ ...p, payload: { ...p.payload, body: "" } })).toBeNull();
+  });
+  const base = { policy: "safe" as const, inbound: "Timing kya hai?", draft: "Hum 10 se 7 khule hain. Kab aana chahenge?", autoSentLastHour: 0, hasMedia: false };
+  it("sends simple answers on its own", () => expect(autoDecision(base)).toEqual({ action: "send" }));
+  it("sends price, money, legal, dates, media and floods to the Founder", () => {
+    expect(autoDecision({ ...base, inbound: "Website kitne ka hai?" }).action).toBe("approval");
+    expect(autoDecision({ ...base, draft: "₹15,000 lagega" }).action).toBe("approval");
+    expect(autoDecision({ ...base, inbound: "GST bill milega?" }).action).toBe("approval");
+    expect(autoDecision({ ...base, hasMedia: true }).action).toBe("approval");
+    expect(autoDecision({ ...base, autoSentLastHour: 4 }).action).toBe("approval");
+    expect(autoDecision({ ...base, policy: "off" })).toEqual({ action: "approval", reasons: ["auto-reply is off"] });
   });
 });

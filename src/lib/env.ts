@@ -69,6 +69,11 @@ const schema = z.object({
   WAHA_SESSION: z.string().trim().regex(/^[a-zA-Z0-9_-]{1,40}$/).catch("default"),
   // Max NEW people the team may message first per day (protects the number from being flagged).
   WHATSAPP_DAILY_NEW_LIMIT: intIn(1, 30, 10),
+  // Shared secret WAHA signs its webhook with (HMAC-SHA512). Without it, incoming messages are not accepted.
+  WHATSAPP_WEBHOOK_SECRET: optional,
+  // Founder's policy (3 Nov 2026): "safe" = Iris answers simple questions on her own; anything about price, money,
+  // legal or dates goes to the Approval Center. "off" = every reply waits for approval.
+  WHATSAPP_AUTO_REPLY: z.enum(["off", "safe"]).catch("off"),
 });
 
 export type Env = z.infer<typeof schema>;

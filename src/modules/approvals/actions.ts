@@ -8,6 +8,7 @@ import { executeApprovedPayload } from "@/modules/orchestration/apply";
 import { listAgents } from "@/modules/orchestration/engine";
 import type { Approval } from "@/types/domain";
 import { lessonFromDecision } from "@/modules/learning/logic";
+import { sendApprovedReply, WHATSAPP_ACTION } from "@/modules/whatsapp/automation";
 
 export async function decideApprovalAction(form: FormData) {
   const back = form.get("return_to") === "/dashboard" ? "/dashboard" : "/approvals";
@@ -35,7 +36,10 @@ export async function decideApprovalAction(form: FormData) {
       const agents = await listAgents(ctx);
       const actor = agents.find((a) => a.id === approval.requested_by_agent_id) ?? null;
       try {
-        ref = await executeApprovedPayload(ctx, approval.payload, actor, agents, overrides);
+        // A WhatsApp reply Iris drafted: approving it sends it to the client now.
+        ref = approval.action_type === WHATSAPP_ACTION
+          ? await sendApprovedReply(ctx, approval.payload, modified ? overrides?.description : undefined)
+          : await executeApprovedPayload(ctx, approval.payload, actor, agents, overrides);
       } catch (err) {
         await logEvent(ctx, { action: "approval.execution_failed", entity: "approvals", entityId: id, metadata: { error: (err as Error).message } });
         throw new UserFacingError(`Approved, but executing the action failed: ${(err as Error).message}`);
