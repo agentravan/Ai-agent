@@ -4,8 +4,8 @@ AI Empire OS includes data (not code) from these open-source projects. Each was 
 `scripts/` that keeps only plain text, removes links/HTML and anything that looks like an instruction to an AI,
 and records the upstream commit in the generated JSON. Agents treat this content as background, never as orders.
 
-## Open Executive — `src/data/playbooks.json`
-Source: https://github.com/SenteLabsAI/OpenExecutive (built-in knowledge Markdown only; real-person personas not imported)
+## Open Executive — `src/data/playbooks.json`, `src/data/specialist-rules.json`
+Source: https://github.com/SenteLabsAI/OpenExecutive (built-in knowledge Markdown and the specialists' decision rules from `prompts/domain_prompts.py`, read as text; real-person personas not imported)
 License: Apache License 2.0 — https://www.apache.org/licenses/LICENSE-2.0
 NOTICE (reproduced as required):
 
@@ -14,7 +14,7 @@ NOTICE (reproduced as required):
 
     This product is licensed under the Apache License, Version 2.0 (see LICENSE).
 
-Changes: files were split into sections, cleaned (links/HTML removed) and tagged by field and type.
+Changes: files were split into sections, cleaned (links/HTML removed) and tagged by field and type; specialist rules reworded as "think like…" and references to blocks we do not use removed. What was kept and dropped: `docs/THIRD_PARTY_AUDIT.md`.
 
 ## awesome-ai-agents — `src/data/agent-radar.json`
 Source: https://github.com/slavakurilyak/awesome-ai-agents — MIT License, Copyright (c) 2024 Slava Kurilyak.

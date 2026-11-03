@@ -9,8 +9,8 @@ import type { AppContext } from "@/modules/auth/session";
 import type { AgentWithPermissions, Execution } from "@/types/domain";
 import { checkAgentCanRun, checkCostLimit, COOL_MS, healthyFirst, maxAttemptsFor, monthStartIso, nextAttemptMs, providerKey, shouldCool, STALE_EXECUTION_MS } from "./policy";
 import { pickRecall, recallBlock, type MemoryRow } from "@/modules/learning/logic";
-import { domainsFor, pickPassages, playbookBlock } from "@/modules/knowledge/logic";
-import { PLAYBOOKS } from "@/modules/knowledge/catalog";
+import { domainsFor, pickPassages, playbookBlock, specialistBlock } from "@/modules/knowledge/logic";
+import { PLAYBOOKS, SPECIALIST_RULES } from "@/modules/knowledge/catalog";
 import { growthStage, upgradeUnlocked } from "@/modules/cockpit/metrics";
 import { formatInr } from "@/lib/utilities/format";
 import { MISSION, northStarLabel } from "./mission";
@@ -144,8 +144,11 @@ export async function runAgent<T = string>(ctx: AppContext, opts: RunOptions<T>)
 
   const [memory, company] = await Promise.all([memoryContext(ctx, agent.id, opts.input), companySnapshot(ctx)]);
   // Executive Playbooks: the passages from this agent's own field that match the task (no AI call).
-  const playbook = playbookBlock(pickPassages(PLAYBOOKS.playbooks, opts.input, domainsFor(agent)));
-  const system = `${GOVERNANCE}\n${goalBriefing(company)}\nYour identity: ${agent.name}, ${agent.designation} (${agent.tier}).\n${agent.instructions}${memory}${playbook}`;
+  const fields = domainsFor(agent);
+  const playbook = playbookBlock(pickPassages(PLAYBOOKS.playbooks, opts.input, fields));
+  // Expert rules: how an experienced specialist in this field decides (bootstrapped guidance for our stage).
+  const expert = specialistBlock(SPECIALIST_RULES.rules, fields);
+  const system = `${GOVERNANCE}\n${goalBriefing(company)}\nYour identity: ${agent.name}, ${agent.designation} (${agent.tier}).\n${agent.instructions}${expert}${memory}${playbook}`;
   const update = (patch: Record<string, unknown>) =>
     ctx.db.from("agent_executions").update(patch).eq("id", execution.id).eq("organisation_id", ctx.organisation.id).select("*").single<Execution>();
 

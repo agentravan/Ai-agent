@@ -46,7 +46,7 @@ Setup:
    - Without the key, leads keep coming from OpenStreetMap (₹0) and the Rank Tracker shows as unavailable.
    - Google's terms limit how long Places data may be cached; leads keep the Google place ID so details can be refreshed.
 4. To refresh the library from upstream: `git clone --depth 1 https://github.com/msitarzewski/agency-agents /tmp/aa && node scripts/import-agency-agents.mjs /tmp/aa`.
-   Playbooks: `git clone --depth 1 https://github.com/SenteLabsAI/OpenExecutive /tmp/oe && node scripts/import-open-executive.mjs /tmp/oe`.
+   Playbooks: `git clone --depth 1 https://github.com/SenteLabsAI/OpenExecutive /tmp/oe && node scripts/import-open-executive.mjs /tmp/oe && node scripts/import-specialist-rules.mjs /tmp/oe`.
    Agent Radar: `git clone --depth 1 https://github.com/slavakurilyak/awesome-ai-agents /tmp/awe && node scripts/import-awesome-agents.mjs /tmp/awe`.
    Review the diff of the generated JSON before committing — it is outside content.
 
