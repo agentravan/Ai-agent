@@ -70,6 +70,11 @@ export interface RunOptions<T> {
   attemptMs?: number;
   /** Validates/parses output; throw a retryable AiError to make the model try again. */
   parse?: (text: string) => T;
+  /**
+   * Goldfish run (Design Studio): the model sees only the governance rules, its role and the input —
+   * no memories, playbooks, expert rules or company briefing — so it reviews the text as a stranger would.
+   */
+  fresh?: boolean;
 }
 
 export const permissionsOf = (a: AgentWithPermissions) => a.agent_permissions.map((p) => p.permission);
@@ -142,13 +147,17 @@ export async function runAgent<T = string>(ctx: AppContext, opts: RunOptions<T>)
       .single<Execution>(),
   );
 
-  const [memory, company] = await Promise.all([memoryContext(ctx, agent.id, opts.input), companySnapshot(ctx)]);
-  // Executive Playbooks: the passages from this agent's own field that match the task (no AI call).
-  const fields = domainsFor(agent);
-  const playbook = playbookBlock(pickPassages(PLAYBOOKS.playbooks, opts.input, fields));
-  // Expert rules: how an experienced specialist in this field decides (bootstrapped guidance for our stage).
-  const expert = specialistBlock(SPECIALIST_RULES.rules, fields);
-  const system = `${GOVERNANCE}\n${goalBriefing(company)}\nYour identity: ${agent.name}, ${agent.designation} (${agent.tier}).\n${agent.instructions}${expert}${memory}${playbook}`;
+  const identity = `Your identity: ${agent.name}, ${agent.designation} (${agent.tier}).\n${agent.instructions}`;
+  let system = `${GOVERNANCE}\n${identity}`;
+  if (!opts.fresh) {
+    const [memory, company] = await Promise.all([memoryContext(ctx, agent.id, opts.input), companySnapshot(ctx)]);
+    // Executive Playbooks: the passages from this agent's own field that match the task (no AI call).
+    const fields = domainsFor(agent);
+    const playbook = playbookBlock(pickPassages(PLAYBOOKS.playbooks, opts.input, fields));
+    // Expert rules: how an experienced specialist in this field decides (bootstrapped guidance for our stage).
+    const expert = specialistBlock(SPECIALIST_RULES.rules, fields);
+    system = `${GOVERNANCE}\n${goalBriefing(company)}\n${identity}${expert}${memory}${playbook}`;
+  }
   const update = (patch: Record<string, unknown>) =>
     ctx.db.from("agent_executions").update(patch).eq("id", execution.id).eq("organisation_id", ctx.organisation.id).select("*").single<Execution>();
 

@@ -14,6 +14,7 @@ An AI CEO, COO and executive workforce plan, delegate and execute work. Every ag
 - **Approval center:** pending requests with action details, approve/reject (exactly once), history.
 - **Audit system:** database-trigger audit of all business tables plus semantic agent/user events, with filters.
 - **Board Room (Meet-style):** live meetings with the CEO, COO, CFO and Legal Head — glowing tiles, voices, captions; the Founder asks by text or mic and members answer, debate risk and profit, or pass. Scribe writes minutes (MOM), emails them, and action items become tasks on approval. Team meetings (a leader with their reports) and daily 09:00 / 19:00 IST stand-ups.
+- **Design Studio (Elephant–Goldfish Model):** plan a website or management system before building it. Gaja (the Elephant, with company memory) writes the brief and the design; Meen (the Goldfish) reviews with a fresh, memory-less context through four lenses — simplicity, new team member, design critic, ready-to-build. The Founder marks findings Fix/Skip, Gaja revises, and only the Founder approves; the spec is frozen and the build becomes a task. Based on [google/elephant-goldfish-model](https://github.com/google/elephant-goldfish-model) (Apache-2.0).
 - **Idea Court:** any idea goes on trial — prosecutor, defence, 12 AI jurors (BUILD / FIX / KILL) and a judge's verdict with the fix, a 7-day ₹0 test and a one-line team vision the Founder can adopt.
 - **Project Apex directive:** every agent run carries the mission ($100B North Star in USD, profit tracked in INR at a Founder-set rate, ₹80,000 gate before paid upgrades, legal-only growth).
 - **Executive Playbooks:** 106 playbooks, skill templates and failure lessons from [Open Executive](https://github.com/SenteLabsAI/OpenExecutive) (Apache-2.0). Every agent automatically reads the matching passage from its own field before a task; agents also learn from the Founder's rules and approval decisions.
@@ -34,6 +35,11 @@ cp .env.example .env.local   # NEXT_PUBLIC_SUPABASE_URL + NEXT_PUBLIC_SUPABASE_A
 npm run dev
 ```
 Apply `supabase/migrations/*.sql` to your Supabase project first. Full steps: [docs/DEPLOYMENT_GUIDE.md](docs/DEPLOYMENT_GUIDE.md).
+
+## Claude Code: EGM plugin
+`.claude/settings.json` registers the Elephant–Goldfish plugin, so Claude Code offers to install it when you trust this folder.
+Or install it by hand: `claude plugin marketplace add google/elephant-goldfish-model` then `claude plugin install egm@egm`.
+Start a new session and use `/egm:egm-brainstorm` → `/egm:egm-draft` → `/egm:egm-review` before large changes; save approved specs in `docs/designs/`.
 
 ## Scripts
 | Command | Purpose |
