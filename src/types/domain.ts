@@ -220,3 +220,18 @@ export interface WhatsappSend {
   id: string; organisation_id: string; chat_id: string; body: string; kind: "reply" | "first_contact";
   drafted_by: string | null; sent_by: string | null; wa_message_id: string | null; created_at: string;
 }
+
+/** Design Studio (Elephant–Goldfish Model): design_docs, design_reviews, design_findings. */
+export type DesignStage = "brief" | "draft" | "review" | "approved";
+export type DesignSeverity = "blocker" | "major" | "minor";
+export type DesignDecision = "open" | "fix" | "skip";
+export interface DesignChallenge { severity: DesignSeverity; title: string; where?: string; detail: string; fix: string }
+export interface DesignDoc {
+  id: string; organisation_id: string; title: string; idea: string; stage: DesignStage;
+  brief: string | null; challenges: DesignChallenge[] | null; draft: string | null; round: number; error: string | null;
+  approved_at: string | null; approved_by: string | null; created_by: string | null; created_at: string; updated_at: string;
+}
+export interface DesignFinding {
+  id: string; organisation_id: string; doc_id: string; review_id: string; round: number; lens: string;
+  severity: DesignSeverity; title: string; detail: string; fix: string; decision: DesignDecision; created_at: string; updated_at: string;
+}

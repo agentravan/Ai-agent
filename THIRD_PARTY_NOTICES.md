@@ -26,3 +26,11 @@ Source: https://github.com/msitarzewski/agency-agents — MIT License.
 ## Ideas only (no code or text copied)
 - Open Duet (https://github.com/Anil-matcha/open-duet, Apache-2.0): relevance recall of agent notes and learning
   from decisions, re-implemented in `src/modules/learning/logic.ts`.
+
+## Elephant–Goldfish Model — `src/modules/design/`, `.claude/settings.json`
+Source: https://github.com/google/elephant-goldfish-model (commit b7d9e2706fb96314a0a3123684f53cedd97e7d79) — Copyright 2026 Google LLC.
+License: Apache License 2.0 — https://www.apache.org/licenses/LICENSE-2.0
+Changes: no files are copied. The Design Studio re-implements the workflow (elephant brief → goldfish challenge → draft →
+goldfish review → Founder decides → approve) in our own code, with reviewer lenses adapted from the upstream personas
+(Zoom Out, Comprehension, Design Critic, Implementation Readiness) for small Indian businesses on a ₹0 budget.
+`.claude/settings.json` only points Claude Code at the upstream plugin marketplace; the plugin is installed by Claude Code, not vendored.

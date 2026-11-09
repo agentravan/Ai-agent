@@ -6,7 +6,8 @@ insert into auth.users (id, email) values
 
 do $$ begin
   assert (select count(*) from public.organisations) = 2, 'one org per founder';
-  assert (select count(*) from public.agents) = 26, 'thirteen starter agents each (4 executives + Legal Head + Strategy + Product + 4 managers + Scribe + Nyaya)';
+  assert (select count(*) from public.agents) = 30, 'fifteen starter agents each (4 executives + Legal Head + Strategy + Product + 4 managers + Scribe + Nyaya + Gaja + Meen)';
+  assert (select count(*) from public.agents where name in ('Gaja', 'Meen')) = 4, 'Design Studio seeded';
   assert (select count(*) from public.agents where name in ('Chanakya', 'Pragati') and tier = 'executive') = 4, 'Strategy and Product heads seeded';
   assert (select count(*) from public.agents where name = 'Nyaya') = 2, 'Idea Court seeded';
   assert (select count(*) from public.agents where name = 'Scribe') = 2, 'Scribe seeded';
@@ -21,7 +22,8 @@ do $$ begin
   perform private.seed_scribe(id) from public.organisations;
   perform private.seed_court(id) from public.organisations;
   perform private.seed_strategy_product(id) from public.organisations;
-  assert (select count(*) from public.agents) = 26, 'seed is idempotent';
+  perform private.seed_design_studio(id) from public.organisations;
+  assert (select count(*) from public.agents) = 30, 'seed is idempotent';
   assert (select count(*) from public.profiles where role = 'founder') = 2, 'founder role';
 end $$;
 
@@ -31,7 +33,7 @@ select set_config('request.jwt.claim.sub', '11111111-1111-1111-1111-111111111111
 do $$
 declare other_agent uuid; t1 uuid; t2 uuid; appr uuid;
 begin
-  assert (select count(*) from public.agents) = 13, 'RLS: sees only own agents';
+  assert (select count(*) from public.agents) = 15, 'RLS: sees only own agents';
   assert (select count(*) from public.kras) = 10, 'RLS: sees only own KRAs';
   assert (select count(*) from public.organisations) = 1, 'RLS: sees only own org';
 
@@ -149,6 +151,46 @@ begin
   exception when check_violation then null; end;
   update public.idea_trials set stage = 'decided', verdict = 'fix' where id = t1;
   update public.idea_trials set adopted_at = now() where id = t1;
+  -- Design Studio: approval needs all four goldfish reviews and every blocker settled; approved designs are frozen.
+  insert into public.design_docs (organisation_id, title, idea) values (private.auth_org_id(), 'Candidate tracker', 'Track candidates per client') returning id into t1;
+  update public.design_docs set stage = 'draft', draft = '## Overview' where id = t1;
+  update public.design_docs set stage = 'review', round = 1 where id = t1;
+  begin
+    update public.design_docs set draft = '## Changed' where id = t1;
+    raise exception 'draft changed silently during review';
+  exception when check_violation then null; end;
+  begin
+    update public.design_docs set stage = 'approved', approved_at = now() where id = t1;
+    raise exception 'design approved without reviews';
+  exception when check_violation then null; end;
+  insert into public.design_reviews (organisation_id, doc_id, round, lens) values
+    (private.auth_org_id(), t1, 1, 'zoom_out'), (private.auth_org_id(), t1, 1, 'comprehension'), (private.auth_org_id(), t1, 1, 'design');
+  begin
+    insert into public.design_reviews (organisation_id, doc_id, round, lens) values (private.auth_org_id(), t1, 1, 'design');
+    raise exception 'same lens reviewed twice in a round';
+  exception when unique_violation then null; end;
+  insert into public.design_reviews (organisation_id, doc_id, round, lens) values (private.auth_org_id(), t1, 1, 'readiness') returning id into t2;
+  insert into public.design_findings (organisation_id, doc_id, review_id, round, lens, severity, title) values (private.auth_org_id(), t1, t2, 1, 'readiness', 'blocker', 'No data fields');
+  begin
+    update public.design_docs set stage = 'approved', approved_at = now() where id = t1;
+    raise exception 'design approved with an open blocker';
+  exception when check_violation then null; end;
+  update public.design_findings set decision = 'skip' where doc_id = t1;
+  begin
+    update public.design_findings set severity = 'minor' where doc_id = t1;
+    raise exception 'finding rewritten';
+  exception when check_violation then null; end;
+  update public.design_docs set stage = 'approved', approved_at = now(), approved_by = auth.uid() where id = t1;
+  begin
+    update public.design_docs set draft = '## Rewritten' where id = t1;
+    raise exception 'approved design changed';
+  exception when check_violation then null; end;
+  begin
+    update public.design_findings set decision = 'fix' where doc_id = t1;
+    raise exception 'finding of an approved design changed';
+  exception when check_violation then null; end;
+  delete from public.design_reviews where doc_id = t1;
+  assert (select count(*) from public.design_reviews where doc_id = t1) = 4, 'reviews of an approved design cannot be deleted';
   insert into public.tasks (organisation_id, title, owner, external_ref) values (private.auth_org_id(), 'Place order BOT1', 'founder', 'buyontime:BOT1');
   begin
     insert into public.tasks (organisation_id, title, owner, external_ref) values (private.auth_org_id(), 'dup', 'founder', 'buyontime:BOT1');
@@ -203,6 +245,13 @@ do $$ declare l uuid; begin
   begin
     update public.idea_trials set adopted_at = now() where id = l;
     raise exception 'member adopted a verdict';
+  exception when insufficient_privilege then null; end;
+  insert into public.design_docs (organisation_id, title, idea) values (private.auth_org_id(), 'Member design', 'Member idea here') returning id into l;
+  update public.design_docs set stage = 'draft', draft = '## Overview' where id = l;
+  update public.design_docs set stage = 'review', round = 1 where id = l;
+  begin
+    update public.design_docs set stage = 'approved', approved_at = now() where id = l;
+    raise exception 'member approved a design';
   exception when insufficient_privilege then null; end;
   begin
     insert into public.whatsapp_sends (organisation_id, chat_id, body, kind, sent_by) values (private.auth_org_id(), '919876543211@c.us', 'Hi', 'reply', auth.uid());
